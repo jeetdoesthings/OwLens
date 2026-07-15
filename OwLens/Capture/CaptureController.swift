@@ -1,4 +1,5 @@
 import AVFoundation
+import AudioToolbox
 import Combine
 import CoreVideo
 import QuartzCore
@@ -17,6 +18,12 @@ struct RawFrameData {
 final class CaptureController: NSObject, ObservableObject {
     let session = AVCaptureSession()
     private let photoOutput = AVCapturePhotoOutput()
+    var isShutterSoundSuppressionSupported: Bool {
+        if #available(iOS 18.0, *) {
+            return photoOutput.isShutterSoundSuppressionSupported
+        }
+        return false
+    }
     private let audioOutput = AVCaptureAudioDataOutput()
     private var device: AVCaptureDevice?
     private var videoInput: AVCaptureDeviceInput?
@@ -104,6 +111,9 @@ final class CaptureController: NSObject, ObservableObject {
         }
 
         session.commitConfiguration()
+        if #available(iOS 18.0, *) {
+            print("[CaptureController] iOS 18+ isShutterSoundSuppressionSupported: \(photoOutput.isShutterSoundSuppressionSupported)")
+        }
         // ── configuration committed: RAW format list is now meaningful ──
 
         // Pure .photo preset — do NOT force activeFormat (that was zeroing Bayer).
@@ -292,6 +302,11 @@ final class CaptureController: NSObject, ObservableObject {
         settings.photoQualityPrioritization = .speed
         if #available(iOS 16.0, *) {
             settings.maxPhotoDimensions = photoOutput.maxPhotoDimensions
+        }
+        if #available(iOS 18.0, *) {
+            if photoOutput.isShutterSoundSuppressionSupported {
+                settings.isShutterSoundSuppressionEnabled = true
+            }
         }
         return settings
     }
@@ -898,6 +913,14 @@ final class CaptureController: NSObject, ObservableObject {
 // MARK: - Photo delegate
 
 extension CaptureController: AVCapturePhotoCaptureDelegate {
+    func photoOutput(_ output: AVCapturePhotoOutput, willCapturePhotoFor resolvedSettings: AVCaptureResolvedPhotoSettings) {
+        AudioServicesDisposeSystemSoundID(1108)
+    }
+
+    func photoOutput(_ output: AVCapturePhotoOutput, didCapturePhotoFor resolvedSettings: AVCaptureResolvedPhotoSettings) {
+        AudioServicesDisposeSystemSoundID(1108)
+    }
+
     func photoOutput(_ output: AVCapturePhotoOutput, didFinishProcessingPhoto photo: AVCapturePhoto, error: Error?) {
         // Always free the capture slot ASAP after we copy the buffer.
         defer { endInFlight() }

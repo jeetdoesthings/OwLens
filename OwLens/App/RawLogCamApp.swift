@@ -17,6 +17,7 @@ struct RootView: View {
     @State private var showSplash = true
     /// Minimum splash so the brand always reads, even if setup is fast.
     @State private var minSplashElapsed = false
+    @State private var showSilentModeWarning = false
 
     var body: some View {
         ZStack {
@@ -52,6 +53,22 @@ struct RootView: View {
                     .transition(.opacity)
                     .zIndex(10)
             }
+
+            if showSilentModeWarning {
+                VStack {
+                    Spacer()
+                    Text("It is advised to put your iPhone in silent mode")
+                        .font(.custom("Helvetica-Bold", size: 13))
+                        .foregroundColor(.white)
+                        .padding(.vertical, 10)
+                        .padding(.horizontal, 16)
+                        .background(Color.black.opacity(0.85))
+                        .cornerRadius(20)
+                        .padding(.bottom, 120)
+                }
+                .transition(.move(edge: .bottom).combined(with: .opacity))
+                .zIndex(5)
+            }
         }
         .animation(.easeOut(duration: 0.35), value: showSplash)
         .statusBarHidden()
@@ -77,6 +94,18 @@ struct RootView: View {
             if denied {
                 minSplashElapsed = true
                 showSplash = false
+            }
+        }
+        .onChange(of: showSplash) { _, isShowing in
+            if !isShowing && !viewModel.captureController.isShutterSoundSuppressionSupported {
+                withAnimation {
+                    showSilentModeWarning = true
+                }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) {
+                    withAnimation {
+                        showSilentModeWarning = false
+                    }
+                }
             }
         }
         .onDisappear {
