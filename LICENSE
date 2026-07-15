@@ -1,0 +1,48 @@
+# OwLens Source-Available License Agreement
+
+Copyright (c) 2026-present Jeet Ghegade("the Author"), https://github.com/jeetdoesthings
+
+By accessing, viewing, cloning, compiling, or running the source code of OwLens ("the Software"), you ("the Licensee") agree to be bound by the terms of this Agreement. If you do not agree to these terms, you must not access, use, or retain any copy of the Software.
+
+## 1. Grant of License
+
+Subject to the terms of this Agreement, the Author grants the Licensee a personal, non-exclusive, non-transferable, revocable, royalty-free license to:
+
+- View and study the source code for personal, educational, and evaluation purposes.
+- Modify the source code for the Licensee's own personal, non-commercial use only.
+- Compile and run the Software (modified or unmodified) on devices personally owned or controlled by the Licensee, for the Licensee's own personal, non-commercial use.
+
+No other rights are granted, whether by implication, estoppel, or otherwise.
+
+## 2. Strict Prohibitions
+
+The Licensee shall NOT, under any circumstances, whether directly or through a third party:
+
+- **Sell, resell, rent, lease, sublicense, or otherwise commercially exploit** the Software, the source code, or any derivative or modified version of it.
+- **Publish, submit, upload, or distribute** the Software, or any derivative or modified version of it, to the Apple App Store, Google Play Store, TestFlight (beyond the Author's own official distribution), any third-party app marketplace, package repository, or any other public or private distribution channel.
+- **Redistribute** copies of the source code, in modified or unmodified form, publicly or privately to any third party, under this license, an open-source license, or any other terms.
+- **Rebrand, whitewash, or represent** the Software or any derivative of it as the Licensee's own original work, or remove or alter any copyright, attribution, or license notices contained in it.
+- **Use the name "OwLens," associated logos, icons, or branding assets** in connection with any product, service, app store listing, or marketing material, whether or not the underlying code has been modified.
+- Circumvent, disable, or assist others in circumventing this Agreement, including by providing compiled binaries, App Store links, or build instructions intended to enable prohibited use by others.
+
+Violation of this Section immediately and automatically terminates the license granted in Section 1, without notice.
+
+## 3. Ownership
+
+All right, title, and interest in and to the Software, including all source code, object code, designs, documentation, trademarks, and the name "OwLens," remain exclusively with the Author. Nothing in this Agreement transfers any ownership or intellectual property rights to the Licensee. Any modifications made by the Licensee to the source code do not create any ownership claim over the original Software; the Author's ownership of the original codebase is unaffected.
+
+## 4. Enforcement
+
+The Author reserves the right to pursue any and all legal remedies available under applicable law — including but not limited to takedown requests, injunctive relief, and damages — against any party found to be in violation of Section 2, including parties who obtained the Software indirectly from a Licensee in breach of this Agreement.
+
+## 5. Termination
+
+This license terminates automatically, without notice, upon any breach of its terms. Upon termination, the Licensee must immediately cease all use of the Software and destroy all copies, modified or unmodified, in their possession or control. Sections 2, 3, 4, 6, and 7 survive termination.
+
+## 6. Disclaimer of Warranty
+
+THE SOFTWARE IS PROVIDED "AS IS," WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT, OR OTHERWISE, ARISING FROM, OUT OF, OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+## 7. Governing Law
+
+This Agreement shall be governed by and construed in accordance with the laws of India, without regard to its conflict of law principles. Any disputes arising under this Agreement shall be subject to the exclusive jurisdiction of the courts of India.

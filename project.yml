@@ -1,0 +1,44 @@
+name: OwLens
+options:
+  bundleIdPrefix: com.owlens
+  deploymentTarget:
+    iOS: "17.0"
+  xcodeVersion: "16.0"
+  createIntermediateGroups: true
+
+settings:
+  base:
+    SWIFT_VERSION: "5.9"
+    TARGETED_DEVICE_FAMILY: "1"
+    GENERATE_INFOPLIST_FILE: false
+
+targets:
+  OwLens:
+    type: application
+    platform: iOS
+    sources:
+      - path: OwLens
+        excludes:
+          - "Resources/Info.plist"
+    info:
+      path: OwLens/Resources/Info.plist
+      properties:
+        CFBundleDisplayName: OwLens
+        CFBundleName: OwLens
+        NSCameraUsageDescription: "OwLens needs camera access to capture RAW sensor data for log-encoded video recording."
+        NSMicrophoneUsageDescription: "OwLens needs microphone access to record audio alongside video."
+        NSPhotoLibraryAddUsageDescription: "Save recorded log-encoded video to your photo library."
+        UILaunchStoryboardName: LaunchScreen
+        UIRequiresFullScreen: true
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationLandscapeRight
+          - UIInterfaceOrientationLandscapeLeft
+    settings:
+      base:
+        PRODUCT_NAME: OwLens
+        PRODUCT_BUNDLE_IDENTIFIER: com.owlens.app
+        CODE_SIGN_STYLE: Automatic
+        DEVELOPMENT_TEAM: ""
+        SWIFT_EMIT_LOC_STRINGS: "YES"
+        INFOPLIST_FILE: OwLens/Resources/Info.plist
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon

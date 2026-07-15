@@ -1,0 +1,30 @@
+# Xcode
+#
+# gitignore template for Xcode programs
+#
+build/
+DerivedData/
+*.xcodeproj
+*.xcworkspace
+!default.xcworkspace
+xcuserdata/
+*.moved-aside
+*.xcuserstate
+*.xccheckout
+*.plugins
+
+# Objective-C/Swift third-party
+#
+# CocoaPods
+#
+Pods/
+# Carthage
+#
+Carthage/Build/
+# Swift Package Manager
+#
+.build/
+
+# User-specific ignores
+ARCHITECTURE.md
+.DS_Store
