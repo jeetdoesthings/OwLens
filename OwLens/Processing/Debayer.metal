@@ -281,5 +281,53 @@ kernel void debayerWBLog(
         result = saturate(result);
     }
 
-    outTexture.write(float4(result, 1.0), gid);
+    bool isClipped = (r >= 0.99 || g >= 0.99 || b >= 0.99);
+    float alpha = isClipped ? 0.0 : 1.0;
+    outTexture.write(float4(result, alpha), gid);
+}
+
+kernel void applyClippingOverlay(
+    texture2d<float, access::read_write> tex [[texture(0)]],
+    constant int &showClipping [[buffer(0)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    if (gid.x >= tex.get_width() || gid.y >= tex.get_height()) return;
+    if (showClipping == 0) return;
+    
+    float4 color = tex.read(gid);
+    float isClipped = step(color.a, 0.5);
+    float3 finalColor = mix(color.rgb, float3(1.0, 0.0, 0.0), isClipped);
+    tex.write(float4(finalColor, 1.0), gid);
+}
+
+struct VertexOut {
+    float4 position [[position]];
+};
+
+vertex VertexOut fullscreenVertex(uint vertexID [[vertex_id]]) {
+    VertexOut out;
+    float2 pos = float2((vertexID << 1) & 2, vertexID & 2);
+    out.position = float4(pos * float2(2.0, -2.0) + float2(-1.0, 1.0), 0.0, 1.0);
+    return out;
+}
+
+fragment float4 displayFragment(
+    VertexOut in [[stage_in]],
+    texture2d<float> tex [[texture(0)]],
+    constant int2 &destOffset [[buffer(0)]],
+    constant int2 &destSize [[buffer(1)]],
+    constant int &showClipping [[buffer(2)]]
+) {
+    float2 uv = float2(in.position.x - destOffset.x, in.position.y - destOffset.y) / float2(destSize);
+    if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) {
+        return float4(0.0, 0.0, 0.0, 1.0);
+    }
+    
+    constexpr sampler s(coord::normalized, address::clamp_to_edge, filter::linear);
+    float4 color = tex.sample(s, uv);
+    
+    float isClipped = step(color.a, 0.5);
+    float applyRed = (showClipping > 0) ? isClipped : 0.0;
+    
+    return float4(mix(color.rgb, float3(1.0, 0.0, 0.0), applyRed), 1.0);
 }

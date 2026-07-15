@@ -42,7 +42,7 @@ struct ControlsView: View {
                     .foregroundColor(.orange)
             }
 
-            // Grid + level toggles (top-right)
+            // Grid, level, and clipping toggles (top-right)
             topToggle(
                 systemName: "grid",
                 active: viewModel.showGrid,
@@ -52,6 +52,11 @@ struct ControlsView: View {
                 systemName: "level",
                 active: viewModel.showLevel,
                 action: { viewModel.toggleLevel() }
+            )
+            topToggle(
+                systemName: "sun.max.fill",
+                active: viewModel.showClipping,
+                action: { viewModel.toggleClipping() }
             )
 
             Text(viewModel.cfaLabel)
@@ -340,17 +345,6 @@ struct ControlsView: View {
                                 viewModel.selectedCurve = curve
                             }
                         }
-                    }
-                    Spacer(minLength: 0)
-                    Button {
-                        viewModel.exportLUT()
-                    } label: {
-                        Image(systemName: "square.and.arrow.up")
-                            .font(.system(size: 12, weight: .semibold))
-                            .foregroundColor(.white.opacity(0.85))
-                            .padding(8)
-                            .background(Color.white.opacity(0.12))
-                            .clipShape(Circle())
                     }
                 }
             }

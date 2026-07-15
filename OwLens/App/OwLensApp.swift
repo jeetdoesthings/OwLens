@@ -33,9 +33,10 @@ struct RootView: View {
                     ZStack {
                         CameraPreviewView(
                             metalPipeline: pipeline,
-                            currentTexture: $viewModel.currentTexture
+                            currentTexture: $viewModel.currentTexture,
+                            showClipping: $viewModel.showClipping
                         )
-                        .ignoresSafeArea()
+                            .ignoresSafeArea()
 
                         GridLevelOverlay(
                             showGrid: viewModel.showGrid,

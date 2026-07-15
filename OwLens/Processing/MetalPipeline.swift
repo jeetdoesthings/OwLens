@@ -64,7 +64,7 @@ struct FusedParams {
 ///   • Synchronous `waitUntilCompleted` only on final BGRA readback
 final class MetalPipeline: @unchecked Sendable {
     let device: MTLDevice
-    private let commandQueue: MTLCommandQueue
+    let commandQueue: MTLCommandQueue
     private let binPipeline: MTLComputePipelineState
     private let fusedPipeline: MTLComputePipelineState
     // Keep legacy pipelines for fallback / future use
@@ -217,11 +217,6 @@ final class MetalPipeline: @unchecked Sendable {
 
         commandBuffer.commit()
         commandBuffer.waitUntilCompleted()
-
-        if let error = commandBuffer.error {
-            print("[MetalPipeline] GPU error: \(error)")
-            return nil
-        }
 
         // Crop/scale to encode size
         return cropToAspectAndScale(fusedOut, targetWidth: encodeWidth, targetHeight: encodeHeight) ?? fusedOut

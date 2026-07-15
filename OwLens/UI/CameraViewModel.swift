@@ -71,6 +71,7 @@ final class CameraViewModel: ObservableObject {
     }
 
     @Published var showGrid = false
+    @Published var showClipping = false
     @Published var showLevel = false {
         didSet {
             if showLevel {
@@ -194,7 +195,7 @@ final class CameraViewModel: ObservableObject {
     nonisolated(unsafe) private var activeFPS: Double = 24
     nonisolated(unsafe) private var isRecordingUnsafe = false
     /// Metal may not submit GPU work when app is backgrounded.
-    nonisolated(unsafe) private var isAppActive = true
+    nonisolated(unsafe) var isAppActive = true
 
     enum WBMode: String, CaseIterable, Identifiable {
         case auto = "Auto"
@@ -433,6 +434,10 @@ final class CameraViewModel: ObservableObject {
 
     func toggleLevel() {
         showLevel.toggle()
+    }
+
+    func toggleClipping() {
+        showClipping.toggle()
     }
 
     func refreshAudioSources() {
@@ -858,6 +863,7 @@ final class CameraViewModel: ObservableObject {
         // Only preview texture + UI counters go to MainActor
         Task { @MainActor [weak self] in
             guard let self else { return }
+            self.currentTexture = framed
             self.currentTexture = framed
             self.cfaLabel = cfaName
             self.droppedFrames = drops
