@@ -22,6 +22,13 @@ OwLens bypasses standard iOS image processing using a three-stage custom pipelin
 2. **Metal-Accelerated GPU Pipeline:** A custom Metal compute shader runs directly on the GPU to perform real-time bilinear debayering, apply white balance gains in the linear color space, and apply the Sony S-Log3 transfer function.
 3. **Hardware Encoding:** The resulting log-encoded texture is fed directly to the iPhone's H.265 (HEVC) hardware encoder at bitrates up to 200 Mbps, maintaining a constant frame rate (CFR) to ensure audio sync.
 
+## Color Grading in DaVinci Resolve
+
+When importing OwLens footage into DaVinci Resolve, use the following settings in a **Color Space Transform (CST)** node to map the colors and contrast correctly:
+
+- **Input Color Space:** Rec.709
+- **Input Gamma:** Sony S-Log3
+
 ## Installation
 
 You'll need:

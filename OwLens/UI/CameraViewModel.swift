@@ -658,7 +658,7 @@ final class CameraViewModel: ObservableObject {
         activeEncodeHeight = selectedFormat.height
         activeFPS = selectedFPS.rawValue
 
-        let fileName = "RawLog_\(selectedFormat.shortLabel)_\(selectedFPS.label)fps_HEVC_\(Int(Date().timeIntervalSince1970)).mov"
+        let fileName = "OwLens_\(selectedFormat.shortLabel)_\(selectedFPS.label)fps_HEVC_\(Int(Date().timeIntervalSince1970)).mov"
         outputURL = FileManager.default.temporaryDirectory.appendingPathComponent(fileName)
 
         let includeAudio = selectedAudioSource.portUID != nil
