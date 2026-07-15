@@ -26,7 +26,7 @@ OwLens bypasses standard iOS image processing using a three-stage custom pipelin
 
 When importing OwLens footage into DaVinci Resolve, use the following settings in a **Color Space Transform (CST)** node to map the colors and contrast correctly:
 
-- **Input Color Space:** Rec.709
+- **Input Color Space:** Sony S-Gamut3.Cine
 - **Input Gamma:** Sony S-Log3
 
 ## Installation
