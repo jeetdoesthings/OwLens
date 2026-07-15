@@ -238,7 +238,8 @@ final class VideoWriter {
 
         guard isRecording,
               let input = audioInput,
-              hasStartedSession else {
+              hasStartedSession,
+              startHostTime > 0 else {
             return false
         }
         guard input.isReadyForMoreMediaData else { return false }
@@ -255,12 +256,10 @@ final class VideoWriter {
         ), count: timingCount)
         CMSampleBufferGetOutputSampleTimingInfoArray(sampleBuffer, entryCount: timingCount, arrayToFill: &timings, entriesNeededOut: &timingCount)
 
-        let elapsed = max(0, CACurrentMediaTime() - startHostTime)
-        let base = CMTime(seconds: elapsed, preferredTimescale: 48_000)
-        let firstPTS = timings[0].presentationTimeStamp
+        let startCMTime = CMTime(seconds: startHostTime, preferredTimescale: 48_000)
+        
         for i in 0..<timings.count {
-            let delta = CMTimeSubtract(timings[i].presentationTimeStamp, firstPTS)
-            timings[i].presentationTimeStamp = CMTimeAdd(base, delta)
+            timings[i].presentationTimeStamp = CMTimeSubtract(timings[i].presentationTimeStamp, startCMTime)
             if timings[i].decodeTimeStamp.isValid {
                 timings[i].decodeTimeStamp = timings[i].presentationTimeStamp
             }

@@ -18,6 +18,9 @@ struct RootView: View {
     /// Minimum splash so the brand always reads, even if setup is fast.
     @State private var minSplashElapsed = false
     @State private var showSilentModeWarning = false
+    @State private var tapFocusPoint: CGPoint? = nil
+    @State private var focusReticleOpacity: Double = 0
+    @State private var touchDownDate: Date? = nil
 
     var body: some View {
         ZStack {
@@ -26,18 +29,78 @@ struct RootView: View {
             } else if viewModel.isDeviceUnsupportedForLog && !showSplash {
                 unsupportedView
             } else if let pipeline = viewModel.metalPipeline, viewModel.isCameraReady {
-                CameraPreviewView(
-                    metalPipeline: pipeline,
-                    currentTexture: $viewModel.currentTexture
-                )
-                .ignoresSafeArea()
+                GeometryReader { geo in
+                    ZStack {
+                        CameraPreviewView(
+                            metalPipeline: pipeline,
+                            currentTexture: $viewModel.currentTexture
+                        )
+                        .ignoresSafeArea()
 
-                GridLevelOverlay(
-                    showGrid: viewModel.showGrid,
-                    showLevel: viewModel.showLevel,
-                    videoAspect: viewModel.selectedFormat.aspectRatio,
-                    levelMonitor: viewModel.levelMonitor
-                )
+                        GridLevelOverlay(
+                            showGrid: viewModel.showGrid,
+                            showLevel: viewModel.showLevel,
+                            videoAspect: viewModel.selectedFormat.aspectRatio,
+                            levelMonitor: viewModel.levelMonitor
+                        )
+                        .ignoresSafeArea()
+
+                        if let focusPt = tapFocusPoint {
+                            Rectangle()
+                                .stroke(Color.yellow, lineWidth: 1.5)
+                                .frame(width: 60, height: 60)
+                                .position(focusPt)
+                                .opacity(focusReticleOpacity)
+                        }
+
+                        if viewModel.isFocusLocked {
+                            Text("AF LOCK")
+                                .font(.system(size: 12, weight: .bold, design: .rounded))
+                                .foregroundColor(.black)
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 4)
+                                .background(Color.yellow)
+                                .cornerRadius(4)
+                                .position(x: geo.size.width / 2, y: geo.size.height * 0.15)
+                        }
+                    }
+                    .contentShape(Rectangle())
+                    .gesture(
+                        DragGesture(minimumDistance: 0)
+                            .onChanged { value in
+                                if touchDownDate == nil {
+                                    touchDownDate = Date()
+                                }
+                            }
+                            .onEnded { value in
+                                let duration = Date().timeIntervalSince(touchDownDate ?? Date())
+                                touchDownDate = nil
+                                let isLongPress = duration > 0.4
+                                
+                                let loc = value.location
+                                let aspect = viewModel.selectedFormat.aspectRatio
+                                let viewAspect = geo.size.width / geo.size.height
+                                var frame = CGRect(origin: .zero, size: geo.size)
+                                if aspect > viewAspect {
+                                    let h = geo.size.width / aspect
+                                    frame = CGRect(x: 0, y: (geo.size.height - h) / 2, width: geo.size.width, height: h)
+                                } else {
+                                    let w = geo.size.height * aspect
+                                    frame = CGRect(x: (geo.size.width - w) / 2, y: 0, width: w, height: geo.size.height)
+                                }
+                                guard frame.contains(loc) else { return }
+                                let x = (loc.x - frame.minX) / frame.width
+                                let y = (loc.y - frame.minY) / frame.height
+                                viewModel.setFocusPoint(CGPoint(x: x, y: y), lock: isLongPress)
+                                
+                                tapFocusPoint = loc
+                                focusReticleOpacity = 1
+                                withAnimation(.easeOut(duration: 0.5).delay(1.5)) {
+                                    focusReticleOpacity = 0
+                                }
+                            }
+                    )
+                }
                 .ignoresSafeArea()
 
                 ControlsView(viewModel: viewModel)

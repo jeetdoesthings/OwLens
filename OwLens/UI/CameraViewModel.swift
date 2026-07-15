@@ -103,6 +103,25 @@ final class CameraViewModel: ObservableObject {
     @Published private(set) var shutterValue: Float = 48
     @Published private(set) var wbKelvin: Float = 5600
 
+    // Focus properties
+    @Published var isFocusLocked: Bool = false
+    @Published var isAutoFocus: Bool = true {
+        didSet {
+            if isAutoFocus {
+                isFocusLocked = false
+                captureController.setContinuousAutoFocus()
+            } else {
+                captureController.setManualFocus(lensPosition: focusLensPosition)
+            }
+        }
+    }
+    @Published var focusLensPosition: Float = 0.5 {
+        didSet {
+            guard !isAutoFocus else { return }
+            captureController.setManualFocus(lensPosition: focusLensPosition)
+        }
+    }
+
     /// Discrete stop lists (snap slider).
     @Published private(set) var isoStops: [Float] = ExposureStops.isoStops(in: 50...2000)
     @Published private(set) var shutterStops: [Float] = ExposureStops.shutterStops(in: 24...8000)
@@ -186,7 +205,7 @@ final class CameraViewModel: ObservableObject {
     }
 
     enum ControlPanel: String, Identifiable {
-        case iso, shutter, wb, fps, format, log, bitrate, mic, lens
+        case iso, shutter, wb, focus, fps, format, log, bitrate, mic, lens
         var id: String { rawValue }
     }
 
@@ -388,7 +407,7 @@ final class CameraViewModel: ObservableObject {
     func togglePanel(_ panel: ControlPanel) {
         if controlsLocked {
             switch panel {
-            case .iso, .shutter, .wb, .fps, .format, .bitrate, .mic, .lens:
+            case .iso, .shutter, .wb, .focus, .fps, .format, .bitrate, .mic, .lens:
                 return
             case .log:
                 break
@@ -569,9 +588,7 @@ final class CameraViewModel: ObservableObject {
 
         do {
             try device.lockForConfiguration()
-            if device.isFocusModeSupported(.locked) {
-                device.focusMode = .locked
-            }
+            // We don't lock focus here anymore, focus is managed independently
             device.unlockForConfiguration()
         } catch {}
 
@@ -590,6 +607,12 @@ final class CameraViewModel: ObservableObject {
         controlsLocked = false
         refreshStatusLine()
         print("[CameraViewModel] Controls unlocked (still manual)")
+    }
+
+    func setFocusPoint(_ point: CGPoint, lock: Bool = false) {
+        isAutoFocus = true
+        isFocusLocked = lock
+        captureController.setFocusPointOfInterest(point, lock: lock)
     }
 
     private func clampWhiteBalanceGains(_ gains: AVCaptureDevice.WhiteBalanceGains, for device: AVCaptureDevice) -> AVCaptureDevice.WhiteBalanceGains {

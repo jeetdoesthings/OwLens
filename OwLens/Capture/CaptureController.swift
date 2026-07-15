@@ -746,6 +746,58 @@ final class CaptureController: NSObject, ObservableObject {
 
     var activeDevice: AVCaptureDevice? { device }
 
+    // MARK: - Focus API
+
+    func setManualFocus(lensPosition: Float) {
+        guard let device = device else { return }
+        do {
+            try device.lockForConfiguration()
+            device.setFocusModeLocked(lensPosition: lensPosition, completionHandler: nil)
+            device.unlockForConfiguration()
+        } catch {
+            print("[CaptureController] Error setting manual focus: \(error)")
+        }
+    }
+
+    func setContinuousAutoFocus() {
+        guard let device = device else { return }
+        do {
+            try device.lockForConfiguration()
+            if device.isFocusModeSupported(.continuousAutoFocus) {
+                device.focusMode = .continuousAutoFocus
+            } else if device.isFocusModeSupported(.autoFocus) {
+                device.focusMode = .autoFocus
+            }
+            device.unlockForConfiguration()
+        } catch {
+            print("[CaptureController] Error setting auto focus: \(error)")
+        }
+    }
+
+    func setFocusPointOfInterest(_ point: CGPoint, lock: Bool = false) {
+        guard let device = activeDevice ?? AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back) else { return }
+        do {
+            try device.lockForConfiguration()
+            if device.isFocusPointOfInterestSupported {
+                device.focusPointOfInterest = point
+            }
+            if lock {
+                if device.isFocusModeSupported(.autoFocus) {
+                    device.focusMode = .autoFocus
+                }
+            } else {
+                if device.isFocusModeSupported(.continuousAutoFocus) {
+                    device.focusMode = .continuousAutoFocus
+                } else if device.isFocusModeSupported(.autoFocus) {
+                    device.focusMode = .autoFocus
+                }
+            }
+            device.unlockForConfiguration()
+        } catch {
+            print("[CaptureController] Failed to set focus point: \(error)")
+        }
+    }
+
     // MARK: - Session Lifecycle
 
     func startSession() {
