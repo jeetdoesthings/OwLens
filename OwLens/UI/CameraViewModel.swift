@@ -35,9 +35,10 @@ final class CameraViewModel: ObservableObject {
             guard !controlsLocked, !isRecording else { return }
             captureController.setCaptureFPS(selectedFPS.rawValue)
             activeFPS = selectedFPS.rawValue
-            // 180° shutter rule → snap to nearest stop
-            let target = Float(selectedFPS.rawValue * 2)
-            shutterStopIndex = ExposureStops.nearestIndex(in: shutterStops, to: target)
+            // 180° shutter rule is now natively maintained by the angle system.
+            // We just need to refresh limits and push the new duration to hardware.
+            seedControlRanges()
+            if isCameraReady { applyManualExposureAndWB() }
             refreshStatusLine()
         }
     }
@@ -72,6 +73,7 @@ final class CameraViewModel: ObservableObject {
 
     @Published var showGrid = false
     @Published var showClipping = false
+    @Published var showFocusPeaking = false
     @Published var showLevel = false {
         didSet {
             if showLevel {
@@ -101,7 +103,7 @@ final class CameraViewModel: ObservableObject {
     @Published private(set) var isCameraReady = false
 
     @Published private(set) var isoValue: Float = 100
-    @Published private(set) var shutterValue: Float = 48
+    @Published private(set) var shutterValue: Float = 180
     @Published private(set) var wbKelvin: Float = 5600
 
     // Focus properties
@@ -118,10 +120,11 @@ final class CameraViewModel: ObservableObject {
     }
     @Published var focusLensPosition: Float = 0.5 {
         didSet {
-            guard !isAutoFocus else { return }
+            guard !controlsLocked, !isAutoFocus else { return }
             captureController.setManualFocus(lensPosition: focusLensPosition)
         }
     }
+    @Published var focusPointLocation: CGPoint? = nil
 
     /// Discrete stop lists (snap slider).
     @Published private(set) var isoStops: [Float] = ExposureStops.isoStops(in: 50...2000)
@@ -140,16 +143,23 @@ final class CameraViewModel: ObservableObject {
             applyManualExposureAndWB()
         }
     }
-    @Published var shutterStopIndex: Int = 0 {
-        didSet {
-            guard !shutterStops.isEmpty else { return }
-            let i = ExposureStops.clampIndex(shutterStopIndex, count: shutterStops.count)
-            if i != shutterStopIndex { shutterStopIndex = i; return }
-            let v = shutterStops[i]
-            guard v != shutterValue else { return }
-            shutterValue = v
-            guard !controlsLocked else { return }
-            applyManualExposureAndWB()
+    func setShutterAngleWithSnapping(_ rawValue: Float) {
+        let snapTargets = ExposureStops.shutterAngles
+        var finalValue = rawValue
+        
+        for target in snapTargets {
+            // Magnetic snap radius of 15 degrees
+            if abs(rawValue - target) < 15.0 {
+                finalValue = target
+                break
+            }
+        }
+        
+        finalValue = max(shutterRange.lowerBound, min(shutterRange.upperBound, finalValue))
+        
+        if finalValue != shutterValue {
+            shutterValue = finalValue
+            if isCameraReady { applyManualExposureAndWB() }
         }
     }
     @Published var wbStopIndex: Int = 0 {
@@ -169,7 +179,7 @@ final class CameraViewModel: ObservableObject {
     @Published var activePanel: ControlPanel? = nil
 
     var isoRange: ClosedRange<Float> = 50...2000
-    var shutterRange: ClosedRange<Float> = 24...8000
+    var shutterRange: ClosedRange<Float> = 11.25...360.0
 
     // MARK: - Pipeline
 
@@ -439,6 +449,10 @@ final class CameraViewModel: ObservableObject {
     func toggleClipping() {
         showClipping.toggle()
     }
+    
+    func toggleFocusPeaking() {
+        showFocusPeaking.toggle()
+    }
 
     func refreshAudioSources() {
         let sources = captureController.availableAudioSources()
@@ -526,12 +540,18 @@ final class CameraViewModel: ObservableObject {
         let minDur = CMTimeGetSeconds(device.activeFormat.minExposureDuration)
         let maxDur = CMTimeGetSeconds(device.activeFormat.maxExposureDuration)
         if minDur > 0, maxDur > 0 {
-            let maxShutter: Float = Float(1.0 / minDur)
-            let minShutter: Float = Float(1.0 / maxDur)
-            shutterRange = min(minShutter, maxShutter)...max(minShutter, maxShutter)
-            shutterStops = ExposureStops.shutterStops(in: shutterRange)
-            let target = Float(selectedFPS.rawValue * 2)
-            shutterStopIndex = ExposureStops.nearestIndex(in: shutterStops, to: target)
+            let maxDur = Float(device.activeFormat.maxExposureDuration.seconds)
+            let minDur = Float(device.activeFormat.minExposureDuration.seconds)
+            
+            let maxAngle = min(360.0, maxDur * 360.0 * Float(activeFPS))
+            let minAngle = minDur * 360.0 * Float(activeFPS)
+            
+            let target: Float = 180.0 // Default 180° shutter rule
+            
+            // Just clamp the current shutter value to the new range, or snap to 180 if out of bounds
+            if shutterValue < minAngle || shutterValue > maxAngle {
+                shutterValue = max(minAngle, min(maxAngle, target))
+            }
         }
 
         wbStops = ExposureStops.wbStops()
@@ -544,8 +564,7 @@ final class CameraViewModel: ObservableObject {
     }
 
     func nudgeShutter(_ delta: Int) {
-        guard !controlsLocked else { return }
-        shutterStopIndex = ExposureStops.clampIndex(shutterStopIndex + delta, count: shutterStops.count)
+        // Obsolete with continuous magnetic slider
     }
 
     func nudgeWB(_ delta: Int) {
@@ -564,7 +583,7 @@ final class CameraViewModel: ObservableObject {
             try device.lockForConfiguration()
 
             let clampedISO = max(device.activeFormat.minISO, min(device.activeFormat.maxISO, isoValue))
-            var shutterDuration = CMTimeMakeWithSeconds(1.0 / Double(shutterValue), preferredTimescale: 1_000_000)
+            var shutterDuration = CMTimeMakeWithSeconds((Double(shutterValue) / 360.0) / activeFPS, preferredTimescale: 1_000_000)
             let minD = device.activeFormat.minExposureDuration
             let maxD = device.activeFormat.maxExposureDuration
             if CMTimeCompare(shutterDuration, minD) < 0 { shutterDuration = minD }
@@ -618,6 +637,18 @@ final class CameraViewModel: ObservableObject {
         isAutoFocus = true
         isFocusLocked = lock
         captureController.setFocusPointOfInterest(point, lock: lock)
+    }
+    
+    func triggerTapToFocus(at screenPoint: CGPoint, normalized: CGPoint) {
+        setFocusPoint(normalized, lock: false)
+        focusPointLocation = screenPoint
+        
+        // Hide indicator after 1.5 seconds
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+            if self.focusPointLocation == screenPoint {
+                self.focusPointLocation = nil
+            }
+        }
     }
 
     private func clampWhiteBalanceGains(_ gains: AVCaptureDevice.WhiteBalanceGains, for device: AVCaptureDevice) -> AVCaptureDevice.WhiteBalanceGains {
@@ -850,12 +881,14 @@ final class CameraViewModel: ObservableObject {
         }
         let drops = frameBuffer.droppedCount
 
-        // BGRA conversion + video encoding stays on processQueue (off MainActor)
+        // BGRA conversion + video encoding is now fully asynchronous (zero CPU blocking)
         if isRecordingUnsafe {
-            if let pb = pipeline.textureToPixelBufferBGRA(framed) {
-                if videoWriter.appendFrame(pixelBuffer: pb) {
-                    // frameIndex is nonisolated(unsafe), safe from processQueue
-                    frameIndex += 1
+            pipeline.textureToPixelBufferBGRA(framed) { [weak self] pb in
+                guard let self = self, let pb = pb else { return }
+                self.processQueue.async {
+                    if self.videoWriter.appendFrame(pixelBuffer: pb) {
+                        self.frameIndex += 1
+                    }
                 }
             }
         }

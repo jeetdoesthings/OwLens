@@ -34,9 +34,22 @@ struct RootView: View {
                         CameraPreviewView(
                             metalPipeline: pipeline,
                             currentTexture: $viewModel.currentTexture,
-                            showClipping: $viewModel.showClipping
+                            showClipping: $viewModel.showClipping,
+                            showFocusPeaking: $viewModel.showFocusPeaking
                         )
                             .ignoresSafeArea()
+                            .onTapGesture { location in
+                                let normalized = CGPoint(x: location.x / geo.size.width, y: location.y / geo.size.height)
+                                viewModel.triggerTapToFocus(at: location, normalized: normalized)
+                            }
+                        
+                        if let focusPt = viewModel.focusPointLocation {
+                            Rectangle()
+                                .stroke(Color.yellow, lineWidth: 1.5)
+                                .frame(width: 60, height: 60)
+                                .position(focusPt)
+                                .animation(.spring(), value: viewModel.focusPointLocation)
+                        }
 
                         GridLevelOverlay(
                             showGrid: viewModel.showGrid,

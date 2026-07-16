@@ -8,13 +8,14 @@ struct CameraPreviewView: UIViewRepresentable {
     let metalPipeline: MetalPipeline
     @Binding var currentTexture: MTLTexture?
     @Binding var showClipping: Bool
+    @Binding var showFocusPeaking: Bool
  
     func makeUIView(context: Context) -> MTKView {
         let mtkView = MTKView(frame: .zero, device: metalPipeline.device)
         mtkView.delegate = context.coordinator
         mtkView.framebufferOnly = true
         mtkView.colorPixelFormat = .bgra8Unorm
-        mtkView.preferredFramesPerSecond = 30
+        mtkView.preferredFramesPerSecond = 60
         mtkView.enableSetNeedsDisplay = false
         mtkView.isPaused = false
         mtkView.autoResizeDrawable = true
@@ -29,6 +30,7 @@ struct CameraPreviewView: UIViewRepresentable {
     func updateUIView(_ uiView: MTKView, context: Context) {
         context.coordinator.currentTexture = currentTexture
         context.coordinator.showClipping = showClipping
+        context.coordinator.showFocusPeaking = showFocusPeaking
     }
  
     func makeCoordinator() -> Coordinator {
@@ -39,6 +41,7 @@ struct CameraPreviewView: UIViewRepresentable {
         let metalPipeline: MetalPipeline
         var currentTexture: MTLTexture?
         var showClipping: Bool = false
+        var showFocusPeaking: Bool = false
         private let renderCommandQueue: MTLCommandQueue?
         private let renderPipeline: MTLRenderPipelineState?
  
@@ -126,6 +129,9 @@ struct CameraPreviewView: UIViewRepresentable {
                 
                 var clipping: Int32 = showClipping ? 1 : 0
                 renderEncoder.setFragmentBytes(&clipping, length: MemoryLayout<Int32>.size, index: 2)
+                
+                var peaking: Int32 = showFocusPeaking ? 1 : 0
+                renderEncoder.setFragmentBytes(&peaking, length: MemoryLayout<Int32>.size, index: 3)
                 
                 // Draw full-screen triangle
                 renderEncoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)

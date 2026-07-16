@@ -100,7 +100,7 @@ final class CaptureController: NSObject, ObservableObject {
 
         photoOutput.maxPhotoQualityPrioritization = .speed
         maxInFlight = 1
-
+ 
         // Mic + audio output
         if let defaultMic = AVCaptureDevice.default(for: .audio) {
             try attachAudioDevice(defaultMic)
@@ -313,8 +313,8 @@ final class CaptureController: NSObject, ObservableObject {
 
     private func applyDefaultCameraModes(on camera: AVCaptureDevice) throws {
         try camera.lockForConfiguration()
-        if camera.isFocusModeSupported(.continuousAutoFocus) {
-            camera.focusMode = .continuousAutoFocus
+        if camera.isFocusModeSupported(.autoFocus) {
+            camera.focusMode = .autoFocus
         }
         if camera.isExposureModeSupported(.continuousAutoExposure) {
             camera.exposureMode = .continuousAutoExposure
@@ -763,8 +763,8 @@ final class CaptureController: NSObject, ObservableObject {
         guard let device = device else { return }
         do {
             try device.lockForConfiguration()
-            if device.isFocusModeSupported(.continuousAutoFocus) {
-                device.focusMode = .continuousAutoFocus
+            if device.isFocusModeSupported(.autoFocus) {
+                device.focusMode = .autoFocus
             } else if device.isFocusModeSupported(.autoFocus) {
                 device.focusMode = .autoFocus
             }
@@ -786,8 +786,8 @@ final class CaptureController: NSObject, ObservableObject {
                     device.focusMode = .autoFocus
                 }
             } else {
-                if device.isFocusModeSupported(.continuousAutoFocus) {
-                    device.focusMode = .continuousAutoFocus
+                if device.isFocusModeSupported(.autoFocus) {
+                    device.focusMode = .autoFocus
                 } else if device.isFocusModeSupported(.autoFocus) {
                     device.focusMode = .autoFocus
                 }

@@ -13,9 +13,14 @@ enum ExposureStops {
         stepped(in: range, step: 5)
     }
 
-    /// Shutter denominator 1/x in steps of 5 (1/15, 1/20, 1/25… 1/125…).
+    /// Standard cinematic shutter angles
+    static let shutterAngles: [Float] = [
+        360.0, 270.0, 216.0, 180.0, 172.8, 144.0, 90.0, 45.0, 22.5, 11.25
+    ]
+    
     static func shutterStops(in range: ClosedRange<Float>) -> [Float] {
-        stepped(in: range, step: 5)
+        let filtered = shutterAngles.filter { range.contains($0) }.sorted(by: <)
+        return filtered.isEmpty ? [range.lowerBound, range.upperBound] : filtered
     }
 
     static func wbStops(in range: ClosedRange<Float> = 2000...10000) -> [Float] {

@@ -316,7 +316,8 @@ fragment float4 displayFragment(
     texture2d<float> tex [[texture(0)]],
     constant int2 &destOffset [[buffer(0)]],
     constant int2 &destSize [[buffer(1)]],
-    constant int &showClipping [[buffer(2)]]
+    constant int &showClipping [[buffer(2)]],
+    constant int &showFocusPeaking [[buffer(3)]]
 ) {
     float2 uv = float2(in.position.x - destOffset.x, in.position.y - destOffset.y) / float2(destSize);
     if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) {
@@ -329,5 +330,25 @@ fragment float4 displayFragment(
     float isClipped = step(color.a, 0.5);
     float applyRed = (showClipping > 0) ? isClipped : 0.0;
     
-    return float4(mix(color.rgb, float3(1.0, 0.0, 0.0), applyRed), 1.0);
+    float3 finalColor = mix(color.rgb, float3(1.0, 0.0, 0.0), applyRed);
+    
+    if (showFocusPeaking > 0) {
+        // Lightweight edge detection (Laplacian approximation)
+        float2 texel = 1.0 / float2(tex.get_width(), tex.get_height());
+        
+        float c = (color.r + color.g + color.b) / 3.0;
+        float top = (tex.sample(s, uv + float2(0, -texel.y)).r + tex.sample(s, uv + float2(0, -texel.y)).g + tex.sample(s, uv + float2(0, -texel.y)).b) / 3.0;
+        float bottom = (tex.sample(s, uv + float2(0, texel.y)).r + tex.sample(s, uv + float2(0, texel.y)).g + tex.sample(s, uv + float2(0, texel.y)).b) / 3.0;
+        float left = (tex.sample(s, uv + float2(-texel.x, 0)).r + tex.sample(s, uv + float2(-texel.x, 0)).g + tex.sample(s, uv + float2(-texel.x, 0)).b) / 3.0;
+        float right = (tex.sample(s, uv + float2(texel.x, 0)).r + tex.sample(s, uv + float2(texel.x, 0)).g + tex.sample(s, uv + float2(texel.x, 0)).b) / 3.0;
+        
+        float edge = abs(top + bottom + left + right - 4.0 * c);
+        
+        // Threshold for edge detection
+        if (edge > 0.05) {
+            finalColor = float3(0.0, 1.0, 0.0); // Bright Green
+        }
+    }
+    
+    return float4(finalColor, 1.0);
 }

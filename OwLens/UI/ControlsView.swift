@@ -58,6 +58,11 @@ struct ControlsView: View {
                 active: viewModel.showClipping,
                 action: { viewModel.toggleClipping() }
             )
+            topToggle(
+                systemName: "viewfinder",
+                active: viewModel.showFocusPeaking,
+                action: { viewModel.toggleFocusPeaking() }
+            )
 
             Text(viewModel.cfaLabel)
                 .font(.system(size: 9, weight: .bold, design: .monospaced))
@@ -133,8 +138,8 @@ struct ControlsView: View {
     private var chipRow: some View {
         HStack(spacing: 3) {
             valueChip(title: "ISO", value: String(format: "%.0f", viewModel.isoValue), panel: .iso)
-            valueChip(title: "SHT", value: String(format: "1/%.0f", viewModel.shutterValue), panel: .shutter)
-            valueChip(title: "FCS", value: viewModel.isAutoFocus ? "AF" : String(format: "%.2f", viewModel.focusLensPosition), panel: .focus)
+            valueChip(title: "ANG", value: String(format: "%.0f°", viewModel.shutterValue), panel: .shutter)
+            valueChip(title: "FCS", value: viewModel.isAutoFocus ? "AF" : "MF", panel: .focus)
             valueChip(title: "WB", value: String(format: "%.0fK", viewModel.wbKelvin), panel: .wb)
             valueChip(title: "FPS", value: viewModel.selectedFPS.label, panel: .fps)
             valueChip(title: "FMT", value: viewModel.selectedFormat.shortLabel, panel: .format)
@@ -201,13 +206,20 @@ struct ControlsView: View {
                     onNudge: { viewModel.nudgeISO($0) }
                 )
             case .shutter:
-                panelHeader("Shutter — snap stops")
-                stopSlider(
-                    index: $viewModel.shutterStopIndex,
-                    count: viewModel.shutterStops.count,
-                    label: String(format: "1/%.0f", viewModel.shutterValue),
-                    onNudge: { viewModel.nudgeShutter($0) }
-                )
+                panelHeader("Shutter Angle")
+                HStack {
+                    Text(String(format: "%.0f°", viewModel.shutterRange.lowerBound))
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundColor(.white.opacity(0.6))
+                    Slider(value: Binding(get: { viewModel.shutterValue }, set: { 
+                        viewModel.setShutterAngleWithSnapping($0) 
+                    }), in: viewModel.shutterRange)
+                    .tint(.white)
+                    Text(String(format: "%.0f°", viewModel.shutterRange.upperBound))
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundColor(.white.opacity(0.6))
+                }
+                .padding(.horizontal, 4)
             case .wb:
                 panelHeader("White Balance — snap stops")
                 stopSlider(
@@ -220,18 +232,6 @@ struct ControlsView: View {
                 HStack(alignment: .center) {
                     panelHeader("Focus")
                     Spacer()
-                    Button {
-                        viewModel.isAutoFocus = true
-                    } label: {
-                        Text("AF")
-                            .font(.system(size: 11, weight: .bold, design: .monospaced))
-                            .padding(.horizontal, 10)
-                            .padding(.vertical, 5)
-                            .background(viewModel.isAutoFocus ? Color.white : Color.white.opacity(0.12))
-                            .foregroundColor(viewModel.isAutoFocus ? .black : .white.opacity(0.85))
-                            .clipShape(Capsule())
-                    }
-                    .buttonStyle(.plain)
                 }
                 
                 HStack {

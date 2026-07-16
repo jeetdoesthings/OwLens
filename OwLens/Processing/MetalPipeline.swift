@@ -215,42 +215,39 @@ final class MetalPipeline: @unchecked Sendable {
             enc.endEncoding()
         }
 
+        let finalTex = cropToAspectAndScale(fusedOut, targetWidth: encodeWidth, targetHeight: encodeHeight, cb: commandBuffer) ?? fusedOut
+        
         commandBuffer.commit()
         commandBuffer.waitUntilCompleted()
-
-        // Crop/scale to encode size
-        return cropToAspectAndScale(fusedOut, targetWidth: encodeWidth, targetHeight: encodeHeight) ?? fusedOut
+        return finalTex
     }
 
-    func scale(_ texture: MTLTexture, width: Int, height: Int) -> MTLTexture? {
+    func scale(_ texture: MTLTexture, width: Int, height: Int, cb: MTLCommandBuffer) -> MTLTexture? {
         guard width > 0, height > 0 else { return nil }
         if texture.width == width && texture.height == height { return texture }
         let outDesc = MTLTextureDescriptor.texture2DDescriptor(
             pixelFormat: .rgba16Float, width: width, height: height, mipmapped: false)
         outDesc.usage = [.shaderWrite, .shaderRead]
         outDesc.storageMode = .private
-        guard let output = device.makeTexture(descriptor: outDesc),
-              let commandBuffer = commandQueue.makeCommandBuffer() else { return nil }
-        scaler.encode(commandBuffer: commandBuffer, sourceTexture: texture, destinationTexture: output)
-        commandBuffer.commit()
-        commandBuffer.waitUntilCompleted()
+        guard let output = device.makeTexture(descriptor: outDesc) else { return nil }
+        scaler.encode(commandBuffer: cb, sourceTexture: texture, destinationTexture: output)
         return output
     }
 
-    func cropToAspectAndScale(_ texture: MTLTexture, targetWidth: Int, targetHeight: Int) -> MTLTexture? {
+    func cropToAspectAndScale(_ texture: MTLTexture, targetWidth: Int, targetHeight: Int, cb: MTLCommandBuffer) -> MTLTexture? {
         guard targetWidth > 0, targetHeight > 0 else { return nil }
         let srcW = texture.width
         let srcH = texture.height
         guard srcW > 0, srcH > 0 else { return nil }
-
+ 
         let srcAspect = Float(srcW) / Float(srcH)
         let dstAspect = Float(targetWidth) / Float(targetHeight)
-
+ 
         var cropW = srcW
         var cropH = srcH
         var originX = 0
         var originY = 0
-
+ 
         if srcAspect > dstAspect + 0.001 {
             cropW = max(2, Int((Float(srcH) * dstAspect).rounded(.toNearestOrEven)))
             originX = max(0, (srcW - cropW) / 2)
@@ -258,28 +255,27 @@ final class MetalPipeline: @unchecked Sendable {
             cropH = max(2, Int((Float(srcW) / dstAspect).rounded(.toNearestOrEven)))
             originY = max(0, (srcH - cropH) / 2)
         }
-
+ 
         cropW = min(srcW - originX, cropW) & ~1
         cropH = min(srcH - originY, cropH) & ~1
         originX &= ~1
         originY &= ~1
-
+ 
         guard cropW >= 2, cropH >= 2 else {
-            return scale(texture, width: targetWidth, height: targetHeight)
+            return scale(texture, width: targetWidth, height: targetHeight, cb: cb)
         }
-
+ 
         if cropW == srcW && cropH == srcH && srcW == targetWidth && srcH == targetHeight {
             return texture
         }
-
+ 
         let sourceForScale: MTLTexture
         if cropW == srcW && cropH == srcH {
             sourceForScale = texture
         } else {
             guard let cropped = makePrivateTexture(width: cropW, height: cropH),
-                  let cb = commandQueue.makeCommandBuffer(),
                   let blit = cb.makeBlitCommandEncoder() else {
-                return scale(texture, width: targetWidth, height: targetHeight)
+                return scale(texture, width: targetWidth, height: targetHeight, cb: cb)
             }
             blit.copy(
                 from: texture,
@@ -291,45 +287,57 @@ final class MetalPipeline: @unchecked Sendable {
                 destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0)
             )
             blit.endEncoding()
-            cb.commit()
-            cb.waitUntilCompleted()
             sourceForScale = cropped
         }
-
-        return scale(sourceForScale, width: targetWidth, height: targetHeight)
+ 
+        return scale(sourceForScale, width: targetWidth, height: targetHeight, cb: cb)
     }
 
-    /// BGRA8 pixel buffer for HEVC (better device player compat than 64RGBAHalf).
-    func textureToPixelBufferBGRA(_ texture: MTLTexture) -> CVPixelBuffer? {
+    func textureToPixelBufferBGRA(
+        _ texture: MTLTexture,
+        completion: @escaping (CVPixelBuffer?) -> Void
+    ) {
         let width = texture.width
         let height = texture.height
-
-        guard let bgraTex = getOrCreateBGRATexture(width: width, height: height),
-              let cb = commandQueue.makeCommandBuffer() else { return nil }
-
-        // rgba16Float → bgra8Unorm via MPS scale (handles format convert)
-        scaler.encode(commandBuffer: cb, sourceTexture: texture, destinationTexture: bgraTex)
-        cb.commit()
-        cb.waitUntilCompleted()
-
-        var pixelBuffer: CVPixelBuffer?
+ 
         let attrs: [String: Any] = [
             kCVPixelBufferMetalCompatibilityKey as String: true,
             kCVPixelBufferIOSurfacePropertiesKey as String: [:] as [String: Any]
         ]
+        var pixelBuffer: CVPixelBuffer?
         let status = CVPixelBufferCreate(
             nil, width, height,
             kCVPixelFormatType_32BGRA,
             attrs as CFDictionary,
             &pixelBuffer)
-        guard status == kCVReturnSuccess, let pb = pixelBuffer else { return nil }
-
-        CVPixelBufferLockBaseAddress(pb, [])
-        defer { CVPixelBufferUnlockBaseAddress(pb, []) }
-        guard let base = CVPixelBufferGetBaseAddress(pb) else { return nil }
-        let bpr = CVPixelBufferGetBytesPerRow(pb)
-        bgraTex.getBytes(base, bytesPerRow: bpr, from: MTLRegionMake2D(0, 0, width, height), mipmapLevel: 0)
-        return pb
+        
+        guard status == kCVReturnSuccess,
+              let pb = pixelBuffer,
+              let textureCache = textureCache else {
+            completion(nil)
+            return
+        }
+ 
+        var cvTextureOut: CVMetalTexture?
+        let cacheStatus = CVMetalTextureCacheCreateTextureFromImage(
+            nil, textureCache, pb, nil,
+            .bgra8Unorm, width, height, 0, &cvTextureOut)
+ 
+        guard cacheStatus == kCVReturnSuccess,
+              let cvTex = cvTextureOut,
+              let bgraTex = CVMetalTextureGetTexture(cvTex),
+              let cb = commandQueue.makeCommandBuffer() else {
+            completion(nil)
+            return
+        }
+ 
+        // rgba16Float → bgra8Unorm via MPS scale (handles format convert) directly into the pixel buffer's memory!
+        scaler.encode(commandBuffer: cb, sourceTexture: texture, destinationTexture: bgraTex)
+        
+        cb.addCompletedHandler { _ in
+            completion(pb)
+        }
+        cb.commit()
     }
 
     // MARK: - Texture helpers
