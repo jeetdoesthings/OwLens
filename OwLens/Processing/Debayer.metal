@@ -463,5 +463,7 @@ kernel void chromaBilateralAndTNR(
         finalRGB = mix(finalRGB, historyRGB, blendFactor);
     }
     
-    outTexture.write(float4(finalRGB, 1.0), gid);
+    
+    float alpha = inTexture.read(gid).a;
+    outTexture.write(float4(finalRGB, alpha), gid);
 }
