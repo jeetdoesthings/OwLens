@@ -8,7 +8,7 @@ struct DebayerParams {
     var bayerPattern: Int32
     var blackLevel: Float
     var whiteLevel: Float
-    var _pad: Float = 0
+    var lscCoefficients: SIMD4<Float>
 }
 
 struct WhiteBalanceParams {
@@ -53,7 +53,11 @@ struct FusedParams {
     var whiteLevel: Float
     var curveType: Int32
     var wbGains: SIMD3<Float>
-    var _pad: Float = 0
+    var lscCoefficients: SIMD4<Float>
+}
+struct BilateralParams {
+    var iso: Float
+    var isFirstFrame: Int32
 }
 
 /// Metal pipeline: Bayer → (CFA-safe 2× bin) → **fused** debayer+WB+log → optional crop/scale.
@@ -67,6 +71,7 @@ final class MetalPipeline: @unchecked Sendable {
     let commandQueue: MTLCommandQueue
     private let binPipeline: MTLComputePipelineState
     private let fusedPipeline: MTLComputePipelineState
+    private let chromaBilateralTNRPipeline: MTLComputePipelineState
     // Keep legacy pipelines for fallback / future use
     private let debayerPipeline: MTLComputePipelineState
     private let wbPipeline: MTLComputePipelineState
@@ -81,6 +86,12 @@ final class MetalPipeline: @unchecked Sendable {
     private var pooledFusedTex: MTLTexture?
     private var pooledFusedW: Int = 0
     private var pooledFusedH: Int = 0
+    
+    // TNR ping-pong state
+    private var tnrTextures: [MTLTexture] = []
+    private var tnrIndex: Int = 0
+    private var isFirstTNRFrame: Bool = true
+    
     private var pooledBGRATex: MTLTexture?
     private var pooledBGRAW: Int = 0
     private var pooledBGRAH: Int = 0
@@ -90,6 +101,9 @@ final class MetalPipeline: @unchecked Sendable {
     var bayerPattern: Int32 = 0
     var blackLevel: Float = 0
     var whiteLevel: Float = 16383.0 / 65535.0
+    var lscCoefficients: SIMD4<Float> = SIMD4<Float>(repeating: 0)
+    var iso: Float = 0
+    var isAutoWBEnabled: Bool = true
 
     init?() {
         guard let device = MTLCreateSystemDefaultDevice(),
@@ -97,6 +111,7 @@ final class MetalPipeline: @unchecked Sendable {
               let library = device.makeDefaultLibrary(),
               let binFunc = library.makeFunction(name: "binBayerCFA"),
               let fusedFunc = library.makeFunction(name: "debayerWBLog"),
+              let chromaTNRFunc = library.makeFunction(name: "chromaBilateralAndTNR"),
               let debayerFunc = library.makeFunction(name: "debayerBilinear"),
               let wbFunc = library.makeFunction(name: "applyWhiteBalanceAndColorMatrix"),
               let logCurveFunc = library.makeFunction(name: "applyLogCurve") else {
@@ -108,6 +123,7 @@ final class MetalPipeline: @unchecked Sendable {
         do {
             self.binPipeline = try device.makeComputePipelineState(function: binFunc)
             self.fusedPipeline = try device.makeComputePipelineState(function: fusedFunc)
+            self.chromaBilateralTNRPipeline = try device.makeComputePipelineState(function: chromaTNRFunc)
             self.debayerPipeline = try device.makeComputePipelineState(function: debayerFunc)
             self.wbPipeline = try device.makeComputePipelineState(function: wbFunc)
             self.logCurvePipeline = try device.makeComputePipelineState(function: logCurveFunc)
@@ -140,6 +156,32 @@ final class MetalPipeline: @unchecked Sendable {
         pooledFusedW = width
         pooledFusedH = height
         return tex
+    }
+
+    private func getTNRTextures(width: Int, height: Int) -> (history: MTLTexture, output: MTLTexture)? {
+        if tnrTextures.count == 2, tnrTextures[0].width == width, tnrTextures[0].height == height {
+            let history = tnrTextures[tnrIndex]
+            tnrIndex = (tnrIndex + 1) % 2
+            let output = tnrTextures[tnrIndex]
+            return (history, output)
+        }
+        
+        let desc = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .rgba16Float, width: width, height: height, mipmapped: false)
+        desc.usage = [.shaderWrite, .shaderRead]
+        desc.storageMode = .private
+        
+        guard let t0 = device.makeTexture(descriptor: desc),
+              let t1 = device.makeTexture(descriptor: desc) else { return nil }
+              
+        tnrTextures = [t0, t1]
+        tnrIndex = 0
+        isFirstTNRFrame = true
+        return (tnrTextures[0], tnrTextures[1])
+    }
+    
+    func resetTNR() {
+        isFirstTNRFrame = true
     }
 
     private func getOrCreateBGRATexture(width: Int, height: Int) -> MTLTexture? {
@@ -208,14 +250,33 @@ final class MetalPipeline: @unchecked Sendable {
                 blackLevel: blackLevel,
                 whiteLevel: max(whiteLevel, blackLevel + 1e-6),
                 curveType: Int32(curveType.rawValue),
-                wbGains: wbParams.gains
+                wbGains: wbParams.gains,
+                lscCoefficients: lscCoefficients
             )
             enc.setBytes(&params, length: MemoryLayout<FusedParams>.stride, index: 0)
             dispatch(enc, width: bayerW, height: bayerH, state: fusedPipeline)
             enc.endEncoding()
         }
 
-        let finalTex = cropToAspectAndScale(fusedOut, targetWidth: encodeWidth, targetHeight: encodeHeight, cb: commandBuffer) ?? fusedOut
+        // ── Chroma Bilateral + TNR Pass ──
+        guard let (historyTex, denoisedOut) = getTNRTextures(width: bayerW, height: bayerH) else { return nil }
+
+        if let enc = commandBuffer.makeComputeCommandEncoder() {
+            enc.setComputePipelineState(chromaBilateralTNRPipeline)
+            enc.setTexture(fusedOut, index: 0)
+            enc.setTexture(denoisedOut, index: 1)
+            enc.setTexture(historyTex, index: 2)
+            
+            var bParams = BilateralParams(iso: iso, isFirstFrame: isFirstTNRFrame ? 1 : 0)
+            enc.setBytes(&bParams, length: MemoryLayout<BilateralParams>.stride, index: 0)
+            
+            dispatch(enc, width: bayerW, height: bayerH, state: chromaBilateralTNRPipeline)
+            enc.endEncoding()
+        }
+        
+        isFirstTNRFrame = false
+
+        let finalTex = cropToAspectAndScale(denoisedOut, targetWidth: encodeWidth, targetHeight: encodeHeight, cb: commandBuffer) ?? denoisedOut
         
         commandBuffer.commit()
         commandBuffer.waitUntilCompleted()

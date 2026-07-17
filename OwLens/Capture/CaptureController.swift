@@ -13,6 +13,8 @@ struct RawFrameData {
     let blackLevel: Float
     let whiteLevel: Float
     let pixelFormat: OSType
+    let lscCoefficients: SIMD4<Float>
+    let iso: Float
 }
 
 final class CaptureController: NSObject, ObservableObject {
@@ -48,9 +50,9 @@ final class CaptureController: NSObject, ObservableObject {
     private var selectedAudioPortUID: String?
     private var isReconfiguringAudio = false
 
-    /// Cached black/white so we don't re-parse metadata every frame after first.
     private var cachedBlackLevel: Float?
     private var cachedWhiteLevel: Float?
+    private var cachedISO: Float?
 
     // MARK: - Session Configuration
 
@@ -584,9 +586,10 @@ final class CaptureController: NSObject, ObservableObject {
                     }
                     throw error
                 }
-
+                
                 self.cachedBlackLevel = nil
                 self.cachedWhiteLevel = nil
+                self.cachedISO = nil
                 self.prepareRAWPhotoResources()
 
                 if wasRunning {
@@ -1009,18 +1012,24 @@ extension CaptureController: AVCapturePhotoCaptureDelegate {
         } else {
             cfa = formatCFAPattern
         }
-
-        let (black, white): (Float, Float)
-        if let cb = cachedBlackLevel, let cw = cachedWhiteLevel {
-            black = cb
-            white = cw
+        let currentISO = device?.iso ?? 0
+        let levels: (Float, Float)
+        
+        if let cb = cachedBlackLevel, let cw = cachedWhiteLevel, let ci = cachedISO, abs(ci - currentISO) < 1.0 {
+            levels = (cb, cw)
         } else {
-            let levels = extractBlackWhiteLevels(from: photo, pixelFormat: rawPixelFormat)
+            levels = extractBlackWhiteLevels(from: photo, pixelFormat: rawPixelFormat)
             cachedBlackLevel = levels.0
             cachedWhiteLevel = levels.1
-            black = levels.0
-            white = levels.1
+            cachedISO = currentISO
         }
+        
+        let black = levels.0
+        let white = levels.1
+
+        // Disable hardcoded LSC polynomial. Hardcoding 0.35 across all iPhones/lenses
+        // will cause severe vignette under/over correction. (Phase 2 feature pending).
+        let lsc = SIMD4<Float>(0.0, 0.0, 0.0, 0.0)
 
         let frameData = RawFrameData(
             pixelBuffer: owned,
@@ -1028,7 +1037,9 @@ extension CaptureController: AVCapturePhotoCaptureDelegate {
             cfaPattern: cfa,
             blackLevel: black,
             whiteLevel: white,
-            pixelFormat: bufferFormat
+            pixelFormat: bufferFormat,
+            lscCoefficients: lsc,
+            iso: currentISO
         )
 
         onRawFrameData?(frameData)
@@ -1037,7 +1048,16 @@ extension CaptureController: AVCapturePhotoCaptureDelegate {
     private func extractBlackWhiteLevels(from photo: AVCapturePhoto, pixelFormat: OSType) -> (Float, Float) {
         let fullScale: Float = 65535.0
         var blackRaw: Float = 0
-        var whiteRaw: Float = 16383
+        
+        // Dynamically guess fallback based on format, in case metadata fails
+        var whiteRaw: Float = 16383 // Assume 14-bit
+        if pixelFormat == kCVPixelFormatType_14Bayer_RGGB || pixelFormat == kCVPixelFormatType_14Bayer_GRBG ||
+           pixelFormat == kCVPixelFormatType_14Bayer_GBRG || pixelFormat == kCVPixelFormatType_14Bayer_BGGR {
+            whiteRaw = 16383
+        } else {
+            // If it's a 10 or 12 bit bayer format (or custom), fallback appropriately (though iOS prefers 14)
+            // But realistically, if DNG metadata exists, it overrides this anyway.
+        }
 
         let metadata = photo.metadata
         if let dng = metadata["{DNG}"] as? [String: Any] {

@@ -370,7 +370,7 @@ final class CameraViewModel: ObservableObject {
             try AVAudioSession.sharedInstance().setCategory(
                 .playAndRecord,
                 mode: .videoRecording,
-                options: [.defaultToSpeaker, .allowBluetooth, .allowBluetoothA2DP, .mixWithOthers]
+                options: [.defaultToSpeaker, .allowBluetoothHFP, .allowBluetoothA2DP, .mixWithOthers]
             )
             try AVAudioSession.sharedInstance().setActive(true)
         } catch {
@@ -663,10 +663,13 @@ final class CameraViewModel: ObservableObject {
     private func updateWBParams(from device: AVCaptureDevice) {
         switch wbMode {
         case .daylight:
+            metalPipeline?.isAutoWBEnabled = false
             metalPipeline?.wbParams = .daylight
         case .tungsten:
+            metalPipeline?.isAutoWBEnabled = false
             metalPipeline?.wbParams = .tungsten
         case .manual, .auto:
+            metalPipeline?.isAutoWBEnabled = (wbMode == .auto)
             let gains = device.deviceWhiteBalanceGains
             let g = max(gains.greenGain, 0.001)
             metalPipeline?.wbParams = WhiteBalanceParams(
@@ -846,6 +849,10 @@ final class CameraViewModel: ObservableObject {
         }
     }
 
+    struct SendablePixelBuffer: @unchecked Sendable {
+        let buffer: CVPixelBuffer
+    }
+
     nonisolated private func processFrame(_ frameData: RawFrameData) {
         guard isAppActive else { return }
         guard let pipeline = metalPipeline else { return }
@@ -853,8 +860,10 @@ final class CameraViewModel: ObservableObject {
         pipeline.bayerPattern = frameData.cfaPattern
         pipeline.blackLevel = frameData.blackLevel
         pipeline.whiteLevel = frameData.whiteLevel
+        pipeline.lscCoefficients = frameData.lscCoefficients
+        pipeline.iso = frameData.iso
 
-        if let gains = frameData.whiteBalanceGains {
+        if pipeline.isAutoWBEnabled, let gains = frameData.whiteBalanceGains {
             let g = max(gains.greenGain, 0.001)
             pipeline.wbParams = WhiteBalanceParams(
                 gains: SIMD3<Float>(
@@ -881,13 +890,17 @@ final class CameraViewModel: ObservableObject {
         }
         let drops = frameBuffer.droppedCount
 
-        // BGRA conversion + video encoding is now fully asynchronous (zero CPU blocking)
+        // BGRA conversion + video encoding is fully asynchronous (zero CPU blocking)
         if isRecordingUnsafe {
             pipeline.textureToPixelBufferBGRA(framed) { [weak self] pb in
                 guard let self = self, let pb = pb else { return }
+                let sendablePB = SendablePixelBuffer(buffer: pb)
                 self.processQueue.async {
-                    if self.videoWriter.appendFrame(pixelBuffer: pb) {
-                        self.frameIndex += 1
+                    Task { @MainActor [weak self] in
+                        guard let self = self else { return }
+                        if self.videoWriter.appendFrame(pixelBuffer: sendablePB.buffer) {
+                            self.frameIndex += 1
+                        }
                     }
                 }
             }
@@ -896,7 +909,6 @@ final class CameraViewModel: ObservableObject {
         // Only preview texture + UI counters go to MainActor
         Task { @MainActor [weak self] in
             guard let self else { return }
-            self.currentTexture = framed
             self.currentTexture = framed
             self.cfaLabel = cfaName
             self.droppedFrames = drops

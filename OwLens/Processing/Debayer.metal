@@ -12,7 +12,7 @@ struct DebayerParams {
     int bayerPattern;
     float blackLevel;
     float whiteLevel;
-    float _pad;
+    float4 lscCoefficients;
 };
 
 struct WhiteBalanceParams {
@@ -20,48 +20,18 @@ struct WhiteBalanceParams {
     float3x3 colorMatrix;
 };
 
-// Sample with bounds check; returns whether sample is inside (for edge averages).
-static inline bool sampleBayerValid(texture2d<float, access::read> tex, int x, int y, int dx, int dy, thread float &outV) {
-    int nx = x + dx;
-    int ny = y + dy;
-    int w = int(tex.get_width());
-    int h = int(tex.get_height());
-    if (nx < 0 || ny < 0 || nx >= w || ny >= h) {
-        outV = 0.0;
-        return false;
-    }
-    outV = tex.read(uint2(nx, ny)).r;
-    return true;
-}
+// (Removed unused sampleBayerValid)
 
 static inline float linearize(float raw, float black, float white) {
     float denom = max(white - black, 1e-6);
-    return saturate((raw - black) / denom);
+    return (raw - black) / denom; // Do NOT clamp negative noise here, let it average to zero during demosaic!
 }
 
-// Average only in-bounds neighbors — avoids dark vignette from clamp-duplicating edges.
-static inline float avgLinNeighbors4(texture2d<float, access::read> tex, int x, int y,
-                                     int dx0, int dy0, int dx1, int dy1, int dx2, int dy2, int dx3, int dy3,
-                                     float black, float white) {
-    float s = 0.0;
-    float n = 0.0;
-    float v;
-    if (sampleBayerValid(tex, x, y, dx0, dy0, v)) { s += linearize(v, black, white); n += 1.0; }
-    if (sampleBayerValid(tex, x, y, dx1, dy1, v)) { s += linearize(v, black, white); n += 1.0; }
-    if (sampleBayerValid(tex, x, y, dx2, dy2, v)) { s += linearize(v, black, white); n += 1.0; }
-    if (sampleBayerValid(tex, x, y, dx3, dy3, v)) { s += linearize(v, black, white); n += 1.0; }
-    return n > 0.0 ? s / n : 0.0;
-}
-
-static inline float avgLinNeighbors2(texture2d<float, access::read> tex, int x, int y,
-                                     int dx0, int dy0, int dx1, int dy1,
-                                     float black, float white) {
-    float s = 0.0;
-    float n = 0.0;
-    float v;
-    if (sampleBayerValid(tex, x, y, dx0, dy0, v)) { s += linearize(v, black, white); n += 1.0; }
-    if (sampleBayerValid(tex, x, y, dx1, dy1, v)) { s += linearize(v, black, white); n += 1.0; }
-    return n > 0.0 ? s / n : 0.0;
+static inline float sampleBayerClamp(texture2d<float, access::read> tex, int x, int y, int dx, int dy, float black, float white) {
+    int nx = clamp(x + dx, 0, int(tex.get_width()) - 1);
+    int ny = clamp(y + dy, 0, int(tex.get_height()) - 1);
+    float v = tex.read(uint2(nx, ny)).r;
+    return linearize(v, black, white);
 }
 
 // CFA-preserving half-res bin: out(x,y) = in(2x+(x&1), 2y+(y&1))
@@ -104,36 +74,50 @@ kernel void debayerBilinear(
     float black = params.blackLevel;
     float white = params.whiteLevel;
 
+    // ── Directional Demosaic (Malvar-He-Cutler) ──
+    float c00 = sampleBayerClamp(rawTexture, x, y, 0, 0, black, white);
+    float cN1 = sampleBayerClamp(rawTexture, x, y, 0, -1, black, white);
+    float cS1 = sampleBayerClamp(rawTexture, x, y, 0, 1, black, white);
+    float cE1 = sampleBayerClamp(rawTexture, x, y, 1, 0, black, white);
+    float cW1 = sampleBayerClamp(rawTexture, x, y, -1, 0, black, white);
+    
+    float cN2 = sampleBayerClamp(rawTexture, x, y, 0, -2, black, white);
+    float cS2 = sampleBayerClamp(rawTexture, x, y, 0, 2, black, white);
+    float cE2 = sampleBayerClamp(rawTexture, x, y, 2, 0, black, white);
+    float cW2 = sampleBayerClamp(rawTexture, x, y, -2, 0, black, white);
+    
+    float cNE = sampleBayerClamp(rawTexture, x, y, 1, -1, black, white);
+    float cNW = sampleBayerClamp(rawTexture, x, y, -1, -1, black, white);
+    float cSE = sampleBayerClamp(rawTexture, x, y, 1, 1, black, white);
+    float cSW = sampleBayerClamp(rawTexture, x, y, -1, 1, black, white);
+
+    float G_at_RB = (2*(cN1 + cS1 + cE1 + cW1) + 4*c00 - (cN2 + cS2 + cE2 + cW2)) / 8.0;
+    float Color_at_G_H = (4*(cE1 + cW1) + 5*c00 - (cE2 + cW2) - 0.5*(cN2 + cS2) - (cNE + cNW + cSE + cSW)) / 8.0;
+    float Color_at_G_V = (4*(cN1 + cS1) + 5*c00 - (cN2 + cS2) - 0.5*(cE2 + cW2) - (cNE + cNW + cSE + cSW)) / 8.0;
+    float Color_at_Diag = (2*(cNE + cNW + cSE + cSW) + 6*c00 - 1.5*(cN2 + cS2 + cE2 + cW2)) / 8.0;
+
     float r, g, b;
-    float center;
-    sampleBayerValid(rawTexture, x, y, 0, 0, center);
-    float cLin = linearize(center, black, white);
-
     if (yEven && xEven) {
-        r = cLin;
-        g = avgLinNeighbors4(rawTexture, x, y, -1, 0, 1, 0, 0, -1, 0, 1, black, white);
-        b = avgLinNeighbors4(rawTexture, x, y, -1, -1, 1, -1, -1, 1, 1, 1, black, white);
+        r = c00; g = G_at_RB; b = Color_at_Diag;
     } else if (yEven && !xEven) {
-        g = cLin;
-        r = avgLinNeighbors2(rawTexture, x, y, -1, 0, 1, 0, black, white);
-        b = avgLinNeighbors2(rawTexture, x, y, 0, -1, 0, 1, black, white);
+        r = Color_at_G_H; g = c00; b = Color_at_G_V;
     } else if (!yEven && xEven) {
-        g = cLin;
-        b = avgLinNeighbors2(rawTexture, x, y, -1, 0, 1, 0, black, white);
-        r = avgLinNeighbors2(rawTexture, x, y, 0, -1, 0, 1, black, white);
+        b = Color_at_G_H; g = c00; r = Color_at_G_V;
     } else {
-        b = cLin;
-        g = avgLinNeighbors4(rawTexture, x, y, -1, 0, 1, 0, 0, -1, 0, 1, black, white);
-        r = avgLinNeighbors4(rawTexture, x, y, -1, -1, 1, -1, -1, 1, 1, 1, black, white);
+        b = c00; g = G_at_RB; r = Color_at_Diag;
     }
+    r = max(r, 0.0);
+    g = max(g, 0.0);
+    b = max(b, 0.0);
 
-    // Mild optical falloff compensation (sensor vignette without shading map)
-    // Strength kept low so center stays natural.
+    // Per-channel Lens Shading Correction (LSC)
     float2 uv = float2(float(x) + 0.5, float(y) + 0.5) / float2(float(outTexture.get_width()), float(outTexture.get_height()));
     float2 d = uv - float2(0.5, 0.5);
-    float r2 = dot(d, d); // 0 center → ~0.5 corners
-    float vignetteGain = 1.0 + 0.35 * r2; // lift corners slightly
-    float3 rgb = float3(r, g, b) * vignetteGain;
+    float r2 = dot(d, d);
+    float gainR = 1.0 + params.lscCoefficients[0] * r2;
+    float gainG = 1.0 + ((params.lscCoefficients[1] + params.lscCoefficients[2]) * 0.5) * r2;
+    float gainB = 1.0 + params.lscCoefficients[3] * r2;
+    float3 rgb = float3(r * gainR, g * gainG, b * gainB);
     rgb = min(rgb, float3(8.0)); // allow headroom pre-log
 
     outTexture.write(float4(rgb, 1.0), gid);
@@ -200,7 +184,7 @@ struct FusedParams {
     float whiteLevel;
     int   curveType;
     float3 wbGains;
-    float  _pad;
+    float4 lscCoefficients;
 };
 
 kernel void debayerWBLog(
@@ -225,36 +209,51 @@ kernel void debayerWBLog(
     float black = params.blackLevel;
     float white = params.whiteLevel;
 
-    // ── Demosaic (bilinear) ──
+    // ── Directional Demosaic (Malvar-He-Cutler) ──
+    float c00 = sampleBayerClamp(rawTexture, x, y, 0, 0, black, white);
+    float cN1 = sampleBayerClamp(rawTexture, x, y, 0, -1, black, white);
+    float cS1 = sampleBayerClamp(rawTexture, x, y, 0, 1, black, white);
+    float cE1 = sampleBayerClamp(rawTexture, x, y, 1, 0, black, white);
+    float cW1 = sampleBayerClamp(rawTexture, x, y, -1, 0, black, white);
+    
+    float cN2 = sampleBayerClamp(rawTexture, x, y, 0, -2, black, white);
+    float cS2 = sampleBayerClamp(rawTexture, x, y, 0, 2, black, white);
+    float cE2 = sampleBayerClamp(rawTexture, x, y, 2, 0, black, white);
+    float cW2 = sampleBayerClamp(rawTexture, x, y, -2, 0, black, white);
+    
+    float cNE = sampleBayerClamp(rawTexture, x, y, 1, -1, black, white);
+    float cNW = sampleBayerClamp(rawTexture, x, y, -1, -1, black, white);
+    float cSE = sampleBayerClamp(rawTexture, x, y, 1, 1, black, white);
+    float cSW = sampleBayerClamp(rawTexture, x, y, -1, 1, black, white);
+
+    float G_at_RB = (2*(cN1 + cS1 + cE1 + cW1) + 4*c00 - (cN2 + cS2 + cE2 + cW2)) / 8.0;
+    float Color_at_G_H = (4*(cE1 + cW1) + 5*c00 - (cE2 + cW2) - 0.5*(cN2 + cS2) - (cNE + cNW + cSE + cSW)) / 8.0;
+    float Color_at_G_V = (4*(cN1 + cS1) + 5*c00 - (cN2 + cS2) - 0.5*(cE2 + cW2) - (cNE + cNW + cSE + cSW)) / 8.0;
+    float Color_at_Diag = (2*(cNE + cNW + cSE + cSW) + 6*c00 - 1.5*(cN2 + cS2 + cE2 + cW2)) / 8.0;
+
     float r, g, b;
-    float center;
-    sampleBayerValid(rawTexture, x, y, 0, 0, center);
-    float cLin = linearize(center, black, white);
-
     if (yEven && xEven) {
-        r = cLin;
-        g = avgLinNeighbors4(rawTexture, x, y, -1, 0, 1, 0, 0, -1, 0, 1, black, white);
-        b = avgLinNeighbors4(rawTexture, x, y, -1, -1, 1, -1, -1, 1, 1, 1, black, white);
+        r = c00; g = G_at_RB; b = Color_at_Diag;
     } else if (yEven && !xEven) {
-        g = cLin;
-        r = avgLinNeighbors2(rawTexture, x, y, -1, 0, 1, 0, black, white);
-        b = avgLinNeighbors2(rawTexture, x, y, 0, -1, 0, 1, black, white);
+        r = Color_at_G_H; g = c00; b = Color_at_G_V;
     } else if (!yEven && xEven) {
-        g = cLin;
-        b = avgLinNeighbors2(rawTexture, x, y, -1, 0, 1, 0, black, white);
-        r = avgLinNeighbors2(rawTexture, x, y, 0, -1, 0, 1, black, white);
+        b = Color_at_G_H; g = c00; r = Color_at_G_V;
     } else {
-        b = cLin;
-        g = avgLinNeighbors4(rawTexture, x, y, -1, 0, 1, 0, 0, -1, 0, 1, black, white);
-        r = avgLinNeighbors4(rawTexture, x, y, -1, -1, 1, -1, -1, 1, 1, 1, black, white);
+        b = c00; g = G_at_RB; r = Color_at_Diag;
     }
+    
+    r = max(r, 0.0);
+    g = max(g, 0.0);
+    b = max(b, 0.0);
 
-    // Mild vignette compensation
+    // Per-channel Lens Shading Correction (LSC)
     float2 uv = float2(float(x) + 0.5, float(y) + 0.5) / float2(float(outTexture.get_width()), float(outTexture.get_height()));
     float2 d = uv - float2(0.5, 0.5);
     float r2 = dot(d, d);
-    float vignetteGain = 1.0 + 0.35 * r2;
-    float3 rgb = float3(r, g, b) * vignetteGain;
+    float gainR = 1.0 + params.lscCoefficients[0] * r2;
+    float gainG = 1.0 + ((params.lscCoefficients[1] + params.lscCoefficients[2]) * 0.5) * r2;
+    float gainB = 1.0 + params.lscCoefficients[3] * r2;
+    float3 rgb = float3(r * gainR, g * gainG, b * gainB);
     rgb = min(rgb, float3(8.0));
 
     // ── White Balance ──
@@ -351,4 +350,118 @@ fragment float4 displayFragment(
     }
     
     return float4(finalColor, 1.0);
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// PHASE 3: CHROMA BILATERAL DENOISING
+// ──────────────────────────────────────────────────────────────────────
+
+static inline float3 rgb2yuv(float3 rgb) {
+    float y = dot(rgb, float3(0.299, 0.587, 0.114));
+    float u = dot(rgb, float3(-0.1687, -0.3313, 0.5)) + 0.5;
+    float v = dot(rgb, float3(0.5, -0.4187, -0.0813)) + 0.5;
+    return float3(y, u, v);
+}
+
+static inline float3 yuv2rgb(float3 yuv) {
+    float y = yuv.x;
+    float u = yuv.y - 0.5;
+    float v = yuv.z - 0.5;
+    float r = y + 1.402 * v;
+    float g = y - 0.3441 * u - 0.7141 * v;
+    float b = y + 1.772 * u;
+    return float3(r, g, b);
+}
+
+struct BilateralParams {
+    float iso;
+    int isFirstFrame;
+};
+
+kernel void chromaBilateralAndTNR(
+    texture2d<float, access::read> inTexture [[texture(0)]],
+    texture2d<float, access::write> outTexture [[texture(1)]],
+    texture2d<float, access::read> historyTex [[texture(2)]],
+    constant BilateralParams &params [[buffer(0)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    if (gid.x >= outTexture.get_width() || gid.y >= outTexture.get_height()) return;
+    
+    float3 centerRGB = inTexture.read(gid).rgb;
+    float3 centerYUV = rgb2yuv(centerRGB);
+    
+    float sumWeights = 0.0;
+    float2 sumUV = float2(0.0);
+    
+    // Dynamic ISO-scaled Luma edge threshold
+    float iso = max(params.iso, 33.0);
+    float baseRangeSigma = 0.02; // Tight threshold at base ISO
+    float rangeSigma = baseRangeSigma * sqrt(iso / 33.0);
+    float rangeSigma2 = rangeSigma * rangeSigma;
+    
+    float spatialSigma2 = 1.5 * 1.5;
+    
+    int w = inTexture.get_width();
+    int h = inTexture.get_height();
+    int cx = int(gid.x);
+    int cy = int(gid.y);
+    
+    // 13-tap Diamond pattern (radius 2)
+    for (int dy = -2; dy <= 2; dy++) {
+        for (int dx = -2; dx <= 2; dx++) {
+            float dist2 = dx*dx + dy*dy;
+            if (dist2 > 4.0) continue; // Skip corners -> makes it a diamond
+            
+            uint2 pid = uint2(clamp(cx + dx, 0, w - 1), clamp(cy + dy, 0, h - 1));
+            float3 yuv = rgb2yuv(inTexture.read(pid).rgb);
+            
+            float spatialWeight = exp(-dist2 / (2.0 * spatialSigma2));
+            
+            float lumaDiff = yuv.x - centerYUV.x;
+            
+            // CROSS-BILATERAL: Use ONLY Luma difference as the edge-stopping function.
+            // If we include chroma difference, the filter refuses to blur massive color noise!
+            float rangeWeight = exp(-(lumaDiff * lumaDiff) / (2.0 * rangeSigma2));
+            
+            float weight = spatialWeight * rangeWeight;
+            sumWeights += weight;
+            sumUV += yuv.yz * weight;
+        }
+    }
+    
+    float2 finalUV = (sumWeights > 0.0001) ? (sumUV / sumWeights) : centerYUV.yz;
+    float3 finalYUV = float3(centerYUV.x, finalUV.x, finalUV.y);
+    float3 finalRGB = yuv2rgb(finalYUV); // Spatially denoised current frame
+    
+    // ── Temporal Noise Reduction (Motion Adaptive) ──
+    float blendFactor = 0.0;
+    
+    if (params.isFirstFrame == 0) {
+        float3 historyRGB = historyTex.read(gid).rgb;
+        float3 historyYUV = rgb2yuv(historyRGB);
+        
+        float lumaDiff = abs(historyYUV.x - centerYUV.x);
+        float chromaDiff = length(historyYUV.yz - centerYUV.yz);
+        
+        // Log space severely compresses noise amplitude. 
+        // We must use a very tight threshold so we don't accidentally treat low-contrast motion as noise.
+        float motionThreshold = 0.01 + (0.003 * sqrt(iso / 33.0));
+        float chromaThreshold = 0.02; // Static base threshold for color motion
+        
+        // Anything below threshold is static noise. Above threshold * 1.5 is physical motion.
+        float lumaMotion = smoothstep(motionThreshold, motionThreshold * 1.5, lumaDiff);
+        float chromaMotion = smoothstep(chromaThreshold, chromaThreshold * 1.5, chromaDiff);
+        
+        // Either signal counts as motion — take the stronger one to prevent isoluminant color ghosting
+        float motionWeight = max(lumaMotion, chromaMotion);
+        
+        // Max blend is 40% (down from 80%). 
+        // A 40% blend decays to 16% in 1 frame, killing ghosting instantly.
+        // Professional Log footage should leave heavy TNR to DaVinci Resolve's optical flow!
+        blendFactor = mix(0.4, 0.0, motionWeight);
+        
+        finalRGB = mix(finalRGB, historyRGB, blendFactor);
+    }
+    
+    outTexture.write(float4(finalRGB, 1.0), gid);
 }
