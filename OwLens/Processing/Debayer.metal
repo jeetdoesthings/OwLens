@@ -375,13 +375,11 @@ static inline float3 yuv2rgb(float3 yuv) {
 
 struct BilateralParams {
     float iso;
-    int isFirstFrame;
 };
 
-kernel void chromaBilateralAndTNR(
+kernel void chromaBilateral(
     texture2d<float, access::read> inTexture [[texture(0)]],
     texture2d<float, access::write> outTexture [[texture(1)]],
-    texture2d<float, access::read> historyTex [[texture(2)]],
     constant BilateralParams &params [[buffer(0)]],
     uint2 gid [[thread_position_in_grid]])
 {
@@ -432,36 +430,6 @@ kernel void chromaBilateralAndTNR(
     float2 finalUV = (sumWeights > 0.0001) ? (sumUV / sumWeights) : centerYUV.yz;
     float3 finalYUV = float3(centerYUV.x, finalUV.x, finalUV.y);
     float3 finalRGB = yuv2rgb(finalYUV); // Spatially denoised current frame
-    
-    // ── Temporal Noise Reduction (Motion Adaptive) ──
-    float blendFactor = 0.0;
-    
-    if (params.isFirstFrame == 0) {
-        float3 historyRGB = historyTex.read(gid).rgb;
-        float3 historyYUV = rgb2yuv(historyRGB);
-        
-        float lumaDiff = abs(historyYUV.x - centerYUV.x);
-        float chromaDiff = length(historyYUV.yz - centerYUV.yz);
-        
-        // Log space severely compresses noise amplitude. 
-        // We must use a very tight threshold so we don't accidentally treat low-contrast motion as noise.
-        float motionThreshold = 0.01 + (0.003 * sqrt(iso / 33.0));
-        float chromaThreshold = 0.02; // Static base threshold for color motion
-        
-        // Anything below threshold is static noise. Above threshold * 1.5 is physical motion.
-        float lumaMotion = smoothstep(motionThreshold, motionThreshold * 1.5, lumaDiff);
-        float chromaMotion = smoothstep(chromaThreshold, chromaThreshold * 1.5, chromaDiff);
-        
-        // Either signal counts as motion — take the stronger one to prevent isoluminant color ghosting
-        float motionWeight = max(lumaMotion, chromaMotion);
-        
-        // Max blend is 40% (down from 80%). 
-        // A 40% blend decays to 16% in 1 frame, killing ghosting instantly.
-        // Professional Log footage should leave heavy TNR to DaVinci Resolve's optical flow!
-        blendFactor = mix(0.4, 0.0, motionWeight);
-        
-        finalRGB = mix(finalRGB, historyRGB, blendFactor);
-    }
     
     
     float alpha = inTexture.read(gid).a;
