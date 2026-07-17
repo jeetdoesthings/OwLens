@@ -81,6 +81,10 @@ struct CameraPreviewView: UIViewRepresentable {
             let destH = dest.height
  
             guard let texture = currentTexture, destW > 0, destH > 0 else {
+                if let renderPassDescriptor = view.currentRenderPassDescriptor,
+                   let renderEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: renderPassDescriptor) {
+                    renderEncoder.endEncoding()
+                }
                 commandBuffer.present(drawable)
                 commandBuffer.commit()
                 return
@@ -91,6 +95,10 @@ struct CameraPreviewView: UIViewRepresentable {
             let dstW = CGFloat(destW)
             let dstH = CGFloat(destH)
             guard srcW > 0, srcH > 0 else {
+                if let renderPassDescriptor = view.currentRenderPassDescriptor,
+                   let renderEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: renderPassDescriptor) {
+                    renderEncoder.endEncoding()
+                }
                 commandBuffer.present(drawable)
                 commandBuffer.commit()
                 return
