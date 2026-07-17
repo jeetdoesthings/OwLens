@@ -118,6 +118,7 @@ struct RootView: View {
                 .ignoresSafeArea()
 
                 ControlsView(viewModel: viewModel)
+                    .frame(maxWidth: UIDevice.current.userInterfaceIdiom == .pad ? 700 : .infinity)
             } else if !showSplash && viewModel.metalPipeline == nil {
                 metalUnavailableView
             } else {
