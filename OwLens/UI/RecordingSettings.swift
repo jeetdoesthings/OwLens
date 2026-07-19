@@ -100,13 +100,6 @@ enum VideoSaveDestination: String, CaseIterable, Identifiable {
         case .files: return "Files"
         }
     }
-
-    var shortLabel: String {
-        switch self {
-        case .photos: return "PH"
-        case .files: return "Files"
-        }
-    }
 }
 
 /// Mic option from AVAudioSession ports (Off / iPhone / external by name).

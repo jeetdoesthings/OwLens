@@ -19,31 +19,6 @@ struct WhiteBalanceParams {
         gains: SIMD3<Float>(1, 1, 1),
         colorMatrix: matrix_identity_float3x3
     )
-
-    static let daylight = WhiteBalanceParams(
-        gains: SIMD3<Float>(1.8, 1.0, 1.4),
-        colorMatrix: matrix_identity_float3x3
-    )
-
-    static let tungsten = WhiteBalanceParams(
-        gains: SIMD3<Float>(1.2, 1.0, 2.2),
-        colorMatrix: matrix_identity_float3x3
-    )
-
-    func metalBytes() -> [Float] {
-        var bytes = [Float](repeating: 0, count: 16)
-        bytes[0] = gains.x
-        bytes[1] = gains.y
-        bytes[2] = gains.z
-        bytes[3] = 0
-        let c0 = colorMatrix.columns.0
-        let c1 = colorMatrix.columns.1
-        let c2 = colorMatrix.columns.2
-        bytes[4] = c0.x; bytes[5] = c0.y; bytes[6] = c0.z; bytes[7] = 0
-        bytes[8] = c1.x; bytes[9] = c1.y; bytes[10] = c1.z; bytes[11] = 0
-        bytes[12] = c2.x; bytes[13] = c2.y; bytes[14] = c2.z; bytes[15] = 0
-        return bytes
-    }
 }
 
 /// Matches `FusedParams` in Debayer.metal — must be identical layout.

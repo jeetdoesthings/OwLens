@@ -87,9 +87,9 @@ struct ControlsView: View {
                 viewModel.togglePanel(.save)
             } label: {
                 HStack(spacing: 6) {
-                    Image(systemName: viewModel.selectedSaveDestination == .photos ? "photo.on.rectangle" : "folder")
+                    Image(systemName: saveDestinationIcon(viewModel.selectedSaveDestination))
                         .font(.system(size: 10, weight: .semibold))
-                    Text("SAVE \(viewModel.selectedSaveDestination.label)")
+                    Text(viewModel.selectedSaveDestination.label)
                         .font(.system(size: 9, weight: .bold, design: .rounded))
                         .lineLimit(1)
                 }
@@ -106,16 +106,19 @@ struct ControlsView: View {
                 HStack(spacing: 5) {
                     ForEach(VideoSaveDestination.allCases) { destination in
                         Button {
-                            viewModel.selectedSaveDestination = destination
-                            viewModel.activePanel = nil
+                            viewModel.chooseSaveDestination(destination)
                         } label: {
-                            Text(destination.label)
-                                .font(.system(size: 9, weight: .bold, design: .rounded))
-                                .foregroundColor(viewModel.selectedSaveDestination == destination ? .black : .white.opacity(0.78))
-                                .padding(.horizontal, 10)
-                                .frame(height: 26)
-                                .background(viewModel.selectedSaveDestination == destination ? Color.white : Color.black.opacity(0.55))
-                                .clipShape(Capsule())
+                            HStack(spacing: 5) {
+                                Image(systemName: saveDestinationIcon(destination))
+                                    .font(.system(size: 9, weight: .semibold))
+                                Text(destination.label)
+                                    .font(.system(size: 9, weight: .bold, design: .rounded))
+                            }
+                            .foregroundColor(viewModel.selectedSaveDestination == destination ? .black : .white.opacity(0.78))
+                            .padding(.horizontal, 10)
+                            .frame(height: 26)
+                            .background(viewModel.selectedSaveDestination == destination ? Color.white : Color.black.opacity(0.55))
+                            .clipShape(Capsule())
                         }
                         .buttonStyle(.plain)
                     }
@@ -128,6 +131,13 @@ struct ControlsView: View {
                         .strokeBorder(Color.white.opacity(0.12), lineWidth: 1)
                 )
             }
+        }
+    }
+
+    private func saveDestinationIcon(_ destination: VideoSaveDestination) -> String {
+        switch destination {
+        case .photos: return "photo.on.rectangle"
+        case .files: return "folder"
         }
     }
 

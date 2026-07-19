@@ -1,6 +1,6 @@
 import Foundation
 
-/// Discrete stops for ISO / shutter / WB — snap-friendly sliders.
+/// Discrete stops for ISO / WB plus snap targets for shutter angle.
 enum ExposureStops {
     /// Kelvin white-balance stops (coarse is fine for WB).
     static let wbAll: [Float] = [
@@ -17,12 +17,6 @@ enum ExposureStops {
     static let shutterAngles: [Float] = [
         360.0, 270.0, 216.0, 180.0, 172.8, 144.0, 90.0, 45.0, 22.5, 11.25
     ]
-    
-    static func shutterStops(in range: ClosedRange<Float>) -> [Float] {
-        let filtered = shutterAngles.filter { range.contains($0) }.sorted(by: <)
-        return filtered.isEmpty ? [range.lowerBound, range.upperBound] : filtered
-    }
-
     static func wbStops(in range: ClosedRange<Float> = 2000...10000) -> [Float] {
         let filtered = wbAll.filter { range.contains($0) }
         return filtered.isEmpty ? [range.lowerBound, range.upperBound] : filtered

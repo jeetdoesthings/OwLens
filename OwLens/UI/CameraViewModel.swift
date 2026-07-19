@@ -6,6 +6,7 @@ import Photos
 import QuartzCore
 import simd
 import UIKit
+import UniformTypeIdentifiers
 
 /// Central view model — CaptureController → RawFrameBuffer → MetalPipeline → preview + VideoWriter.
 @MainActor
@@ -49,11 +50,7 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
             refreshStatusLine()
         }
     }
-    @Published var selectedSaveDestination: VideoSaveDestination = .photos {
-        didSet {
-            guard !isRecording else { return }
-        }
-    }
+    @Published private(set) var selectedSaveDestination: VideoSaveDestination = .photos
     @Published var audioSources: [AudioSourceOption] = [.none]
     @Published var selectedAudioSource: AudioSourceOption = .none {
         didSet {
@@ -123,7 +120,6 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
     @Published var isAutoWhiteBalanceEnabled: Bool = false {
         didSet {
             guard oldValue != isAutoWhiteBalanceEnabled else { return }
-            wbMode = isAutoWhiteBalanceEnabled ? .auto : .manual
             if isCameraReady { applyManualExposureAndWB() }
         }
     }
@@ -152,7 +148,6 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
 
     /// Discrete stop lists (snap slider).
     @Published private(set) var isoStops: [Float] = ExposureStops.isoStops(in: 50...2000)
-    @Published private(set) var shutterStops: [Float] = ExposureStops.shutterStops(in: 24...8000)
     @Published private(set) var wbStops: [Float] = ExposureStops.wbStops()
 
     @Published var isoStopIndex: Int = 0 {
@@ -200,7 +195,6 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
         }
     }
 
-    @Published var wbMode: WBMode = .auto
     @Published var activePanel: ControlPanel? = nil
 
     var isoRange: ClosedRange<Float> = 50...2000
@@ -218,9 +212,8 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
     private var recordingStartTime: Date?
     private var recordingTimer: Timer?
     nonisolated(unsafe) private var frameIndex: Int64 = 0
-    private var outputURL: URL?
-    private var pendingFilesExportURL: URL?
-    private var hasTakenManualControl = false
+    private var filesFolderBookmark: Data?
+    private let filesFolderBookmarkKey = "OwLens.FilesFolderBookmark"
 
     private let processQueue = DispatchQueue(label: "raw.process.queue", qos: .userInitiated)
     nonisolated private let processLock = NSLock()
@@ -235,14 +228,6 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
     /// Metal may not submit GPU work when app is backgrounded.
     nonisolated(unsafe) var isAppActive = true
 
-    enum WBMode: String, CaseIterable, Identifiable {
-        case auto = "Auto"
-        case daylight = "Daylight"
-        case tungsten = "Tungsten"
-        case manual = "Manual"
-        var id: String { rawValue }
-    }
-
     enum ControlPanel: String, Identifiable {
         case exposure, iso, shutter, wb, focus, fps, format, log, bitrate, mic, lens, save
         var id: String { rawValue }
@@ -253,6 +238,7 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
     override init() {
         metalPipeline = MetalPipeline()
         super.init()
+        loadFilesFolderBookmark()
         metalPipeline?.curveType = selectedCurve
         activeEncodeWidth = selectedFormat.width
         activeEncodeHeight = selectedFormat.height
@@ -419,7 +405,6 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
             captureController.setCaptureFPS(selectedFPS.rawValue)
             refreshAudioSources()
             captureController.startSession()
-            hasTakenManualControl = true
             applyManualExposureAndWB()
             refreshStatusLine()
             isCameraReady = true
@@ -464,6 +449,17 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
             if panel == .lens {
                 availableLenses = CaptureController.discoverBackLenses()
             }
+        }
+    }
+
+    func chooseSaveDestination(_ destination: VideoSaveDestination) {
+        guard !isRecording else { return }
+        activePanel = nil
+        switch destination {
+        case .photos:
+            selectedSaveDestination = .photos
+        case .files:
+            presentFilesFolderPicker()
         }
     }
 
@@ -608,10 +604,6 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
         isoStopIndex = ExposureStops.clampIndex(isoStopIndex + delta, count: isoStops.count)
     }
 
-    func nudgeShutter(_ delta: Int) {
-        // Obsolete with continuous magnetic slider
-    }
-
     func nudgeWB(_ delta: Int) {
         guard !controlsLocked, !isAutoWhiteBalanceEnabled else { return }
         wbStopIndex = ExposureStops.clampIndex(wbStopIndex + delta, count: wbStops.count)
@@ -654,7 +646,6 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
 
             device.unlockForConfiguration()
             updateWBParams(from: device)
-            hasTakenManualControl = true
         } catch {
             print("[CameraViewModel] applyManualExposureAndWB: \(error)")
         }
@@ -717,26 +708,17 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
     }
 
     private func updateWBParams(from device: AVCaptureDevice) {
-        switch wbMode {
-        case .daylight:
-            metalPipeline?.isAutoWBEnabled = false
-            metalPipeline?.wbParams = .daylight
-        case .tungsten:
-            metalPipeline?.isAutoWBEnabled = false
-            metalPipeline?.wbParams = .tungsten
-        case .manual, .auto:
-            metalPipeline?.isAutoWBEnabled = isAutoWhiteBalanceEnabled
-            let gains = device.deviceWhiteBalanceGains
-            let g = max(gains.greenGain, 0.001)
-            metalPipeline?.wbParams = WhiteBalanceParams(
-                gains: SIMD3<Float>(
-                    max(gains.redGain / g, 0.01),
-                    1.0,
-                    max(gains.blueGain / g, 0.01)
-                ),
-                colorMatrix: matrix_identity_float3x3
-            )
-        }
+        metalPipeline?.isAutoWBEnabled = isAutoWhiteBalanceEnabled
+        let gains = device.deviceWhiteBalanceGains
+        let g = max(gains.greenGain, 0.001)
+        metalPipeline?.wbParams = WhiteBalanceParams(
+            gains: SIMD3<Float>(
+                max(gains.redGain / g, 0.01),
+                1.0,
+                max(gains.blueGain / g, 0.01)
+            ),
+            colorMatrix: matrix_identity_float3x3
+        )
     }
 
     // MARK: - Recording
@@ -755,13 +737,13 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
         activeFPS = selectedFPS.rawValue
 
         let fileName = "OwLens_\(selectedFormat.shortLabel)_\(selectedFPS.label)fps_HEVC_\(Int(Date().timeIntervalSince1970)).mov"
-        outputURL = FileManager.default.temporaryDirectory.appendingPathComponent(fileName)
+        let outputURL = FileManager.default.temporaryDirectory.appendingPathComponent(fileName)
 
         let includeAudio = selectedAudioSource.portUID != nil
 
         do {
             try videoWriter.start(
-                outputURL: outputURL!,
+                outputURL: outputURL,
                 width: selectedFormat.width,
                 height: selectedFormat.height,
                 bitrate: selectedBitrate.bitsPerSecond,
@@ -866,23 +848,21 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
                 }
             }
         case .files:
-            presentFilesExportPicker(for: url)
+            saveRecordingToChosenFilesFolder(url)
         }
     }
 
-    private func presentFilesExportPicker(for url: URL) {
-        pendingFilesExportURL = url
-        statusText = "Choose Files Location"
+    private func presentFilesFolderPicker() {
         guard let scene = UIApplication.shared.connectedScenes.first as? UIWindowScene,
               let rootVC = scene.windows.first(where: { $0.isKeyWindow })?.rootViewController else {
-            errorMessage = "Files save failed: no active window"
+            errorMessage = "Files picker unavailable"
             refreshStatusLine()
             return
         }
 
-        let picker = UIDocumentPickerViewController(forExporting: [url], asCopy: false)
+        let picker = UIDocumentPickerViewController(forOpeningContentTypes: [.folder], asCopy: false)
         picker.delegate = self
-        picker.shouldShowFileExtensions = true
+        picker.allowsMultipleSelection = false
         if let pop = picker.popoverPresentationController {
             pop.sourceView = rootVC.view
             pop.sourceRect = CGRect(x: rootVC.view.bounds.midX, y: rootVC.view.bounds.midY, width: 0, height: 0)
@@ -892,41 +872,112 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
     }
 
     func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
-        pendingFilesExportURL = nil
-        statusText = "Saved to Files"
+        guard let folderURL = urls.first else {
+            selectedSaveDestination = .photos
+            refreshStatusLine()
+            return
+        }
+        do {
+            let shouldStop = folderURL.startAccessingSecurityScopedResource()
+            defer {
+                if shouldStop {
+                    folderURL.stopAccessingSecurityScopedResource()
+                }
+            }
+            filesFolderBookmark = try folderURL.bookmarkData(
+                options: [.minimalBookmark],
+                includingResourceValuesForKeys: nil,
+                relativeTo: nil
+            )
+            UserDefaults.standard.set(filesFolderBookmark, forKey: filesFolderBookmarkKey)
+            selectedSaveDestination = .files
+            statusText = "Files selected"
+        } catch {
+            selectedSaveDestination = .photos
+            errorMessage = "Files folder failed: \(error.localizedDescription)"
+        }
         refreshStatusLine()
-        print("[CameraViewModel] Exported recording to Files destination")
     }
 
     func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) {
-        if let url = pendingFilesExportURL {
-            try? FileManager.default.removeItem(at: url)
-        }
-        pendingFilesExportURL = nil
-        statusText = "Save cancelled"
+        selectedSaveDestination = .photos
         refreshStatusLine()
     }
 
-    func exportLUT() {
-        let lut = LUTGenerator.generate(for: selectedCurve, size: 33)
-        let fileName = "RawLogCam_\(selectedCurve.displayName.replacingOccurrences(of: " ", with: "_")).cube"
-        let url = FileManager.default.temporaryDirectory.appendingPathComponent(fileName)
+    private func loadFilesFolderBookmark() {
+        guard let bookmark = UserDefaults.standard.data(forKey: filesFolderBookmarkKey) else { return }
+        filesFolderBookmark = bookmark
+        if resolveFilesFolderURL() != nil {
+            selectedSaveDestination = .files
+        }
+    }
+
+    private func resolveFilesFolderURL() -> URL? {
+        guard let filesFolderBookmark else { return nil }
+        do {
+            var isStale = false
+            let url = try URL(
+                resolvingBookmarkData: filesFolderBookmark,
+                options: [],
+                relativeTo: nil,
+                bookmarkDataIsStale: &isStale
+            )
+            if isStale {
+                UserDefaults.standard.removeObject(forKey: filesFolderBookmarkKey)
+                self.filesFolderBookmark = nil
+                selectedSaveDestination = .photos
+                return nil
+            }
+            return url
+        } catch {
+            UserDefaults.standard.removeObject(forKey: filesFolderBookmarkKey)
+            self.filesFolderBookmark = nil
+            selectedSaveDestination = .photos
+            return nil
+        }
+    }
+
+    private func saveRecordingToChosenFilesFolder(_ url: URL) {
+        guard let folderURL = resolveFilesFolderURL() else {
+            errorMessage = "Choose a Files folder before recording"
+            statusText = "Save failed"
+            return
+        }
+
+        let shouldStop = folderURL.startAccessingSecurityScopedResource()
+        defer {
+            if shouldStop {
+                folderURL.stopAccessingSecurityScopedResource()
+            }
+        }
 
         do {
-            try lut.write(toFile: url.path, atomically: true, encoding: String.Encoding.utf8)
-            Task { @MainActor in
-                guard let scene = UIApplication.shared.connectedScenes.first as? UIWindowScene,
-                      let rootVC = scene.windows.first?.rootViewController else { return }
-                let activityVC = UIActivityViewController(activityItems: [url], applicationActivities: nil)
-                if let pop = activityVC.popoverPresentationController {
-                    pop.sourceView = rootVC.view
-                    pop.sourceRect = CGRect(x: rootVC.view.bounds.midX, y: rootVC.view.bounds.midY, width: 0, height: 0)
-                }
-                rootVC.present(activityVC, animated: true)
-            }
+            let destination = uniqueDestinationURL(in: folderURL, preferredName: url.lastPathComponent)
+            try FileManager.default.copyItem(at: url, to: destination)
+            try? FileManager.default.removeItem(at: url)
+            statusText = "Saved to Files"
+            refreshStatusLine()
+            print("[CameraViewModel] Saved recording to Files: \(destination.path)")
         } catch {
-            errorMessage = "LUT export failed"
+            errorMessage = "Files save failed: \(error.localizedDescription)"
+            statusText = "Save failed"
         }
+    }
+
+    private func uniqueDestinationURL(in folderURL: URL, preferredName: String) -> URL {
+        let baseURL = folderURL.appendingPathComponent(preferredName)
+        guard FileManager.default.fileExists(atPath: baseURL.path) else { return baseURL }
+
+        let ext = baseURL.pathExtension
+        let stem = baseURL.deletingPathExtension().lastPathComponent
+        for index in 1..<1000 {
+            let candidateName = ext.isEmpty ? "\(stem)-\(index)" : "\(stem)-\(index).\(ext)"
+            let candidate = folderURL.appendingPathComponent(candidateName)
+            if !FileManager.default.fileExists(atPath: candidate.path) {
+                return candidate
+            }
+        }
+        return folderURL.appendingPathComponent(UUID().uuidString + (ext.isEmpty ? "" : ".\(ext)"))
     }
 
     private func updateRecordingDuration() {
