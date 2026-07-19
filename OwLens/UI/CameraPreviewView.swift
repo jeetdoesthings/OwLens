@@ -2,6 +2,7 @@ import SwiftUI
 import UIKit
 import MetalKit
 import MetalPerformanceShaders
+import QuartzCore
 
 /// MTKView wrapper — aspect-fits log texture into landscape drawable (no stretch / fake 9:16)
 struct CameraPreviewView: UIViewRepresentable {
@@ -23,6 +24,8 @@ struct CameraPreviewView: UIViewRepresentable {
         mtkView.clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: overlayOnly ? 0 : 1)
         mtkView.backgroundColor = overlayOnly ? .clear : .black
         mtkView.isOpaque = !overlayOnly
+        mtkView.layer.isOpaque = !overlayOnly
+        (mtkView.layer as? CAMetalLayer)?.isOpaque = !overlayOnly
         mtkView.contentMode = .scaleToFill
         // Avoid UIKit transforming layers into portrait letterbox mid-record
         mtkView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
@@ -37,6 +40,8 @@ struct CameraPreviewView: UIViewRepresentable {
         uiView.clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: overlayOnly ? 0 : 1)
         uiView.backgroundColor = overlayOnly ? .clear : .black
         uiView.isOpaque = !overlayOnly
+        uiView.layer.isOpaque = !overlayOnly
+        (uiView.layer as? CAMetalLayer)?.isOpaque = !overlayOnly
     }
  
     func makeCoordinator() -> Coordinator {
@@ -130,8 +135,19 @@ struct CameraPreviewView: UIViewRepresentable {
             let originY = (destH - fitH) / 2
             
             if let renderPassDescriptor = view.currentRenderPassDescriptor,
-               let renderEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: renderPassDescriptor),
                let renderPipeline = renderPipeline {
+                renderPassDescriptor.colorAttachments[0].loadAction = .clear
+                renderPassDescriptor.colorAttachments[0].clearColor = MTLClearColor(
+                    red: 0,
+                    green: 0,
+                    blue: 0,
+                    alpha: overlayOnly ? 0 : 1
+                )
+                guard let renderEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: renderPassDescriptor) else {
+                    commandBuffer.present(drawable)
+                    commandBuffer.commit()
+                    return
+                }
                 
                 renderEncoder.setRenderPipelineState(renderPipeline)
                 renderEncoder.setFragmentTexture(texture, index: 0)

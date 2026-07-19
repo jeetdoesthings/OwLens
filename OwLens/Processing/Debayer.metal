@@ -353,6 +353,9 @@ fragment float4 displayFragment(
     }
     
     if (overlayOnly > 0) {
+        if (overlayAlpha <= 0.0) {
+            return float4(0.0, 0.0, 0.0, 0.0);
+        }
         return float4(finalColor, overlayAlpha);
     }
     return float4(finalColor, 1.0);

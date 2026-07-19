@@ -70,6 +70,14 @@ struct RootView: View {
                         )
                         .ignoresSafeArea()
 
+                        if viewModel.showScopes {
+                            ScopesOverlay(data: viewModel.scopeData)
+                                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+                                .padding(.leading, 18)
+                                .padding(.top, 104)
+                                .allowsHitTesting(false)
+                        }
+
                         if let focusPt = tapFocusPoint {
                             Rectangle()
                                 .stroke(Color.yellow, lineWidth: 1.5)

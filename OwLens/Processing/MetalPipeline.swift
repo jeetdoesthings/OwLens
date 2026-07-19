@@ -100,6 +100,9 @@ final class MetalPipeline: @unchecked Sendable {
     private var pooledScaleTex: MTLTexture?
     private var pooledScaleW: Int = 0
     private var pooledScaleH: Int = 0
+    private var pooledScopeTex: MTLTexture?
+    private var pooledScopeW: Int = 0
+    private var pooledScopeH: Int = 0
     
     private var pixelBufferPool: CVPixelBufferPool?
     private var pixelBufferPoolW: Int = 0
@@ -217,6 +220,21 @@ final class MetalPipeline: @unchecked Sendable {
         pooledScaleTex = tex
         pooledScaleW = width
         pooledScaleH = height
+        return tex
+    }
+
+    private func getOrCreateScopeTexture(width: Int, height: Int) -> MTLTexture? {
+        if let tex = pooledScopeTex, pooledScopeW == width, pooledScopeH == height {
+            return tex
+        }
+        let desc = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .rgba16Float, width: width, height: height, mipmapped: false)
+        desc.usage = [.shaderRead, .shaderWrite]
+        desc.storageMode = .shared
+        let tex = device.makeTexture(descriptor: desc)
+        pooledScopeTex = tex
+        pooledScopeW = width
+        pooledScopeH = height
         return tex
     }
 
@@ -398,6 +416,29 @@ final class MetalPipeline: @unchecked Sendable {
         }
  
         return scale(sourceForScale, width: targetWidth, height: targetHeight, cb: cb)
+    }
+
+    func makeScopeData(from texture: MTLTexture, sampleWidth: Int = 96, sampleHeight: Int = 54) -> ScopeData? {
+        let width = max(16, sampleWidth)
+        let height = max(16, sampleHeight)
+        guard let output = getOrCreateScopeTexture(width: width, height: height),
+              let cb = commandQueue.makeCommandBuffer() else { return nil }
+
+        scaler.encode(commandBuffer: cb, sourceTexture: texture, destinationTexture: output)
+        cb.commit()
+        cb.waitUntilCompleted()
+
+        let componentsPerPixel = 4
+        let bytesPerComponent = MemoryLayout<UInt16>.stride
+        let bytesPerRow = width * componentsPerPixel * bytesPerComponent
+        var pixels = [UInt16](repeating: 0, count: width * height * componentsPerPixel)
+        output.getBytes(
+            &pixels,
+            bytesPerRow: bytesPerRow,
+            from: MTLRegionMake2D(0, 0, width, height),
+            mipmapLevel: 0
+        )
+        return ScopeData.make(fromHalfRGBA: pixels, width: width, height: height)
     }
 
     func textureToPixelBufferBGRA(

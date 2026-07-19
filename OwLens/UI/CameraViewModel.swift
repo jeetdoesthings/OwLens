@@ -3,12 +3,13 @@ import AVFoundation
 import Combine
 import Metal
 import Photos
+import QuartzCore
 import simd
 import UIKit
 
 /// Central view model — CaptureController → RawFrameBuffer → MetalPipeline → preview + VideoWriter.
 @MainActor
-final class CameraViewModel: ObservableObject {
+final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegate {
     // MARK: - Published State
 
     @Published var currentTexture: MTLTexture?
@@ -48,6 +49,11 @@ final class CameraViewModel: ObservableObject {
             refreshStatusLine()
         }
     }
+    @Published var selectedSaveDestination: VideoSaveDestination = .photos {
+        didSet {
+            guard !isRecording else { return }
+        }
+    }
     @Published var audioSources: [AudioSourceOption] = [.none]
     @Published var selectedAudioSource: AudioSourceOption = .none {
         didSet {
@@ -74,6 +80,8 @@ final class CameraViewModel: ObservableObject {
     @Published var showGrid = false
     @Published var showClipping = false
     @Published var showFocusPeaking = false
+    @Published var showScopes = false
+    @Published var scopeData: ScopeData = .empty
     @Published var previewDisplayMode: PreviewDisplayMode = .log
     @Published var showLevel = false {
         didSet {
@@ -106,6 +114,21 @@ final class CameraViewModel: ObservableObject {
     @Published private(set) var isoValue: Float = 100
     @Published private(set) var shutterValue: Float = 180
     @Published private(set) var wbKelvin: Float = 5600
+    @Published var isAutoExposureEnabled: Bool = false {
+        didSet {
+            guard oldValue != isAutoExposureEnabled else { return }
+            if isCameraReady { applyManualExposureAndWB() }
+        }
+    }
+    @Published var isAutoWhiteBalanceEnabled: Bool = false {
+        didSet {
+            guard oldValue != isAutoWhiteBalanceEnabled else { return }
+            wbMode = isAutoWhiteBalanceEnabled ? .auto : .manual
+            if isCameraReady { applyManualExposureAndWB() }
+        }
+    }
+    @Published private(set) var isAutoExposureAdjusting: Bool = false
+    @Published private(set) var isAutoWhiteBalanceAdjusting: Bool = false
 
     // Focus properties
     @Published var isFocusLocked: Bool = false
@@ -140,11 +163,12 @@ final class CameraViewModel: ObservableObject {
             let v = isoStops[i]
             guard v != isoValue else { return }
             isoValue = v
-            guard !controlsLocked else { return }
+            guard !controlsLocked, !isAutoExposureEnabled else { return }
             applyManualExposureAndWB()
         }
     }
     func setShutterAngleWithSnapping(_ rawValue: Float) {
+        guard !isAutoExposureEnabled else { return }
         let snapTargets = ExposureStops.shutterAngles
         var finalValue = rawValue
         
@@ -171,7 +195,7 @@ final class CameraViewModel: ObservableObject {
             let v = wbStops[i]
             guard v != wbKelvin else { return }
             wbKelvin = v
-            guard !controlsLocked else { return }
+            guard !controlsLocked, !isAutoWhiteBalanceEnabled else { return }
             applyManualExposureAndWB()
         }
     }
@@ -195,6 +219,7 @@ final class CameraViewModel: ObservableObject {
     private var recordingTimer: Timer?
     nonisolated(unsafe) private var frameIndex: Int64 = 0
     private var outputURL: URL?
+    private var pendingFilesExportURL: URL?
     private var hasTakenManualControl = false
 
     private let processQueue = DispatchQueue(label: "raw.process.queue", qos: .userInitiated)
@@ -205,6 +230,8 @@ final class CameraViewModel: ObservableObject {
     nonisolated(unsafe) private var activeEncodeHeight = 1440
     nonisolated(unsafe) private var activeFPS: Double = 24
     nonisolated(unsafe) private var isRecordingUnsafe = false
+    nonisolated(unsafe) private var showScopesUnsafe = false
+    nonisolated(unsafe) private var lastScopeUpdateTime: CFTimeInterval = 0
     /// Metal may not submit GPU work when app is backgrounded.
     nonisolated(unsafe) var isAppActive = true
 
@@ -217,14 +244,15 @@ final class CameraViewModel: ObservableObject {
     }
 
     enum ControlPanel: String, Identifiable {
-        case iso, shutter, wb, focus, fps, format, log, bitrate, mic, lens
+        case exposure, iso, shutter, wb, focus, fps, format, log, bitrate, mic, lens, save
         var id: String { rawValue }
     }
 
     // MARK: - Init
 
-    init() {
+    override init() {
         metalPipeline = MetalPipeline()
+        super.init()
         metalPipeline?.curveType = selectedCurve
         activeEncodeWidth = selectedFormat.width
         activeEncodeHeight = selectedFormat.height
@@ -419,9 +447,9 @@ final class CameraViewModel: ObservableObject {
     func togglePanel(_ panel: ControlPanel) {
         if controlsLocked {
             switch panel {
-            case .iso, .shutter, .wb, .focus, .fps, .format, .bitrate, .mic, .lens:
+            case .exposure, .iso, .shutter, .wb, .focus, .fps, .format, .bitrate, .mic, .lens:
                 return
-            case .log:
+            case .log, .save:
                 break
             }
         }
@@ -453,6 +481,14 @@ final class CameraViewModel: ObservableObject {
     
     func toggleFocusPeaking() {
         showFocusPeaking.toggle()
+    }
+
+    func toggleScopes() {
+        showScopes.toggle()
+        showScopesUnsafe = showScopes
+        if !showScopes {
+            scopeData = .empty
+        }
     }
 
     func togglePreviewDisplayMode() {
@@ -527,12 +563,16 @@ final class CameraViewModel: ObservableObject {
 
     private func refreshStatusLine() {
         if isRecording { return }
-        let mic = selectedAudioSource.portUID == nil ? "mute" : "mic"
-        if controlsLocked {
-            statusText = "Locked · \(selectedFormat.shortLabel) · \(selectedFPS.label)fps · \(selectedBitrate.label)M"
-        } else {
-            statusText = "Edit · \(selectedFormat.shortLabel) · \(selectedFPS.label)fps · \(mic)"
-        }
+        let mode = controlsLocked ? "Locked" : "Edit"
+        statusText = "\(mode) · \(selectedFormat.shortLabel) · \(selectedFPS.label)fps · \(statusMicName)"
+    }
+
+    private var statusMicName: String {
+        guard selectedAudioSource.portUID != nil else { return "mute" }
+        let name = selectedAudioSource.name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty else { return "mic" }
+        if name.count <= 12 { return name }
+        return String(name.prefix(11)) + "…"
     }
 
     private func seedControlRanges() {
@@ -564,7 +604,7 @@ final class CameraViewModel: ObservableObject {
     }
 
     func nudgeISO(_ delta: Int) {
-        guard !controlsLocked else { return }
+        guard !controlsLocked, !isAutoExposureEnabled else { return }
         isoStopIndex = ExposureStops.clampIndex(isoStopIndex + delta, count: isoStops.count)
     }
 
@@ -573,7 +613,7 @@ final class CameraViewModel: ObservableObject {
     }
 
     func nudgeWB(_ delta: Int) {
-        guard !controlsLocked else { return }
+        guard !controlsLocked, !isAutoWhiteBalanceEnabled else { return }
         wbStopIndex = ExposureStops.clampIndex(wbStopIndex + delta, count: wbStops.count)
     }
 
@@ -587,18 +627,30 @@ final class CameraViewModel: ObservableObject {
         do {
             try device.lockForConfiguration()
 
-            let clampedISO = max(device.activeFormat.minISO, min(device.activeFormat.maxISO, isoValue))
-            var shutterDuration = CMTimeMakeWithSeconds((Double(shutterValue) / 360.0) / activeFPS, preferredTimescale: 1_000_000)
-            let minD = device.activeFormat.minExposureDuration
-            let maxD = device.activeFormat.maxExposureDuration
-            if CMTimeCompare(shutterDuration, minD) < 0 { shutterDuration = minD }
-            if CMTimeCompare(shutterDuration, maxD) > 0 { shutterDuration = maxD }
-            device.setExposureModeCustom(duration: shutterDuration, iso: clampedISO)
+            if isAutoExposureEnabled {
+                if device.isExposureModeSupported(.continuousAutoExposure) {
+                    device.exposureMode = .continuousAutoExposure
+                }
+            } else {
+                let clampedISO = max(device.activeFormat.minISO, min(device.activeFormat.maxISO, isoValue))
+                var shutterDuration = CMTimeMakeWithSeconds((Double(shutterValue) / 360.0) / activeFPS, preferredTimescale: 1_000_000)
+                let minD = device.activeFormat.minExposureDuration
+                let maxD = device.activeFormat.maxExposureDuration
+                if CMTimeCompare(shutterDuration, minD) < 0 { shutterDuration = minD }
+                if CMTimeCompare(shutterDuration, maxD) > 0 { shutterDuration = maxD }
+                device.setExposureModeCustom(duration: shutterDuration, iso: clampedISO)
+            }
 
-            let temperatureAndTint = AVCaptureDevice.WhiteBalanceTemperatureAndTintValues(temperature: wbKelvin, tint: 0)
-            let wbGains = device.deviceWhiteBalanceGains(for: temperatureAndTint)
-            let clampedGains = clampWhiteBalanceGains(wbGains, for: device)
-            device.setWhiteBalanceModeLocked(with: clampedGains)
+            if isAutoWhiteBalanceEnabled {
+                if device.isWhiteBalanceModeSupported(.continuousAutoWhiteBalance) {
+                    device.whiteBalanceMode = .continuousAutoWhiteBalance
+                }
+            } else {
+                let temperatureAndTint = AVCaptureDevice.WhiteBalanceTemperatureAndTintValues(temperature: wbKelvin, tint: 0)
+                let wbGains = device.deviceWhiteBalanceGains(for: temperatureAndTint)
+                let clampedGains = clampWhiteBalanceGains(wbGains, for: device)
+                device.setWhiteBalanceModeLocked(with: clampedGains)
+            }
 
             device.unlockForConfiguration()
             updateWBParams(from: device)
@@ -632,10 +684,9 @@ final class CameraViewModel: ObservableObject {
     }
 
     func unlockControls() {
-        // Stay on custom exposure — do NOT restore continuous AE
         controlsLocked = false
         refreshStatusLine()
-        print("[CameraViewModel] Controls unlocked (still manual)")
+        print("[CameraViewModel] Controls unlocked")
     }
 
     func setFocusPoint(_ point: CGPoint, lock: Bool = false) {
@@ -674,7 +725,7 @@ final class CameraViewModel: ObservableObject {
             metalPipeline?.isAutoWBEnabled = false
             metalPipeline?.wbParams = .tungsten
         case .manual, .auto:
-            metalPipeline?.isAutoWBEnabled = (wbMode == .auto)
+            metalPipeline?.isAutoWBEnabled = isAutoWhiteBalanceEnabled
             let gains = device.deviceWhiteBalanceGains
             let g = max(gains.greenGain, 0.001)
             metalPipeline?.wbParams = WhiteBalanceParams(
@@ -697,6 +748,7 @@ final class CameraViewModel: ObservableObject {
         }
         guard controlsLocked, !isRecording else { return }
 
+        lockAutoModesForRecording()
         metalPipeline?.curveType = selectedCurve
         activeEncodeWidth = selectedFormat.width
         activeEncodeHeight = selectedFormat.height
@@ -738,6 +790,26 @@ final class CameraViewModel: ObservableObject {
         }
     }
 
+    private func lockAutoModesForRecording() {
+        guard isAutoExposureEnabled || isAutoWhiteBalanceEnabled else { return }
+        guard let device = captureController.activeDevice else { return }
+
+        isoValue = device.iso
+        let angle = Float(device.exposureDuration.seconds * activeFPS * 360.0)
+        if angle.isFinite && angle > 0 {
+            shutterValue = max(shutterRange.lowerBound, min(shutterRange.upperBound, angle))
+        }
+        let gains = device.deviceWhiteBalanceGains
+        let temperatureAndTint = device.temperatureAndTintValues(for: gains)
+        wbKelvin = max(2000, min(10000, temperatureAndTint.temperature))
+
+        isAutoExposureEnabled = false
+        isAutoWhiteBalanceEnabled = false
+        isAutoExposureAdjusting = false
+        isAutoWhiteBalanceAdjusting = false
+        applyManualExposureAndWB()
+    }
+
     func stopRecording() {
         guard isRecording else { return }
 
@@ -755,28 +827,8 @@ final class CameraViewModel: ObservableObject {
                 }
                 return
             }
-            PHPhotoLibrary.requestAuthorization(for: .addOnly) { status in
-                guard status == .authorized || status == .limited else {
-                    Task { @MainActor in
-                        self?.errorMessage = "Photo library access denied"
-                        self?.refreshStatusLine()
-                    }
-                    return
-                }
-                PHPhotoLibrary.shared().performChanges {
-                    PHAssetChangeRequest.creationRequestForAssetFromVideo(atFileURL: url)
-                } completionHandler: { success, error in
-                    Task { @MainActor in
-                        if success {
-                            self?.statusText = "Saved to Photos"
-                        } else {
-                            self?.errorMessage = error?.localizedDescription ?? "Save failed"
-                            self?.statusText = "Save failed"
-                        }
-                        self?.refreshStatusLine()
-                    }
-                    try? FileManager.default.removeItem(at: url)
-                }
+            Task { @MainActor [weak self] in
+                self?.saveFinishedRecording(at: url)
             }
         }
 
@@ -785,6 +837,74 @@ final class CameraViewModel: ObservableObject {
         if let caps = capabilities {
             print("[CameraViewModel] Tester diagnostics:\n\(caps.diagnosticSummary)\n\(realNote)")
         }
+    }
+
+    private func saveFinishedRecording(at url: URL) {
+        switch selectedSaveDestination {
+        case .photos:
+            PHPhotoLibrary.requestAuthorization(for: .addOnly) { status in
+                guard status == .authorized || status == .limited else {
+                    Task { @MainActor in
+                        self.errorMessage = "Photo library access denied"
+                        self.refreshStatusLine()
+                    }
+                    return
+                }
+                PHPhotoLibrary.shared().performChanges {
+                    PHAssetChangeRequest.creationRequestForAssetFromVideo(atFileURL: url)
+                } completionHandler: { success, error in
+                    Task { @MainActor in
+                        if success {
+                            self.statusText = "Saved to Photos"
+                        } else {
+                            self.errorMessage = error?.localizedDescription ?? "Save failed"
+                            self.statusText = "Save failed"
+                        }
+                        self.refreshStatusLine()
+                    }
+                    try? FileManager.default.removeItem(at: url)
+                }
+            }
+        case .files:
+            presentFilesExportPicker(for: url)
+        }
+    }
+
+    private func presentFilesExportPicker(for url: URL) {
+        pendingFilesExportURL = url
+        statusText = "Choose Files Location"
+        guard let scene = UIApplication.shared.connectedScenes.first as? UIWindowScene,
+              let rootVC = scene.windows.first(where: { $0.isKeyWindow })?.rootViewController else {
+            errorMessage = "Files save failed: no active window"
+            refreshStatusLine()
+            return
+        }
+
+        let picker = UIDocumentPickerViewController(forExporting: [url], asCopy: false)
+        picker.delegate = self
+        picker.shouldShowFileExtensions = true
+        if let pop = picker.popoverPresentationController {
+            pop.sourceView = rootVC.view
+            pop.sourceRect = CGRect(x: rootVC.view.bounds.midX, y: rootVC.view.bounds.midY, width: 0, height: 0)
+            pop.permittedArrowDirections = []
+        }
+        rootVC.present(picker, animated: true)
+    }
+
+    func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
+        pendingFilesExportURL = nil
+        statusText = "Saved to Files"
+        refreshStatusLine()
+        print("[CameraViewModel] Exported recording to Files destination")
+    }
+
+    func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) {
+        if let url = pendingFilesExportURL {
+            try? FileManager.default.removeItem(at: url)
+        }
+        pendingFilesExportURL = nil
+        statusText = "Save cancelled"
+        refreshStatusLine()
     }
 
     func exportLUT() {
@@ -894,6 +1014,14 @@ final class CameraViewModel: ObservableObject {
         default: cfaName = "?\(frameData.cfaPattern)"
         }
         let drops = frameBuffer.droppedCount
+        let newScopeData: ScopeData?
+        let scopeNow = CACurrentMediaTime()
+        if showScopesUnsafe && scopeNow - lastScopeUpdateTime >= 0.1 {
+            lastScopeUpdateTime = scopeNow
+            newScopeData = pipeline.makeScopeData(from: framed)
+        } else {
+            newScopeData = nil
+        }
 
         // BGRA conversion + video encoding is fully asynchronous (zero CPU blocking)
         if isRecordingUnsafe {
@@ -914,12 +1042,42 @@ final class CameraViewModel: ObservableObject {
         // Only preview texture + UI counters go to MainActor
         Task { @MainActor [weak self] in
             guard let self else { return }
+            self.syncLiveAutoValues(from: frameData)
             self.currentTexture = framed
             self.cfaLabel = cfaName
             self.droppedFrames = drops
+            if let newScopeData {
+                self.scopeData = newScopeData
+            }
             if self.isRecording {
                 self.frameCount = Int(self.frameIndex)
             }
+        }
+    }
+
+    private func syncLiveAutoValues(from frameData: RawFrameData) {
+        guard let device = captureController.activeDevice else { return }
+        if isAutoExposureEnabled {
+            if frameData.iso > 0 {
+                isoValue = frameData.iso
+            }
+            if frameData.exposureDurationSeconds > 0 {
+                let angle = Float(frameData.exposureDurationSeconds * activeFPS * 360.0)
+                shutterValue = max(shutterRange.lowerBound, min(shutterRange.upperBound, angle))
+            }
+            isAutoExposureAdjusting = device.isAdjustingExposure
+        } else {
+            isAutoExposureAdjusting = false
+        }
+
+        if isAutoWhiteBalanceEnabled {
+            if let gains = frameData.whiteBalanceGains {
+                let temperatureAndTint = device.temperatureAndTintValues(for: gains)
+                wbKelvin = max(2000, min(10000, temperatureAndTint.temperature))
+            }
+            isAutoWhiteBalanceAdjusting = device.isAdjustingWhiteBalance
+        } else {
+            isAutoWhiteBalanceAdjusting = false
         }
     }
 }

@@ -27,6 +27,27 @@ struct ControlsView: View {
 
     private var topBar: some View {
         HStack(alignment: .top, spacing: 12) {
+            topLeftStack
+
+            Spacer(minLength: 12)
+
+            HStack(spacing: 8) {
+                previewToggle
+                topToggle(systemName: "grid", active: viewModel.showGrid) { viewModel.toggleGrid() }
+                topToggle(systemName: "level", active: viewModel.showLevel) { viewModel.toggleLevel() }
+                topToggle(systemName: "sun.max.fill", active: viewModel.showClipping) { viewModel.toggleClipping() }
+                topToggle(systemName: "viewfinder", active: viewModel.showFocusPeaking) { viewModel.toggleFocusPeaking() }
+                topToggle(systemName: "chart.bar", active: viewModel.showScopes) { viewModel.toggleScopes() }
+                readoutChip(viewModel.cfaLabel)
+            }
+        }
+        .padding(.leading, 16)
+        .padding(.trailing, 92)
+        .padding(.top, 12)
+    }
+
+    private var topLeftStack: some View {
+        VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 10) {
                 if viewModel.isRecording {
                     Circle()
@@ -56,20 +77,58 @@ struct ControlsView: View {
             .background(Color.black.opacity(0.48))
             .clipShape(Capsule())
 
-            Spacer(minLength: 12)
+            saveLocationControl
+        }
+    }
 
-            HStack(spacing: 8) {
-                previewToggle
-                topToggle(systemName: "grid", active: viewModel.showGrid) { viewModel.toggleGrid() }
-                topToggle(systemName: "level", active: viewModel.showLevel) { viewModel.toggleLevel() }
-                topToggle(systemName: "sun.max.fill", active: viewModel.showClipping) { viewModel.toggleClipping() }
-                topToggle(systemName: "viewfinder", active: viewModel.showFocusPeaking) { viewModel.toggleFocusPeaking() }
-                readoutChip(viewModel.cfaLabel)
+    private var saveLocationControl: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Button {
+                viewModel.togglePanel(.save)
+            } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: viewModel.selectedSaveDestination == .photos ? "photo.on.rectangle" : "folder")
+                        .font(.system(size: 10, weight: .semibold))
+                    Text("SAVE \(viewModel.selectedSaveDestination.label)")
+                        .font(.system(size: 9, weight: .bold, design: .rounded))
+                        .lineLimit(1)
+                }
+                .foregroundColor(viewModel.activePanel == .save ? .black : .white.opacity(viewModel.isRecording ? 0.35 : 0.85))
+                .padding(.horizontal, 10)
+                .frame(height: 28)
+                .background(viewModel.activePanel == .save ? Color.white : Color.black.opacity(0.42))
+                .clipShape(Capsule())
+            }
+            .buttonStyle(.plain)
+            .disabled(viewModel.isRecording)
+
+            if viewModel.activePanel == .save, !viewModel.isRecording {
+                HStack(spacing: 5) {
+                    ForEach(VideoSaveDestination.allCases) { destination in
+                        Button {
+                            viewModel.selectedSaveDestination = destination
+                            viewModel.activePanel = nil
+                        } label: {
+                            Text(destination.label)
+                                .font(.system(size: 9, weight: .bold, design: .rounded))
+                                .foregroundColor(viewModel.selectedSaveDestination == destination ? .black : .white.opacity(0.78))
+                                .padding(.horizontal, 10)
+                                .frame(height: 26)
+                                .background(viewModel.selectedSaveDestination == destination ? Color.white : Color.black.opacity(0.55))
+                                .clipShape(Capsule())
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+                .padding(5)
+                .background(Color.black.opacity(0.6))
+                .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .strokeBorder(Color.white.opacity(0.12), lineWidth: 1)
+                )
             }
         }
-        .padding(.leading, 16)
-        .padding(.trailing, 92)
-        .padding(.top, 12)
     }
 
     private func topToggle(systemName: String, active: Bool, action: @escaping () -> Void) -> some View {
@@ -129,7 +188,7 @@ struct ControlsView: View {
             }
 
             // Expanded panel — keep layout when recording by using fixed min height zone
-            if let panel = viewModel.activePanel, !viewModel.isRecording {
+            if let panel = viewModel.activePanel, panel != .save, !viewModel.isRecording {
                 expandedPanel(panel)
                     .transition(.opacity)
                     .frame(maxWidth: 620)
@@ -164,10 +223,9 @@ struct ControlsView: View {
 
     private var chipRow: some View {
         HStack(spacing: 5) {
-            valueChip(title: "ISO", value: String(format: "%.0f", viewModel.isoValue), panel: .iso)
-            valueChip(title: "ANG", value: String(format: "%.0f°", viewModel.shutterValue), panel: .shutter)
+            valueChip(title: "EXP", value: exposureChipValue, panel: .exposure)
             valueChip(title: "FCS", value: viewModel.isAutoFocus ? "AF" : "MF", panel: .focus)
-            valueChip(title: "WB", value: String(format: "%.0fK", viewModel.wbKelvin), panel: .wb)
+            valueChip(title: "WB", value: viewModel.isAutoWhiteBalanceEnabled ? String(format: "A %.0fK", viewModel.wbKelvin) : String(format: "%.0fK", viewModel.wbKelvin), panel: .wb)
             valueChip(title: "FPS", value: viewModel.selectedFPS.label, panel: .fps)
             valueChip(title: "FMT", value: viewModel.selectedFormat.shortLabel, panel: .format)
             valueChip(title: "BIT", value: viewModel.selectedBitrate.label, panel: .bitrate)
@@ -187,6 +245,11 @@ struct ControlsView: View {
         if n == "iPhone" { return "Phone" }
         if n.count <= 6 { return n }
         return String(n.prefix(5))
+    }
+
+    private var exposureChipValue: String {
+        let prefix = viewModel.isAutoExposureEnabled ? "A " : ""
+        return prefix + String(format: "%.0f/%.0f°", viewModel.isoValue, viewModel.shutterValue)
     }
 
     private func valueChip(title: String, value: String, panel: CameraViewModel.ControlPanel) -> some View {
@@ -224,37 +287,63 @@ struct ControlsView: View {
     private func expandedPanel(_ panel: CameraViewModel.ControlPanel) -> some View {
         VStack(alignment: .leading, spacing: 8) {
             switch panel {
-            case .iso:
-                panelHeader("ISO — snap stops")
-                stopSlider(
-                    index: $viewModel.isoStopIndex,
-                    count: viewModel.isoStops.count,
-                    label: String(format: "%.0f", viewModel.isoValue),
-                    onNudge: { viewModel.nudgeISO($0) }
+            case .exposure, .iso, .shutter:
+                panelHeaderRow(
+                    title: viewModel.isAutoExposureAdjusting ? "Exposure — auto adjusting" : "Exposure",
+                    isAutoOn: $viewModel.isAutoExposureEnabled
                 )
-            case .shutter:
-                panelHeader("Shutter Angle")
-                HStack {
-                    Text(String(format: "%.0f°", viewModel.shutterRange.lowerBound))
-                        .font(.system(size: 10, weight: .medium))
-                        .foregroundColor(.white.opacity(0.6))
-                    Slider(value: Binding(get: { viewModel.shutterValue }, set: { 
-                        viewModel.setShutterAngleWithSnapping($0) 
-                    }), in: viewModel.shutterRange)
-                    .tint(.white)
-                    Text(String(format: "%.0f°", viewModel.shutterRange.upperBound))
-                        .font(.system(size: 10, weight: .medium))
-                        .foregroundColor(.white.opacity(0.6))
+                VStack(spacing: 10) {
+                    HStack(spacing: 10) {
+                        Text("ISO")
+                            .font(.system(size: 10, weight: .bold, design: .rounded))
+                            .foregroundColor(.white.opacity(0.55))
+                            .frame(width: 34, alignment: .leading)
+                        stopSlider(
+                            index: $viewModel.isoStopIndex,
+                            count: viewModel.isoStops.count,
+                            label: String(format: "%.0f", viewModel.isoValue),
+                            onNudge: { viewModel.nudgeISO($0) }
+                        )
+                    }
+                    HStack(spacing: 10) {
+                        Text("ANG")
+                            .font(.system(size: 10, weight: .bold, design: .rounded))
+                            .foregroundColor(.white.opacity(0.55))
+                            .frame(width: 34, alignment: .leading)
+                        HStack {
+                            Text(String(format: "%.0f°", viewModel.shutterRange.lowerBound))
+                                .font(.system(size: 10, weight: .medium))
+                                .foregroundColor(.white.opacity(0.6))
+                            Slider(value: Binding(get: { viewModel.shutterValue }, set: {
+                                viewModel.setShutterAngleWithSnapping($0)
+                            }), in: viewModel.shutterRange)
+                            .tint(.white)
+                            Text(String(format: "%.0f°", viewModel.shutterRange.upperBound))
+                                .font(.system(size: 10, weight: .medium))
+                                .foregroundColor(.white.opacity(0.6))
+                            Text(String(format: "%.0f°", viewModel.shutterValue))
+                                .font(.system(size: 12, weight: .semibold, design: .monospaced))
+                                .foregroundColor(.white.opacity(0.9))
+                                .frame(width: 58, alignment: .trailing)
+                        }
+                        .padding(.horizontal, 4)
+                    }
                 }
-                .padding(.horizontal, 4)
+                .opacity(viewModel.isAutoExposureEnabled ? 0.35 : 1)
+                .disabled(viewModel.isAutoExposureEnabled)
             case .wb:
-                panelHeader("White Balance — snap stops")
+                panelHeaderRow(
+                    title: viewModel.isAutoWhiteBalanceAdjusting ? "White Balance — auto adjusting" : "White Balance",
+                    isAutoOn: $viewModel.isAutoWhiteBalanceEnabled
+                )
                 stopSlider(
                     index: $viewModel.wbStopIndex,
                     count: viewModel.wbStops.count,
                     label: String(format: "%.0fK", viewModel.wbKelvin),
                     onNudge: { viewModel.nudgeWB($0) }
                 )
+                .opacity(viewModel.isAutoWhiteBalanceEnabled ? 0.35 : 1)
+                .disabled(viewModel.isAutoWhiteBalanceEnabled)
             case .focus:
                 HStack(alignment: .center) {
                     panelHeader("Focus")
@@ -374,6 +463,8 @@ struct ControlsView: View {
                         }
                     }
                 }
+            case .save:
+                EmptyView()
             }
         }
         .padding(10)
@@ -397,6 +488,20 @@ struct ControlsView: View {
             .font(.system(size: 9, weight: .bold))
             .foregroundColor(.white.opacity(0.45))
             .tracking(0.8)
+    }
+
+    private func panelHeaderRow(title: String, isAutoOn: Binding<Bool>) -> some View {
+        HStack(spacing: 10) {
+            panelHeader(title)
+            Spacer(minLength: 0)
+            Toggle("", isOn: isAutoOn)
+                .labelsHidden()
+                .toggleStyle(.switch)
+                .scaleEffect(0.72)
+            Text("AUTO")
+                .font(.system(size: 9, weight: .bold, design: .rounded))
+                .foregroundColor(isAutoOn.wrappedValue ? .white : .white.opacity(0.42))
+        }
     }
 
     /// Discrete snap slider + − / + for one-stop nudges (ISO 100/200, 1/48, 5600K…).

@@ -88,6 +88,27 @@ enum BitratePreset: Int, CaseIterable, Identifiable {
     var bitsPerSecond: Int { rawValue * 1_000_000 }
 }
 
+enum VideoSaveDestination: String, CaseIterable, Identifiable {
+    case photos = "photos"
+    case files = "files"
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .photos: return "Photos"
+        case .files: return "Files"
+        }
+    }
+
+    var shortLabel: String {
+        switch self {
+        case .photos: return "PH"
+        case .files: return "Files"
+        }
+    }
+}
+
 /// Mic option from AVAudioSession ports (Off / iPhone / external by name).
 struct AudioSourceOption: Identifiable, Hashable {
     let id: String

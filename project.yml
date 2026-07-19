@@ -28,6 +28,8 @@ targets:
         NSCameraUsageDescription: "OwLens needs camera access to capture RAW sensor data for log-encoded video recording."
         NSMicrophoneUsageDescription: "OwLens needs microphone access to record audio alongside video."
         NSPhotoLibraryAddUsageDescription: "Save recorded log-encoded video to your photo library."
+        LSSupportsOpeningDocumentsInPlace: true
+        UIFileSharingEnabled: true
         UILaunchStoryboardName: LaunchScreen
         UIRequiresFullScreen: true
         UISupportedInterfaceOrientations:

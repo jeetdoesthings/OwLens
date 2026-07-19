@@ -26,6 +26,10 @@
 	<string>OwLens needs microphone access to record audio alongside video.</string>
 	<key>NSPhotoLibraryAddUsageDescription</key>
 	<string>Save recorded log-encoded video to your photo library.</string>
+	<key>LSSupportsOpeningDocumentsInPlace</key>
+	<true/>
+	<key>UIFileSharingEnabled</key>
+	<true/>
 	<key>UILaunchStoryboardName</key>
 	<string>LaunchScreen</string>
 	<key>UIRequiresFullScreen</key>

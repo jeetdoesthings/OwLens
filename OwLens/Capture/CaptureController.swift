@@ -15,6 +15,7 @@ struct RawFrameData {
     let pixelFormat: OSType
     let lscCoefficients: SIMD4<Float>
     let iso: Float
+    let exposureDurationSeconds: Double
 }
 
 final class CaptureController: NSObject, ObservableObject {
@@ -1039,7 +1040,8 @@ extension CaptureController: AVCapturePhotoCaptureDelegate {
             whiteLevel: white,
             pixelFormat: bufferFormat,
             lscCoefficients: lsc,
-            iso: currentISO
+            iso: currentISO,
+            exposureDurationSeconds: device?.exposureDuration.seconds ?? 0
         )
 
         onRawFrameData?(frameData)
