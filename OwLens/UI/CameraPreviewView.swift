@@ -9,6 +9,7 @@ struct CameraPreviewView: UIViewRepresentable {
     @Binding var currentTexture: MTLTexture?
     @Binding var showClipping: Bool
     @Binding var showFocusPeaking: Bool
+    var overlayOnly: Bool = false
  
     func makeUIView(context: Context) -> MTKView {
         let mtkView = MTKView(frame: .zero, device: metalPipeline.device)
@@ -19,8 +20,9 @@ struct CameraPreviewView: UIViewRepresentable {
         mtkView.enableSetNeedsDisplay = false
         mtkView.isPaused = false
         mtkView.autoResizeDrawable = true
-        mtkView.clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 1)
-        mtkView.backgroundColor = .black
+        mtkView.clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: overlayOnly ? 0 : 1)
+        mtkView.backgroundColor = overlayOnly ? .clear : .black
+        mtkView.isOpaque = !overlayOnly
         mtkView.contentMode = .scaleToFill
         // Avoid UIKit transforming layers into portrait letterbox mid-record
         mtkView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
@@ -31,6 +33,10 @@ struct CameraPreviewView: UIViewRepresentable {
         context.coordinator.currentTexture = currentTexture
         context.coordinator.showClipping = showClipping
         context.coordinator.showFocusPeaking = showFocusPeaking
+        context.coordinator.overlayOnly = overlayOnly
+        uiView.clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: overlayOnly ? 0 : 1)
+        uiView.backgroundColor = overlayOnly ? .clear : .black
+        uiView.isOpaque = !overlayOnly
     }
  
     func makeCoordinator() -> Coordinator {
@@ -42,6 +48,7 @@ struct CameraPreviewView: UIViewRepresentable {
         var currentTexture: MTLTexture?
         var showClipping: Bool = false
         var showFocusPeaking: Bool = false
+        var overlayOnly: Bool = false
         private let renderCommandQueue: MTLCommandQueue?
         private let renderPipeline: MTLRenderPipelineState?
  
@@ -140,6 +147,9 @@ struct CameraPreviewView: UIViewRepresentable {
                 
                 var peaking: Int32 = showFocusPeaking ? 1 : 0
                 renderEncoder.setFragmentBytes(&peaking, length: MemoryLayout<Int32>.size, index: 3)
+                
+                var overlay: Int32 = overlayOnly ? 1 : 0
+                renderEncoder.setFragmentBytes(&overlay, length: MemoryLayout<Int32>.size, index: 4)
                 
                 // Draw full-screen triangle
                 renderEncoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)

@@ -316,11 +316,12 @@ fragment float4 displayFragment(
     constant int2 &destOffset [[buffer(0)]],
     constant int2 &destSize [[buffer(1)]],
     constant int &showClipping [[buffer(2)]],
-    constant int &showFocusPeaking [[buffer(3)]]
+    constant int &showFocusPeaking [[buffer(3)]],
+    constant int &overlayOnly [[buffer(4)]]
 ) {
     float2 uv = float2(in.position.x - destOffset.x, in.position.y - destOffset.y) / float2(destSize);
     if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) {
-        return float4(0.0, 0.0, 0.0, 1.0);
+        return overlayOnly > 0 ? float4(0.0, 0.0, 0.0, 0.0) : float4(0.0, 0.0, 0.0, 1.0);
     }
     
     constexpr sampler s(coord::normalized, address::clamp_to_edge, filter::linear);
@@ -330,6 +331,7 @@ fragment float4 displayFragment(
     float applyRed = (showClipping > 0) ? isClipped : 0.0;
     
     float3 finalColor = mix(color.rgb, float3(1.0, 0.0, 0.0), applyRed);
+    float overlayAlpha = (overlayOnly > 0 && applyRed > 0.0) ? 0.75 : 0.0;
     
     if (showFocusPeaking > 0) {
         // Lightweight edge detection (Laplacian approximation)
@@ -346,9 +348,13 @@ fragment float4 displayFragment(
         // Threshold for edge detection
         if (edge > 0.05) {
             finalColor = float3(0.0, 1.0, 0.0); // Bright Green
+            overlayAlpha = 1.0;
         }
     }
     
+    if (overlayOnly > 0) {
+        return float4(finalColor, overlayAlpha);
+    }
     return float4(finalColor, 1.0);
 }
 

@@ -31,12 +31,23 @@ struct RootView: View {
             } else if let pipeline = viewModel.metalPipeline, viewModel.isCameraReady {
                 GeometryReader { geo in
                     ZStack {
+                        NormalVideoPreviewView(
+                            session: viewModel.captureController.session,
+                            lensID: viewModel.selectedLens?.uniqueID
+                        )
+                            .opacity(viewModel.previewDisplayMode == .normalVideo ? 1 : 0)
+                            .allowsHitTesting(false)
+                            .ignoresSafeArea()
+
                         CameraPreviewView(
                             metalPipeline: pipeline,
                             currentTexture: $viewModel.currentTexture,
                             showClipping: $viewModel.showClipping,
-                            showFocusPeaking: $viewModel.showFocusPeaking
+                            showFocusPeaking: $viewModel.showFocusPeaking,
+                            overlayOnly: viewModel.previewDisplayMode == .normalVideo
                         )
+                            .opacity(viewModel.previewDisplayMode == .log || viewModel.showClipping || viewModel.showFocusPeaking ? 1 : 0)
+                            .allowsHitTesting(viewModel.previewDisplayMode == .log)
                             .ignoresSafeArea()
                             .onTapGesture { location in
                                 let normalized = CGPoint(x: location.x / geo.size.width, y: location.y / geo.size.height)

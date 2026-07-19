@@ -106,3 +106,17 @@ struct LensOption: Identifiable, Hashable {
     let deviceType: AVCaptureDevice.DeviceType
     let uniqueID: String
 }
+
+enum PreviewDisplayMode: Int, CaseIterable, Identifiable {
+    case log = 0
+    case normalVideo = 1
+
+    var id: Int { rawValue }
+
+    var label: String {
+        switch self {
+        case .log: return "LOG"
+        case .normalVideo: return "VID"
+        }
+    }
+}

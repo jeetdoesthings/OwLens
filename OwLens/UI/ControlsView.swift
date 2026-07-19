@@ -6,74 +6,70 @@ struct ControlsView: View {
     @ObservedObject var viewModel: CameraViewModel
 
     var body: some View {
-        VStack(spacing: 0) {
+        ZStack {
             topBar
-            Spacer(minLength: 0)
-            bottomChrome
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+
+            VStack(spacing: 8) {
+                Spacer(minLength: 0)
+                lowerStatusStack
+                bottomRail
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
+
+            rightGrip
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .trailing)
         }
+        .animation(.easeOut(duration: 0.15), value: viewModel.activePanel)
     }
 
     // MARK: - Top
 
     private var topBar: some View {
-        HStack(spacing: 10) {
-            Text(viewModel.statusText)
-                .font(.system(size: 11, weight: .semibold, design: .rounded))
-                .foregroundColor(.white.opacity(0.9))
-                .lineLimit(1)
+        HStack(alignment: .top, spacing: 12) {
+            HStack(spacing: 10) {
+                if viewModel.isRecording {
+                    Circle()
+                        .fill(.red)
+                        .frame(width: 8, height: 8)
+                }
+                Text(viewModel.isRecording ? viewModel.recordingDuration : viewModel.statusText)
+                    .font(.system(size: 12, weight: .semibold, design: .monospaced))
+                    .foregroundColor(.white.opacity(0.92))
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.7)
 
-            Spacer(minLength: 8)
-
-            if viewModel.isRecording {
-                HStack(spacing: 4) {
-                    Circle().fill(.red).frame(width: 6, height: 6)
-                    Text(viewModel.recordingDuration)
-                        .font(.system(size: 11, weight: .semibold, design: .monospaced))
-                        .foregroundColor(.white)
-                    Text("· \(viewModel.frameCount)")
-                        .font(.system(size: 10, design: .monospaced))
+                if viewModel.isRecording {
+                    Text("\(viewModel.frameCount)")
+                        .font(.system(size: 10, weight: .medium, design: .monospaced))
                         .foregroundColor(.white.opacity(0.45))
                 }
+
+                if viewModel.droppedFrames > 0 {
+                    Text("DROP \(viewModel.droppedFrames)")
+                        .font(.system(size: 10, weight: .bold, design: .monospaced))
+                        .foregroundColor(.orange)
+                }
             }
+            .padding(.horizontal, 12)
+            .frame(height: 34)
+            .background(Color.black.opacity(0.48))
+            .clipShape(Capsule())
 
-            if viewModel.droppedFrames > 0 {
-                Text("↓\(viewModel.droppedFrames)")
-                    .font(.system(size: 10, weight: .bold, design: .monospaced))
-                    .foregroundColor(.orange)
+            Spacer(minLength: 12)
+
+            HStack(spacing: 8) {
+                previewToggle
+                topToggle(systemName: "grid", active: viewModel.showGrid) { viewModel.toggleGrid() }
+                topToggle(systemName: "level", active: viewModel.showLevel) { viewModel.toggleLevel() }
+                topToggle(systemName: "sun.max.fill", active: viewModel.showClipping) { viewModel.toggleClipping() }
+                topToggle(systemName: "viewfinder", active: viewModel.showFocusPeaking) { viewModel.toggleFocusPeaking() }
+                readoutChip(viewModel.cfaLabel)
             }
-
-            // Grid, level, and clipping toggles (top-right)
-            topToggle(
-                systemName: "grid",
-                active: viewModel.showGrid,
-                action: { viewModel.toggleGrid() }
-            )
-            topToggle(
-                systemName: "level",
-                active: viewModel.showLevel,
-                action: { viewModel.toggleLevel() }
-            )
-            topToggle(
-                systemName: "sun.max.fill",
-                active: viewModel.showClipping,
-                action: { viewModel.toggleClipping() }
-            )
-            topToggle(
-                systemName: "viewfinder",
-                active: viewModel.showFocusPeaking,
-                action: { viewModel.toggleFocusPeaking() }
-            )
-
-            Text(viewModel.cfaLabel)
-                .font(.system(size: 9, weight: .bold, design: .monospaced))
-                .foregroundColor(.white.opacity(0.4))
-                .padding(.horizontal, 6)
-                .padding(.vertical, 3)
-                .background(Color.white.opacity(0.08))
-                .clipShape(Capsule())
         }
-        .padding(.horizontal, 16)
-        .padding(.top, 10)
+        .padding(.leading, 16)
+        .padding(.trailing, 92)
+        .padding(.top, 12)
     }
 
     private func topToggle(systemName: String, active: Bool, action: @escaping () -> Void) -> some View {
@@ -81,22 +77,51 @@ struct ControlsView: View {
             Image(systemName: systemName)
                 .font(.system(size: 13, weight: .semibold))
                 .foregroundColor(active ? .black : .white.opacity(0.85))
-                .frame(width: 32, height: 32)
-                .background(active ? Color.white : Color.white.opacity(0.12))
+                .frame(width: 34, height: 34)
+                .background(active ? Color.white : Color.black.opacity(0.48))
                 .clipShape(Circle())
         }
         .buttonStyle(.plain)
     }
 
+    private var previewToggle: some View {
+        Button {
+            viewModel.togglePreviewDisplayMode()
+        } label: {
+            Text(viewModel.previewDisplayMode.label)
+                .font(.system(size: 10, weight: .bold, design: .rounded))
+                .foregroundColor(viewModel.previewDisplayMode == .normalVideo ? .black : .white.opacity(0.9))
+                .frame(width: 38, height: 34)
+                .background(viewModel.previewDisplayMode == .normalVideo ? Color.white : Color.black.opacity(0.48))
+                .clipShape(Capsule())
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func readoutChip(_ text: String) -> some View {
+        Text(text)
+            .font(.system(size: 9, weight: .bold, design: .monospaced))
+            .foregroundColor(.white.opacity(0.55))
+            .frame(minWidth: 38)
+            .frame(height: 34)
+            .padding(.horizontal, 6)
+            .background(Color.black.opacity(0.38))
+            .clipShape(Capsule())
+    }
+
     // MARK: - Bottom chrome
 
-    private var bottomChrome: some View {
+    private var lowerStatusStack: some View {
         VStack(spacing: 8) {
             if let err = viewModel.errorMessage {
                 Text(err)
                     .font(.system(size: 10))
                     .foregroundColor(.red.opacity(0.9))
                     .lineLimit(1)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 5)
+                    .background(Color.black.opacity(0.55))
+                    .clipShape(Capsule())
             }
 
             if viewModel.thermalState != .nominal {
@@ -107,36 +132,38 @@ struct ControlsView: View {
             if let panel = viewModel.activePanel, !viewModel.isRecording {
                 expandedPanel(panel)
                     .transition(.opacity)
+                    .frame(maxWidth: 620)
             }
 
             if viewModel.showUnverifiedDeviceWarning, !viewModel.isDeviceUnsupportedForLog {
                 unverifiedBanner
             }
+        }
+        .padding(.horizontal, 108)
+    }
 
-            // Always reserve chip row space so preview doesn't jump mid-record
+    private var bottomRail: some View {
+        HStack(spacing: 5) {
             chipRow
                 .opacity(viewModel.isRecording || viewModel.isDeviceUnsupportedForLog ? 0.35 : 1)
                 .allowsHitTesting(!viewModel.isRecording && !viewModel.isDeviceUnsupportedForLog)
-
-            recordRow
         }
-        .padding(.horizontal, 14)
-        .padding(.bottom, 18)
-        .padding(.top, 10)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .padding(.trailing, 82)
         .background(
             LinearGradient(
-                colors: [.clear, .black.opacity(0.5), .black.opacity(0.88)],
+                colors: [.clear, .black.opacity(0.5), .black.opacity(0.86)],
                 startPoint: .top,
                 endPoint: .bottom
             )
         )
-        .animation(.easeOut(duration: 0.15), value: viewModel.activePanel)
     }
 
     // MARK: - Chips
 
     private var chipRow: some View {
-        HStack(spacing: 3) {
+        HStack(spacing: 5) {
             valueChip(title: "ISO", value: String(format: "%.0f", viewModel.isoValue), panel: .iso)
             valueChip(title: "ANG", value: String(format: "%.0f°", viewModel.shutterValue), panel: .shutter)
             valueChip(title: "FCS", value: viewModel.isAutoFocus ? "AF" : "MF", panel: .focus)
@@ -179,12 +206,12 @@ struct ControlsView: View {
                     .minimumScaleFactor(0.6)
             }
             .frame(maxWidth: .infinity)
-            .padding(.vertical, 5)
-            .background(selected ? Color.white : Color.white.opacity(lockedOut ? 0.05 : 0.1))
-            .clipShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
+            .frame(height: 42)
+            .background(selected ? Color.white : Color.black.opacity(lockedOut ? 0.22 : 0.48))
+            .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
             .overlay(
-                RoundedRectangle(cornerRadius: 7, style: .continuous)
-                    .strokeBorder(lockedOut ? Color.white.opacity(0.08) : Color.clear, lineWidth: 1)
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .strokeBorder(selected ? Color.clear : Color.white.opacity(lockedOut ? 0.06 : 0.12), lineWidth: 1)
             )
         }
         .buttonStyle(.plain)
@@ -350,8 +377,12 @@ struct ControlsView: View {
             }
         }
         .padding(10)
-        .background(Color.white.opacity(0.08))
-        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .background(Color.black.opacity(0.72))
+        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .strokeBorder(Color.white.opacity(0.12), lineWidth: 1)
+        )
     }
 
     private func shortMicLabel(_ src: AudioSourceOption) -> String {
@@ -442,16 +473,27 @@ struct ControlsView: View {
                 .foregroundColor(selected ? .black : .white.opacity(0.8))
                 .padding(.horizontal, 12)
                 .padding(.vertical, 6)
-                .background(selected ? Color.white : Color.white.opacity(0.1))
-                .clipShape(Capsule())
+                .background(selected ? Color.white : Color.white.opacity(0.12))
+                .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
         }
         .buttonStyle(.plain)
     }
 
     // MARK: - Record row
 
-    private var recordRow: some View {
-        HStack(spacing: 28) {
+    private var rightGrip: some View {
+        VStack(spacing: 14) {
+            VStack(spacing: 1) {
+                Text(viewModel.selectedFormat.shortLabel)
+                    .font(.system(size: 13, weight: .bold, design: .rounded))
+                Text("\(viewModel.selectedBitrate.label)M")
+                    .font(.system(size: 9, weight: .medium, design: .monospaced))
+            }
+            .foregroundColor(.white.opacity(0.72))
+            .frame(width: 58, height: 42)
+            .background(Color.black.opacity(0.42))
+            .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+
             Button {
                 if viewModel.controlsLocked {
                     viewModel.unlockControls()
@@ -462,8 +504,8 @@ struct ControlsView: View {
                 Image(systemName: viewModel.controlsLocked ? "lock.fill" : "lock.open")
                     .font(.system(size: 16, weight: .semibold))
                     .foregroundColor(viewModel.controlsLocked ? .green : .white.opacity(0.75))
-                    .frame(width: 44, height: 44)
-                    .background(Color.white.opacity(0.1))
+                    .frame(width: 50, height: 50)
+                    .background(Color.black.opacity(0.46))
                     .clipShape(Circle())
             }
             .disabled(viewModel.isRecording)
@@ -478,12 +520,12 @@ struct ControlsView: View {
             } label: {
                 ZStack {
                     Circle()
-                        .strokeBorder(.white, lineWidth: 3)
-                        .frame(width: 56, height: 56)
+                        .strokeBorder(.white.opacity(0.95), lineWidth: 3)
+                        .frame(width: 72, height: 72)
                     if viewModel.isRecording {
                         RoundedRectangle(cornerRadius: 3)
                             .fill(.red)
-                            .frame(width: 20, height: 20)
+                            .frame(width: 24, height: 24)
                     } else {
                         Circle()
                             .fill(
@@ -491,7 +533,7 @@ struct ControlsView: View {
                                     ? Color.gray.opacity(0.4)
                                     : (viewModel.controlsLocked ? Color.red : Color.red.opacity(0.35))
                             )
-                            .frame(width: 44, height: 44)
+                            .frame(width: 56, height: 56)
                     }
                 }
             }
@@ -499,16 +541,16 @@ struct ControlsView: View {
                 viewModel.isDeviceUnsupportedForLog
                     || (!viewModel.controlsLocked && !viewModel.isRecording)
             )
-
-            VStack(spacing: 1) {
-                Text(viewModel.selectedFormat.shortLabel)
-                    .font(.system(size: 12, weight: .bold, design: .rounded))
-                Text("\(viewModel.selectedBitrate.label)M")
-                    .font(.system(size: 9, weight: .medium, design: .monospaced))
-            }
-            .foregroundColor(.white.opacity(0.55))
-            .frame(width: 48, height: 44)
         }
+        .padding(.trailing, 14)
+        .padding(.vertical, 14)
+        .background(
+            LinearGradient(
+                colors: [.clear, .black.opacity(0.35), .black.opacity(0.72)],
+                startPoint: .leading,
+                endPoint: .trailing
+            )
+        )
     }
 
     private var unverifiedBanner: some View {

@@ -74,6 +74,7 @@ final class CameraViewModel: ObservableObject {
     @Published var showGrid = false
     @Published var showClipping = false
     @Published var showFocusPeaking = false
+    @Published var previewDisplayMode: PreviewDisplayMode = .log
     @Published var showLevel = false {
         didSet {
             if showLevel {
@@ -452,6 +453,10 @@ final class CameraViewModel: ObservableObject {
     
     func toggleFocusPeaking() {
         showFocusPeaking.toggle()
+    }
+
+    func togglePreviewDisplayMode() {
+        previewDisplayMode = previewDisplayMode == .log ? .normalVideo : .log
     }
 
     func refreshAudioSources() {

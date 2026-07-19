@@ -93,6 +93,17 @@ final class MetalPipeline: @unchecked Sendable {
     private var pooledBGRATex: MTLTexture?
     private var pooledBGRAW: Int = 0
     private var pooledBGRAH: Int = 0
+    
+    private var pooledCropTex: MTLTexture?
+    private var pooledCropW: Int = 0
+    private var pooledCropH: Int = 0
+    private var pooledScaleTex: MTLTexture?
+    private var pooledScaleW: Int = 0
+    private var pooledScaleH: Int = 0
+    
+    private var pixelBufferPool: CVPixelBufferPool?
+    private var pixelBufferPoolW: Int = 0
+    private var pixelBufferPoolH: Int = 0
 
     var curveType: LogCurveType = .sLog3Approx
     var wbParams: WhiteBalanceParams = .identity
@@ -187,6 +198,60 @@ final class MetalPipeline: @unchecked Sendable {
         return tex
     }
 
+    private func getOrCreateCropTexture(width: Int, height: Int) -> MTLTexture? {
+        if let tex = pooledCropTex, pooledCropW == width, pooledCropH == height {
+            return tex
+        }
+        let tex = makePrivateTexture(width: width, height: height)
+        pooledCropTex = tex
+        pooledCropW = width
+        pooledCropH = height
+        return tex
+    }
+
+    private func getOrCreateScaleTexture(width: Int, height: Int) -> MTLTexture? {
+        if let tex = pooledScaleTex, pooledScaleW == width, pooledScaleH == height {
+            return tex
+        }
+        let tex = makePrivateTexture(width: width, height: height)
+        pooledScaleTex = tex
+        pooledScaleW = width
+        pooledScaleH = height
+        return tex
+    }
+
+    private func getOrCreatePixelBuffer(width: Int, height: Int) -> CVPixelBuffer? {
+        if pixelBufferPool == nil || pixelBufferPoolW != width || pixelBufferPoolH != height {
+            let attrs: [String: Any] = [
+                kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+                kCVPixelBufferWidthKey as String: width,
+                kCVPixelBufferHeightKey as String: height,
+                kCVPixelBufferMetalCompatibilityKey as String: true,
+                kCVPixelBufferIOSurfacePropertiesKey as String: [:] as [String: Any]
+            ]
+            let poolAttrs: [String: Any] = [
+                kCVPixelBufferPoolMinimumBufferCountKey as String: 6
+            ]
+            var pool: CVPixelBufferPool?
+            let status = CVPixelBufferPoolCreate(
+                nil,
+                poolAttrs as CFDictionary,
+                attrs as CFDictionary,
+                &pool
+            )
+            guard status == kCVReturnSuccess else { return nil }
+            pixelBufferPool = pool
+            pixelBufferPoolW = width
+            pixelBufferPoolH = height
+        }
+
+        guard let pixelBufferPool else { return nil }
+        var pixelBuffer: CVPixelBuffer?
+        let status = CVPixelBufferPoolCreatePixelBuffer(nil, pixelBufferPool, &pixelBuffer)
+        guard status == kCVReturnSuccess else { return nil }
+        return pixelBuffer
+    }
+
     // MARK: - Main process (fused single-kernel path)
 
     /// Process RAW to log RGB using the fused single-kernel path.
@@ -271,11 +336,7 @@ final class MetalPipeline: @unchecked Sendable {
     func scale(_ texture: MTLTexture, width: Int, height: Int, cb: MTLCommandBuffer) -> MTLTexture? {
         guard width > 0, height > 0 else { return nil }
         if texture.width == width && texture.height == height { return texture }
-        let outDesc = MTLTextureDescriptor.texture2DDescriptor(
-            pixelFormat: .rgba16Float, width: width, height: height, mipmapped: false)
-        outDesc.usage = [.shaderWrite, .shaderRead]
-        outDesc.storageMode = .private
-        guard let output = device.makeTexture(descriptor: outDesc) else { return nil }
+        guard let output = getOrCreateScaleTexture(width: width, height: height) else { return nil }
         scaler.encode(commandBuffer: cb, sourceTexture: texture, destinationTexture: output)
         return output
     }
@@ -319,7 +380,7 @@ final class MetalPipeline: @unchecked Sendable {
         if cropW == srcW && cropH == srcH {
             sourceForScale = texture
         } else {
-            guard let cropped = makePrivateTexture(width: cropW, height: cropH),
+            guard let cropped = getOrCreateCropTexture(width: cropW, height: cropH),
                   let blit = cb.makeBlitCommandEncoder() else {
                 return scale(texture, width: targetWidth, height: targetHeight, cb: cb)
             }
@@ -346,19 +407,7 @@ final class MetalPipeline: @unchecked Sendable {
         let width = texture.width
         let height = texture.height
  
-        let attrs: [String: Any] = [
-            kCVPixelBufferMetalCompatibilityKey as String: true,
-            kCVPixelBufferIOSurfacePropertiesKey as String: [:] as [String: Any]
-        ]
-        var pixelBuffer: CVPixelBuffer?
-        let status = CVPixelBufferCreate(
-            nil, width, height,
-            kCVPixelFormatType_32BGRA,
-            attrs as CFDictionary,
-            &pixelBuffer)
-        
-        guard status == kCVReturnSuccess,
-              let pb = pixelBuffer,
+        guard let pb = getOrCreatePixelBuffer(width: width, height: height),
               let textureCache = textureCache else {
             completion(nil)
             return
