@@ -264,7 +264,8 @@ struct ControlsView: View {
 
     private func valueChip(title: String, value: String, panel: CameraViewModel.ControlPanel) -> some View {
         let selected = viewModel.activePanel == panel
-        let lockedOut = viewModel.controlsLocked && panel != .log
+        let isAllowedWhileLocked = panel == .format || panel == .log
+        let lockedOut = viewModel.controlsLocked && !isAllowedWhileLocked
         return Button {
             viewModel.togglePanel(panel)
         } label: {
@@ -288,7 +289,7 @@ struct ControlsView: View {
             )
         }
         .buttonStyle(.plain)
-        .disabled(lockedOut && panel != .log)
+        .disabled(lockedOut)
     }
 
     // MARK: - Expanded panels

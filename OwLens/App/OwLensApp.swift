@@ -33,7 +33,8 @@ struct RootView: View {
                     ZStack {
                         NormalVideoPreviewView(
                             session: viewModel.captureController.session,
-                            lensID: viewModel.selectedLens?.uniqueID
+                            lensID: viewModel.selectedLens?.uniqueID,
+                            videoAspect: viewModel.selectedFormat.aspectRatio
                         )
                             .opacity(viewModel.previewDisplayMode == .normalVideo ? 1 : 0)
                             .allowsHitTesting(false)

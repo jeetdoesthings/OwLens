@@ -25,10 +25,9 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
     }
     @Published var selectedFormat: RecordingFormat = .openGate {
         didSet {
-            guard !controlsLocked, !isRecording else { return }
+            guard !isRecording else { return }
             activeEncodeWidth = selectedFormat.width
             activeEncodeHeight = selectedFormat.height
-            // Suggest bitrate for format if user hasn't customized — keep current if already set
             refreshStatusLine()
         }
     }
@@ -432,9 +431,9 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
     func togglePanel(_ panel: ControlPanel) {
         if controlsLocked {
             switch panel {
-            case .exposure, .iso, .shutter, .wb, .focus, .fps, .format, .bitrate, .mic, .lens:
+            case .exposure, .iso, .shutter, .wb, .focus, .fps, .bitrate, .mic, .lens:
                 return
-            case .log, .save:
+            case .format, .log, .save:
                 break
             }
         }
