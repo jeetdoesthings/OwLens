@@ -62,7 +62,7 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
     @Published var isSwitchingMic = false
     @Published var isSwitchingLens = false
 
-    /// Dynamic back lenses for this iPhone.
+    /// Dynamic back lenses for this device.
     @Published var availableLenses: [LensOption] = []
     @Published var selectedLens: LensOption? {
         didSet {
@@ -504,9 +504,9 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
             return
         }
 
-        // Port gone (unplugged) → prefer iPhone built-in, else first available
-        if let iphone = sources.first(where: { $0.name == "iPhone" }) {
-            selectedAudioSource = iphone
+        // Port gone (unplugged) → prefer built-in mic, else first available
+        if let builtIn = sources.first(where: { $0.id == "Built-In Microphone" || $0.name == "Built-in Mic" }) {
+            selectedAudioSource = builtIn
         } else if let firstMic = sources.first {
             selectedAudioSource = firstMic
         }

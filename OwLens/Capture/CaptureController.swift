@@ -418,10 +418,10 @@ final class CaptureController: NSObject, ObservableObject {
             position: .back
         )
 
-        // Get the wide lens's minimum back FOV zoom factor for relative magnification
+        // Use field of view to derive dynamic tele labels (2x, 3x, 5x) across iPhone models.
         let wideFOV: Float? = discovery.devices
             .first(where: { $0.deviceType == .builtInWideAngleCamera && !$0.isVirtualDevice })
-            .flatMap { Float($0.minAvailableVideoZoomFactor) }
+            .map { $0.activeFormat.videoFieldOfView }
 
         var options: [LensOption] = []
         var seen = Set<String>()
@@ -443,22 +443,11 @@ final class CaptureController: NSObject, ObservableObject {
             case .builtInUltraWideCamera: name = "Ultra Wide"; short = "0.5×"
             case .builtInWideAngleCamera: name = "Wide"; short = "1×"
             case .builtInTelephotoCamera:
-                // Derive actual multiplier relative to wide (2×, 3×, 5× etc.)
-                // Uses the telephoto's zoom factor relative to the wide lens
-                let multiplier: Int
-                if let wFOV = wideFOV, wFOV > 0 {
-                    // Telephoto equivalent focal length vs wide
-                    // Most iPhones: 12 Pro = 2×, 13 Pro = 3×, 15 Pro Max = 5×
-                    let ratio = Float(device.minAvailableVideoZoomFactor) / wFOV
-                    if ratio > 1.1 {
-                        multiplier = Int(ratio.rounded())
-                    } else {
-                        // Fallback: use known device characteristics
-                        multiplier = 2
-                    }
-                } else {
-                    multiplier = 2
-                }
+                let multiplier = Self.relativeZoomLabel(
+                    wideFOV: wideFOV,
+                    lensFOV: device.activeFormat.videoFieldOfView,
+                    fallback: 2
+                )
                 name = "Telephoto"; short = "\(multiplier)×"
             default:
                 print("[RawLogCam] discover: unexpected type \(deviceTypeLabel(device.deviceType)) — skipped")
@@ -486,7 +475,14 @@ final class CaptureController: NSObject, ObservableObject {
                 switch type {
                 case .builtInUltraWideCamera: name = "Ultra Wide"; short = "0.5×"
                 case .builtInWideAngleCamera: name = "Wide"; short = "1×"
-                case .builtInTelephotoCamera: name = "Telephoto"; short = "2×"
+                case .builtInTelephotoCamera:
+                    name = "Telephoto"
+                    let multiplier = Self.relativeZoomLabel(
+                        wideFOV: AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back)?.activeFormat.videoFieldOfView,
+                        lensFOV: device.activeFormat.videoFieldOfView,
+                        fallback: 2
+                    )
+                    short = "\(multiplier)×"
                 default: continue
                 }
                 options.append(LensOption(
@@ -510,6 +506,15 @@ final class CaptureController: NSObject, ObservableObject {
 
         print("[RawLogCam] discoverBackLenses count=\(options.count) types=[\(options.map { "\($0.shortLabel) \(deviceTypeLabel($0.deviceType))" }.joined(separator: ", "))]")
         return options
+    }
+
+    private static func relativeZoomLabel(wideFOV: Float?, lensFOV: Float, fallback: Int) -> Int {
+        guard let wideFOV, wideFOV > 0, lensFOV > 0 else { return fallback }
+        let wideRadians = Double(wideFOV) * .pi / 180.0
+        let lensRadians = Double(lensFOV) * .pi / 180.0
+        let ratio = tan(wideRadians / 2.0) / tan(lensRadians / 2.0)
+        guard ratio.isFinite, ratio > 1 else { return fallback }
+        return max(2, Int(ratio.rounded()))
     }
 
     var currentLensUniqueID: String? { device?.uniqueID }
@@ -619,7 +624,7 @@ final class CaptureController: NSObject, ObservableObject {
             seen.insert(port.uid)
             let name: String
             switch port.portType {
-            case .builtInMic: name = "iPhone"
+            case .builtInMic: name = "Built-in Mic"
             case .headsetMic: name = port.portName.isEmpty ? "Headset" : port.portName
             case .usbAudio: name = port.portName.isEmpty ? "USB Mic" : port.portName
             case .bluetoothHFP, .bluetoothA2DP: name = port.portName.isEmpty ? "Bluetooth" : port.portName

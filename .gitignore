@@ -26,5 +26,6 @@ Carthage/Build/
 .build/
 
 # User-specific ignores
-ARCHITECTURE.md
+*.md
+!README.md
 .DS_Store

@@ -252,7 +252,7 @@ struct ControlsView: View {
     private var micShortName: String {
         if viewModel.selectedAudioSource.portUID == nil { return "Off" }
         let n = viewModel.selectedAudioSource.name
-        if n == "iPhone" { return "Phone" }
+        if n == "Built-in Mic" || n == "iPhone" { return "Built-in" }
         if n.count <= 6 { return n }
         return String(n.prefix(5))
     }

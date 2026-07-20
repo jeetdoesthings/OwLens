@@ -155,7 +155,7 @@ struct RootView: View {
             if showSilentModeWarning {
                 VStack {
                     Spacer()
-                    Text("It is advised to put your iPhone in silent mode")
+                    Text("It is advised to put your device in silent mode")
                         .font(.custom("Helvetica-Bold", size: 13))
                         .foregroundColor(.white)
                         .padding(.vertical, 10)
@@ -271,7 +271,7 @@ struct RootView: View {
             Text("Metal GPU not available")
                 .font(.custom("Helvetica", size: 18))
                 .foregroundColor(.white)
-            Text("OwLens requires a physical iPhone with Metal support.")
+            Text("OwLens requires a physical device with Metal support.")
                 .font(.custom("Helvetica", size: 13))
                 .foregroundColor(.white.opacity(0.6))
         }
