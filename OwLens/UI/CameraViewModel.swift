@@ -906,9 +906,7 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
     private func loadFilesFolderBookmark() {
         guard let bookmark = UserDefaults.standard.data(forKey: filesFolderBookmarkKey) else { return }
         filesFolderBookmark = bookmark
-        if resolveFilesFolderURL() != nil {
-            selectedSaveDestination = .files
-        }
+        _ = resolveFilesFolderURL()
     }
 
     private func resolveFilesFolderURL() -> URL? {
