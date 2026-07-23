@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.4" role="img" aria-label="OwLens mark">
+  <title>OwLens mark</title>
+  <circle cx="8.6" cy="12" r="3.3" />
+  <circle cx="15.4" cy="12" r="3.3" />
+  <circle cx="8.6" cy="12" r="0.95" fill="currentColor" stroke="none" />
+  <circle cx="15.4" cy="12" r="0.95" fill="currentColor" stroke="none" />
+  <path d="M12 15.4 13.7 17.6h-3.4z" fill="currentColor" stroke="none" />
+</svg>
