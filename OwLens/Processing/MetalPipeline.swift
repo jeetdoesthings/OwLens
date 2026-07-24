@@ -33,11 +33,18 @@ struct FusedParams {
 struct BilateralParams {
     var iso: Float
 }
+struct DenoiseParams {
+    var iso: Float
+    var radius: Int32
+}
+struct TemporalParams {
+    var iso: Float
+    var maxBlend: Float
+}
 
-/// Metal pipeline: Bayer → (CFA-safe 2× bin) → **fused** debayer+WB+log → optional crop/scale.
+/// Metal pipeline: Bayer → (optional CFA-safe 2× bin) → linear debayer/WB → spatial denoise → log OETF.
 ///
-/// Optimizations vs. original 3-pass pipeline:
-///   • Single kernel dispatch (debayerWBLog) instead of 3 separate encoders
+/// Legacy fused kernels are still compiled for fallback and experimentation.
 ///   • Pre-allocated texture pool — zero per-frame allocations
 ///   • Synchronous `waitUntilCompleted` only on final BGRA readback
 final class MetalPipeline: @unchecked Sendable {
@@ -46,10 +53,13 @@ final class MetalPipeline: @unchecked Sendable {
     private let binPipeline: MTLComputePipelineState
     private let fusedPipeline: MTLComputePipelineState
     private let chromaBilateralPipeline: MTLComputePipelineState
+    private let linearPipeline: MTLComputePipelineState
+    private let denoisePipeline: MTLComputePipelineState
+    private let temporalPipeline: MTLComputePipelineState
     // Keep legacy pipelines for fallback / future use
     private let debayerPipeline: MTLComputePipelineState
     private let wbPipeline: MTLComputePipelineState
-    private let logCurvePipeline: MTLComputePipelineState
+    private let logOnlyPipeline: MTLComputePipelineState
     private var textureCache: CVMetalTextureCache?
     private let scaler: MPSImageBilinearScale
 
@@ -61,9 +71,18 @@ final class MetalPipeline: @unchecked Sendable {
     private var pooledFusedW: Int = 0
     private var pooledFusedH: Int = 0
     
+    private var pooledLinearTex: MTLTexture?
+    private var pooledLinearW: Int = 0
+    private var pooledLinearH: Int = 0
+    
     private var pooledDenoisedTex: MTLTexture?
     private var pooledDenoisedW: Int = 0
     private var pooledDenoisedH: Int = 0
+
+    private var pooledTemporalHistoryTex: MTLTexture?
+    private var pooledTemporalHistoryW: Int = 0
+    private var pooledTemporalHistoryH: Int = 0
+    private var temporalHistoryValid: Bool = false
     
     private var pooledBGRATex: MTLTexture?
     private var pooledBGRAW: Int = 0
@@ -99,9 +118,12 @@ final class MetalPipeline: @unchecked Sendable {
               let binFunc = library.makeFunction(name: "binBayerCFA"),
               let fusedFunc = library.makeFunction(name: "debayerWBLog"),
               let chromaFunc = library.makeFunction(name: "chromaBilateral"),
+              let linearFunc = library.makeFunction(name: "debayerWBLinear"),
+              let denoiseFunc = library.makeFunction(name: "spatialDenoise"),
+              let temporalFunc = library.makeFunction(name: "temporalDenoise"),
               let debayerFunc = library.makeFunction(name: "debayerBilinear"),
               let wbFunc = library.makeFunction(name: "applyWhiteBalanceAndColorMatrix"),
-              let logCurveFunc = library.makeFunction(name: "applyLogCurve") else {
+              let logOnlyFunc = library.makeFunction(name: "applyLogOnly") else {
             return nil
         }
         self.device = device
@@ -111,9 +133,12 @@ final class MetalPipeline: @unchecked Sendable {
             self.binPipeline = try device.makeComputePipelineState(function: binFunc)
             self.fusedPipeline = try device.makeComputePipelineState(function: fusedFunc)
             self.chromaBilateralPipeline = try device.makeComputePipelineState(function: chromaFunc)
+            self.linearPipeline = try device.makeComputePipelineState(function: linearFunc)
+            self.denoisePipeline = try device.makeComputePipelineState(function: denoiseFunc)
+            self.temporalPipeline = try device.makeComputePipelineState(function: temporalFunc)
             self.debayerPipeline = try device.makeComputePipelineState(function: debayerFunc)
             self.wbPipeline = try device.makeComputePipelineState(function: wbFunc)
-            self.logCurvePipeline = try device.makeComputePipelineState(function: logCurveFunc)
+            self.logOnlyPipeline = try device.makeComputePipelineState(function: logOnlyFunc)
         } catch {
             print("[MetalPipeline] Failed to create compute pipelines: \(error)")
             return nil
@@ -145,6 +170,17 @@ final class MetalPipeline: @unchecked Sendable {
         return tex
     }
 
+    private func getOrCreateLinearTexture(width: Int, height: Int) -> MTLTexture? {
+        if let tex = pooledLinearTex, pooledLinearW == width, pooledLinearH == height {
+            return tex
+        }
+        let tex = makePrivateTexture(width: width, height: height)
+        pooledLinearTex = tex
+        pooledLinearW = width
+        pooledLinearH = height
+        return tex
+    }
+
     private func getOrCreateDenoisedTexture(width: Int, height: Int) -> MTLTexture? {
         if let tex = pooledDenoisedTex, pooledDenoisedW == width, pooledDenoisedH == height {
             return tex
@@ -158,6 +194,18 @@ final class MetalPipeline: @unchecked Sendable {
         pooledDenoisedTex = tex
         pooledDenoisedW = width
         pooledDenoisedH = height
+        return tex
+    }
+
+    private func getOrCreateTemporalHistoryTexture(width: Int, height: Int) -> MTLTexture? {
+        if let tex = pooledTemporalHistoryTex, pooledTemporalHistoryW == width, pooledTemporalHistoryH == height {
+            return tex
+        }
+        let tex = makePrivateTexture(width: width, height: height)
+        pooledTemporalHistoryTex = tex
+        pooledTemporalHistoryW = width
+        pooledTemporalHistoryH = height
+        temporalHistoryValid = false
         return tex
     }
 
@@ -284,13 +332,22 @@ final class MetalPipeline: @unchecked Sendable {
             bayerH = fullH
         }
 
-        // ── Single fused kernel: demosaic + WB + log ──
-        guard let fusedOut = getOrCreateFusedTexture(width: bayerW, height: bayerH) else { return nil }
+        // ── 4-Pass Linear+Temporal Denoising Pipeline ──
+        // Pass 1: debayerWBLinear (Demosaic + LSC + WB -> Linear RGB)
+        // Pass 2: spatialDenoise (Luma + Chroma Bilateral in Linear space, shadow-adaptive)
+        // Pass 3: temporalDenoise (Motion-adaptive blend with frame history)
+        // Pass 4: applyLogOnly (Linear RGB -> S-Log3 / Log2)
+        
+        guard let linearOut = getOrCreateLinearTexture(width: bayerW, height: bayerH),
+              let denoisedOut = getOrCreateDenoisedTexture(width: bayerW, height: bayerH),
+              let temporalHistoryOut = getOrCreateTemporalHistoryTexture(width: bayerW, height: bayerH),
+              let fusedOut = getOrCreateFusedTexture(width: bayerW, height: bayerH) else { return nil }
 
+        // Pass 1: Linear Demosaic + WB
         if let enc = commandBuffer.makeComputeCommandEncoder() {
-            enc.setComputePipelineState(fusedPipeline)
+            enc.setComputePipelineState(linearPipeline)
             enc.setTexture(bayerIn, index: 0)
-            enc.setTexture(fusedOut, index: 1)
+            enc.setTexture(linearOut, index: 1)
             var params = FusedParams(
                 bayerPattern: bayerPattern,
                 blackLevel: blackLevel,
@@ -300,26 +357,88 @@ final class MetalPipeline: @unchecked Sendable {
                 lscCoefficients: lscCoefficients
             )
             enc.setBytes(&params, length: MemoryLayout<FusedParams>.stride, index: 0)
-            dispatch(enc, width: bayerW, height: bayerH, state: fusedPipeline)
+            dispatch(enc, width: bayerW, height: bayerH, state: linearPipeline)
             enc.endEncoding()
         }
 
-        // ── Chroma Bilateral Pass ──
-        guard let denoisedOut = getOrCreateDenoisedTexture(width: bayerW, height: bayerH) else { return nil }
-
+        // Pass 2: Spatial Denoise in Linear Space (Luma + Chroma, ISO-adaptive radius)
         if let enc = commandBuffer.makeComputeCommandEncoder() {
-            enc.setComputePipelineState(chromaBilateralPipeline)
-            enc.setTexture(fusedOut, index: 0)
+            enc.setComputePipelineState(denoisePipeline)
+            enc.setTexture(linearOut, index: 0)
             enc.setTexture(denoisedOut, index: 1)
             
-            var bParams = BilateralParams(iso: iso)
-            enc.setBytes(&bParams, length: MemoryLayout<BilateralParams>.stride, index: 0)
+            let radius: Int32 = iso > 200 ? 3 : 2
+            var dParams = DenoiseParams(iso: iso, radius: radius)
+            enc.setBytes(&dParams, length: MemoryLayout<DenoiseParams>.stride, index: 0)
             
-            dispatch(enc, width: bayerW, height: bayerH, state: chromaBilateralPipeline)
+            dispatch(enc, width: bayerW, height: bayerH, state: denoisePipeline)
             enc.endEncoding()
         }
 
-        let finalTex = cropToAspectAndScale(denoisedOut, targetWidth: encodeWidth, targetHeight: encodeHeight, cb: commandBuffer) ?? denoisedOut
+        // Pass 3: Temporal Denoise in Linear Space (Y+UV motion gating)
+        let temporalOut = linearOut
+        if temporalHistoryValid {
+            if let enc = commandBuffer.makeComputeCommandEncoder() {
+                enc.setComputePipelineState(temporalPipeline)
+                enc.setTexture(denoisedOut, index: 0)
+                enc.setTexture(temporalHistoryOut, index: 1)
+                enc.setTexture(temporalOut, index: 2)
+
+                let isoClamped = max(iso, 33.0)
+                let isoNorm = min(max((isoClamped - 33.0) / (1600.0 - 33.0), 0.0), 1.0)
+                let maxBlend: Float = 0.20 + 0.35 * isoNorm
+                var tParams = TemporalParams(iso: isoClamped, maxBlend: maxBlend)
+                enc.setBytes(&tParams, length: MemoryLayout<TemporalParams>.stride, index: 0)
+
+                dispatch(enc, width: bayerW, height: bayerH, state: temporalPipeline)
+                enc.endEncoding()
+            }
+        } else if let blit = commandBuffer.makeBlitCommandEncoder() {
+            blit.copy(
+                from: denoisedOut,
+                sourceSlice: 0, sourceLevel: 0,
+                sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
+                sourceSize: MTLSize(width: bayerW, height: bayerH, depth: 1),
+                to: temporalOut,
+                destinationSlice: 0, destinationLevel: 0,
+                destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0)
+            )
+            blit.endEncoding()
+        } else {
+            return nil
+        }
+
+        // Update temporal history from current filtered linear frame.
+        if let blit = commandBuffer.makeBlitCommandEncoder() {
+            blit.copy(
+                from: temporalOut,
+                sourceSlice: 0, sourceLevel: 0,
+                sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
+                sourceSize: MTLSize(width: bayerW, height: bayerH, depth: 1),
+                to: temporalHistoryOut,
+                destinationSlice: 0, destinationLevel: 0,
+                destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0)
+            )
+            blit.endEncoding()
+            temporalHistoryValid = true
+        } else {
+            return nil
+        }
+
+        // Pass 4: Log OETF
+        if let enc = commandBuffer.makeComputeCommandEncoder() {
+            enc.setComputePipelineState(logOnlyPipeline)
+            enc.setTexture(temporalOut, index: 0)
+            enc.setTexture(fusedOut, index: 1)
+            
+            var cType = Int32(curveType.rawValue)
+            enc.setBytes(&cType, length: MemoryLayout<Int32>.stride, index: 0)
+            
+            dispatch(enc, width: bayerW, height: bayerH, state: logOnlyPipeline)
+            enc.endEncoding()
+        }
+
+        let finalTex = cropToAspectAndScale(fusedOut, targetWidth: encodeWidth, targetHeight: encodeHeight, cb: commandBuffer) ?? fusedOut
         
         commandBuffer.commit()
         commandBuffer.waitUntilCompleted()
