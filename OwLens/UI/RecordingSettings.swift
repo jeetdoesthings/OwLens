@@ -73,6 +73,13 @@ enum RecordingFormat: String, CaseIterable, Identifiable {
         case .uhd4k: return .mbps150
         }
     }
+
+    var maxBitratePreset: BitratePreset {
+        switch self {
+        case .uhd4k: return .mbps150
+        default: return .mbps200
+        }
+    }
 }
 
 enum BitratePreset: Int, CaseIterable, Identifiable {

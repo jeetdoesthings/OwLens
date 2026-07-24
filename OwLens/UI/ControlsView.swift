@@ -393,7 +393,7 @@ struct ControlsView: View {
                     .foregroundColor(.white.opacity(0.4))
             case .bitrate:
                 panelHeader("Bitrate (HEVC)")
-                pillRow(items: BitratePreset.allCases.map { ($0.label, $0) }) { bit in
+                pillRow(items: BitratePreset.allCases.filter { $0.rawValue <= viewModel.selectedFormat.maxBitratePreset.rawValue }.map { ($0.label, $0) }) { bit in
                     viewModel.selectedBitrate = bit
                 } isSelected: { $0 == viewModel.selectedBitrate }
                 Text("\(viewModel.selectedBitrate.displayName) average")
@@ -660,13 +660,6 @@ struct ControlsView: View {
         }
         .padding(.trailing, 14)
         .padding(.vertical, 14)
-        .background(
-            LinearGradient(
-                colors: [.clear, .black.opacity(0.35), .black.opacity(0.72)],
-                startPoint: .leading,
-                endPoint: .trailing
-            )
-        )
     }
 
     private var unverifiedBanner: some View {

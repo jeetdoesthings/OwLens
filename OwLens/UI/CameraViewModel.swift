@@ -28,6 +28,9 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
             guard !isRecording else { return }
             activeEncodeWidth = selectedFormat.width
             activeEncodeHeight = selectedFormat.height
+            if selectedBitrate.rawValue > selectedFormat.maxBitratePreset.rawValue {
+                selectedBitrate = selectedFormat.suggestedBitratePreset
+            }
             refreshStatusLine()
         }
     }
@@ -221,11 +224,16 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
     nonisolated(unsafe) private var activeEncodeWidth = 1920
     nonisolated(unsafe) private var activeEncodeHeight = 1440
     nonisolated(unsafe) private var activeFPS: Double = 24
-    nonisolated(unsafe) private var isRecordingUnsafe = false
+nonisolated(unsafe) private var isRecordingUnsafe = false
     nonisolated(unsafe) private var showScopesUnsafe = false
     nonisolated(unsafe) private var lastScopeUpdateTime: CFTimeInterval = 0
-    /// Metal may not submit GPU work when app is backgrounded.
     nonisolated(unsafe) var isAppActive = true
+    /// Measured LSC override from device calibration (set once at setup).
+    nonisolated(unsafe) private var lscOverride: SIMD4<Float>?
+    /// Measured noise coefficients from device calibration (set once at setup).
+    nonisolated(unsafe) private var noiseCoeffs: (shot: Float, read: Float) = (0.012, 0.0004)
+    /// Noise profile for per-ISO coefficient lookup (nil on unknown device).
+    nonisolated(unsafe) private var noiseProfileForISO: NoiseProfile?
 
     enum ControlPanel: String, Identifiable {
         case exposure, iso, shutter, wb, focus, fps, format, log, bitrate, mic, lens, save
@@ -366,6 +374,14 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
         activeEncodeWidth = selectedFormat.width
         activeEncodeHeight = selectedFormat.height
         activeFPS = selectedFPS.rawValue
+
+// LSC and noise profile overrides from device calibration
+        lscOverride = caps.lscOverride?.asSIMD
+        noiseProfileForISO = caps.noiseProfile
+        if let prof = caps.noiseProfile {
+            let c = prof.coefficients(at: 33.0)  // base ISO; updated per-frame in processFrame
+            noiseCoeffs = c
+        }
 
         print(caps.diagnosticSummary)
 
@@ -740,12 +756,17 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
 
         let includeAudio = selectedAudioSource.portUID != nil
 
+        let effectiveBitrate = min(selectedBitrate.bitsPerSecond, selectedFormat.maxBitratePreset.bitsPerSecond)
+        if effectiveBitrate < selectedBitrate.bitsPerSecond {
+            print("[CameraViewModel] Bitrate clamped: \(selectedBitrate.label)Mbps → \(selectedFormat.maxBitratePreset.label)Mbps (max for \(selectedFormat.shortLabel))")
+        }
+
         do {
             try videoWriter.start(
                 outputURL: outputURL,
                 width: selectedFormat.width,
                 height: selectedFormat.height,
-                bitrate: selectedBitrate.bitsPerSecond,
+                bitrate: effectiveBitrate,
                 targetFPS: selectedFPS.rawValue,
                 includeAudio: includeAudio
             )
@@ -821,6 +842,15 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
     }
 
     private func saveFinishedRecording(at url: URL) {
+        // Validate the file before attempting any save
+        guard validateVideoFile(at: url) else {
+            statusText = "Save failed"
+            errorMessage = "Video file is corrupt — try a lower bitrate for 4K recordings"
+            print("[CameraViewModel] File validation failed for \(url.lastPathComponent)")
+            try? FileManager.default.removeItem(at: url)
+            return
+        }
+
         switch selectedSaveDestination {
         case .photos:
             PHPhotoLibrary.requestAuthorization(for: .addOnly) { status in
@@ -849,6 +879,28 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
         case .files:
             saveRecordingToChosenFilesFolder(url)
         }
+    }
+
+    /// Check the output .mov is playable before handing it to Photos.
+    private func validateVideoFile(at url: URL) -> Bool {
+        let asset = AVAsset(url: url)
+        let semaphore = DispatchSemaphore(value: 0)
+        var isValid = false
+        asset.loadValuesAsynchronously(forKeys: ["tracks", "playable"]) {
+            var error: NSError?
+            let trackStatus = asset.statusOfValue(forKey: "tracks", error: &error)
+            let playableStatus = asset.statusOfValue(forKey: "playable", error: &error)
+            if trackStatus == .loaded, playableStatus == .loaded,
+               !asset.tracks(withMediaType: .video).isEmpty,
+               asset.isPlayable, asset.duration.seconds > 0 {
+                isValid = true
+            } else {
+                print("[CameraViewModel] AVAsset invalid: tracks=\(trackStatus.rawValue) playable=\(playableStatus.rawValue) duration=\(asset.duration.seconds)")
+            }
+            semaphore.signal()
+        }
+        _ = semaphore.wait(timeout: .now() + 5)
+        return isValid
     }
 
     private func presentFilesFolderPicker() {
@@ -1033,8 +1085,15 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
         pipeline.bayerPattern = frameData.cfaPattern
         pipeline.blackLevel = frameData.blackLevel
         pipeline.whiteLevel = frameData.whiteLevel
-        pipeline.lscCoefficients = frameData.lscCoefficients
+        pipeline.lscCoefficients = lscOverride ?? frameData.lscCoefficients
         pipeline.iso = frameData.iso
+
+        // Recompute noise coefficients from measured profile (ISO-dependent)
+        if let prof = noiseProfileForISO {
+            noiseCoeffs = prof.coefficients(at: frameData.iso)
+        }
+        pipeline.noiseShotCoeff = noiseCoeffs.shot
+        pipeline.noiseReadCoeff = noiseCoeffs.read
 
         if pipeline.isAutoWBEnabled, let gains = frameData.whiteBalanceGains {
             let g = max(gains.greenGain, 0.001)
