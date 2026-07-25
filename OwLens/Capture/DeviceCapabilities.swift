@@ -47,6 +47,52 @@ enum VideoCodecOption: String, CaseIterable, Identifiable {
     }
 }
 
+// MARK: - LSCCoefficients
+
+/// Per-device lens shading correction coefficients from DNG / calibration.
+struct LSCCoefficients: Sendable {
+    let r: Float
+    let g: Float
+    let b: Float
+    let avg: Float
+
+    var asSIMD: SIMD4<Float> { SIMD4<Float>(r, g, b, avg) }
+}
+
+// MARK: - NoiseProfile
+
+/// Measured per-device noise model (shot + read coefficients) from dark-frame calibration.
+/// Each ISO entry maps to (shotCoeff, readCoeff) for the sensor at that ISO.
+struct NoiseProfile: Sendable {
+    struct ISOEntry: Sendable {
+        let iso: Float
+        let shot: Float
+        let read: Float
+    }
+
+    let entries: [ISOEntry]
+
+    /// Linearly interpolate shot/read coefficients at a given ISO.
+    func coefficients(at iso: Float) -> (shot: Float, read: Float) {
+        guard !entries.isEmpty else { return (0.012, 0.0004) }
+        guard iso >= entries.first!.iso else { return (entries.first!.shot, entries.first!.read) }
+        guard iso <= entries.last!.iso else { return (entries.last!.shot, entries.last!.read) }
+
+        for i in 0..<(entries.count - 1) {
+            let a = entries[i]
+            let b = entries[i + 1]
+            if iso >= a.iso && iso <= b.iso {
+                let t = (iso - a.iso) / (b.iso - a.iso)
+                return (
+                    shot: a.shot + t * (b.shot - a.shot),
+                    read: a.read + t * (b.read - a.read)
+                )
+            }
+        }
+        return (entries.last!.shot, entries.last!.read)
+    }
+}
+
 // MARK: - DeviceCapabilities
 
 /// One-shot capability probe at launch (before camera session when possible).
@@ -71,6 +117,12 @@ struct DeviceCapabilities: Sendable {
 
     /// Per-model CFA override if known; nil ⇒ use live OSType / DNG metadata.
     let bayerPatternOverride: BayerPatternID?
+
+    /// Per-device LSC override from calibration; nil ⇒ use live DNG metadata.
+    let lscOverride: LSCCoefficients?
+
+    /// Per-device noise profile from dark-frame calibration; nil ⇒ use defaults.
+    let noiseProfile: NoiseProfile?
 
     /// Multi-line log blob for tester reports.
     let diagnosticSummary: String
@@ -140,6 +192,8 @@ struct DeviceCapabilities: Sendable {
             recommendedFormat: recFormat,
             recommendedBitrate: recBitrate,
             bayerPatternOverride: cfaOverride,
+            lscOverride: lscOverrideTable[machine],
+            noiseProfile: noiseProfileTable[machine],
             diagnosticSummary: summary
         )
     }
@@ -165,6 +219,28 @@ struct DeviceCapabilities: Sendable {
 
     /// Default when machine unknown and OSType unmapped.
     static let defaultBayerPattern: BayerPatternID = .rggb
+
+    // MARK: - LSC override table
+
+    /// Per-device lens shading correction overrides from calibration. nil ⇒ use live DNG.
+    static let lscOverrideTable: [String: LSCCoefficients] = [
+        "iPhone13,3": LSCCoefficients(r: 1.028, g: 1.0, b: 0.974, avg: 1.0),
+        "iPhone13,4": LSCCoefficients(r: 1.032, g: 1.0, b: 0.971, avg: 1.0),
+    ]
+
+    // MARK: - Noise profile table
+
+    /// Per-device measured noise models from dark-frame calibration. nil ⇒ use defaults.
+    static let noiseProfileTable: [String: NoiseProfile] = [
+        "iPhone13,3": NoiseProfile(entries: [
+            .init(iso: 33,  shot: 0.0118, read: 0.00042),
+            .init(iso: 64,  shot: 0.0152, read: 0.00051),
+            .init(iso: 100, shot: 0.0198, read: 0.00068),
+            .init(iso: 200, shot: 0.0285, read: 0.00095),
+            .init(iso: 400, shot: 0.0410, read: 0.00140),
+            .init(iso: 800, shot: 0.0602, read: 0.00210),
+        ]),
+    ]
 
     // MARK: - Hardware id
 

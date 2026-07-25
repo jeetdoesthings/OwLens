@@ -36,6 +36,8 @@ struct BilateralParams {
 struct DenoiseParams {
     var iso: Float
     var radius: Int32
+    var shotCoeff: Float
+    var readCoeff: Float
 }
 struct TemporalParams {
     var iso: Float
@@ -109,6 +111,8 @@ final class MetalPipeline: @unchecked Sendable {
     var whiteLevel: Float = 16383.0 / 65535.0
     var lscCoefficients: SIMD4<Float> = SIMD4<Float>(repeating: 0)
     var iso: Float = 0
+    var noiseShotCoeff: Float = 0.012
+    var noiseReadCoeff: Float = 0.0004
     var isAutoWBEnabled: Bool = true
 
     init?() {
@@ -368,7 +372,7 @@ final class MetalPipeline: @unchecked Sendable {
             enc.setTexture(denoisedOut, index: 1)
             
             let radius: Int32 = iso > 200 ? 3 : 2
-            var dParams = DenoiseParams(iso: iso, radius: radius)
+            var dParams = DenoiseParams(iso: iso, radius: radius, shotCoeff: noiseShotCoeff, readCoeff: noiseReadCoeff)
             enc.setBytes(&dParams, length: MemoryLayout<DenoiseParams>.stride, index: 0)
             
             dispatch(enc, width: bayerW, height: bayerH, state: denoisePipeline)

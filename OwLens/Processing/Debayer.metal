@@ -561,6 +561,8 @@ kernel void chromaBilateral(
 struct DenoiseParams {
     float iso;
     int   radius;
+    float shotCoeff;
+    float readCoeff;
 };
 
 struct TemporalParams {
