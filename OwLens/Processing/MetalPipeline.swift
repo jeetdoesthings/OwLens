@@ -44,7 +44,8 @@ struct TemporalParams {
     var maxBlend: Float
 }
 
-/// Metal pipeline: Bayer → (optional CFA-safe 2× bin) → linear debayer/WB → spatial denoise → log OETF.
+/// Metal pipeline: Bayer → (optional CFA-safe phase-preserving 2× reduce) → linear debayer/WB
+/// → full-res luma denoise + half-res chroma denoise → temporal denoise → log OETF.
 ///
 /// Legacy fused kernels are still compiled for fallback and experimentation.
 ///   • Pre-allocated texture pool — zero per-frame allocations
@@ -57,6 +58,9 @@ final class MetalPipeline: @unchecked Sendable {
     private let chromaBilateralPipeline: MTLComputePipelineState
     private let linearPipeline: MTLComputePipelineState
     private let denoisePipeline: MTLComputePipelineState
+    private let extractChromaPipeline: MTLComputePipelineState
+    private let denoiseChromaPipeline: MTLComputePipelineState
+    private let recombineChromaPipeline: MTLComputePipelineState
     private let temporalPipeline: MTLComputePipelineState
     // Keep legacy pipelines for fallback / future use
     private let debayerPipeline: MTLComputePipelineState
@@ -80,6 +84,16 @@ final class MetalPipeline: @unchecked Sendable {
     private var pooledDenoisedTex: MTLTexture?
     private var pooledDenoisedW: Int = 0
     private var pooledDenoisedH: Int = 0
+
+    private var pooledChromaRawTex: MTLTexture?
+    private var pooledChromaRawW: Int = 0
+    private var pooledChromaRawH: Int = 0
+    private var pooledChromaDenoisedTex: MTLTexture?
+    private var pooledChromaDenoisedW: Int = 0
+    private var pooledChromaDenoisedH: Int = 0
+    private var pooledChromaMergedTex: MTLTexture?
+    private var pooledChromaMergedW: Int = 0
+    private var pooledChromaMergedH: Int = 0
 
     private var pooledTemporalHistoryTex: MTLTexture?
     private var pooledTemporalHistoryW: Int = 0
@@ -124,6 +138,9 @@ final class MetalPipeline: @unchecked Sendable {
               let chromaFunc = library.makeFunction(name: "chromaBilateral"),
               let linearFunc = library.makeFunction(name: "debayerWBLinear"),
               let denoiseFunc = library.makeFunction(name: "spatialDenoise"),
+              let extractChromaFunc = library.makeFunction(name: "extractHalfResChroma"),
+              let denoiseChromaFunc = library.makeFunction(name: "denoiseHalfResChroma"),
+              let recombineChromaFunc = library.makeFunction(name: "recombineLumaWithHalfResChroma"),
               let temporalFunc = library.makeFunction(name: "temporalDenoise"),
               let debayerFunc = library.makeFunction(name: "debayerBilinear"),
               let wbFunc = library.makeFunction(name: "applyWhiteBalanceAndColorMatrix"),
@@ -139,6 +156,9 @@ final class MetalPipeline: @unchecked Sendable {
             self.chromaBilateralPipeline = try device.makeComputePipelineState(function: chromaFunc)
             self.linearPipeline = try device.makeComputePipelineState(function: linearFunc)
             self.denoisePipeline = try device.makeComputePipelineState(function: denoiseFunc)
+            self.extractChromaPipeline = try device.makeComputePipelineState(function: extractChromaFunc)
+            self.denoiseChromaPipeline = try device.makeComputePipelineState(function: denoiseChromaFunc)
+            self.recombineChromaPipeline = try device.makeComputePipelineState(function: recombineChromaFunc)
             self.temporalPipeline = try device.makeComputePipelineState(function: temporalFunc)
             self.debayerPipeline = try device.makeComputePipelineState(function: debayerFunc)
             self.wbPipeline = try device.makeComputePipelineState(function: wbFunc)
@@ -198,6 +218,39 @@ final class MetalPipeline: @unchecked Sendable {
         pooledDenoisedTex = tex
         pooledDenoisedW = width
         pooledDenoisedH = height
+        return tex
+    }
+
+    private func getOrCreateChromaRawTexture(width: Int, height: Int) -> MTLTexture? {
+        if let tex = pooledChromaRawTex, pooledChromaRawW == width, pooledChromaRawH == height {
+            return tex
+        }
+        let tex = makeRGTexture(width: width, height: height)
+        pooledChromaRawTex = tex
+        pooledChromaRawW = width
+        pooledChromaRawH = height
+        return tex
+    }
+
+    private func getOrCreateChromaDenoisedTexture(width: Int, height: Int) -> MTLTexture? {
+        if let tex = pooledChromaDenoisedTex, pooledChromaDenoisedW == width, pooledChromaDenoisedH == height {
+            return tex
+        }
+        let tex = makeRGTexture(width: width, height: height)
+        pooledChromaDenoisedTex = tex
+        pooledChromaDenoisedW = width
+        pooledChromaDenoisedH = height
+        return tex
+    }
+
+    private func getOrCreateChromaMergedTexture(width: Int, height: Int) -> MTLTexture? {
+        if let tex = pooledChromaMergedTex, pooledChromaMergedW == width, pooledChromaMergedH == height {
+            return tex
+        }
+        let tex = makePrivateTexture(width: width, height: height)
+        pooledChromaMergedTex = tex
+        pooledChromaMergedW = width
+        pooledChromaMergedH = height
         return tex
     }
 
@@ -297,10 +350,10 @@ final class MetalPipeline: @unchecked Sendable {
         return pixelBuffer
     }
 
-    // MARK: - Main process (fused single-kernel path)
+    // MARK: - Main process (linear denoise path)
 
-    /// Process RAW to log RGB using the fused single-kernel path.
-    /// Uses CFA-preserving 2× bin when sensor wider than 2500px.
+    /// Process RAW to log RGB using the linear denoise path.
+    /// Uses CFA-preserving 2× reduction only when the reduced frame still covers the encode size.
     func process(_ pixelBuffer: CVPixelBuffer, encodeWidth: Int = 1920, encodeHeight: Int = 1440) -> MTLTexture? {
         let fullW = CVPixelBufferGetWidth(pixelBuffer)
         let fullH = CVPixelBufferGetHeight(pixelBuffer)
@@ -313,13 +366,15 @@ final class MetalPipeline: @unchecked Sendable {
 
         guard let commandBuffer = commandQueue.makeCommandBuffer() else { return nil }
 
-        // Optional CFA-safe half bin
+        // Optional CFA-safe half reduction. This is phase-preserving, not true averaged sensor binning,
+        // so only use it when it leaves a real downscale/crop buffer instead of causing output upscale.
         let bayerIn: MTLTexture
         let bayerW: Int
         let bayerH: Int
-        if fullW > 2500 {
-            let halfW = (fullW / 2) & ~1
-            let halfH = (fullH / 2) & ~1
+        let halfW = (fullW / 2) & ~1
+        let halfH = (fullH / 2) & ~1
+        let canReduceRaw = halfW >= encodeWidth && halfH >= encodeHeight
+        if canReduceRaw {
             guard let halfTex = getOrCreateBinTexture(width: halfW, height: halfH),
                   let enc = commandBuffer.makeComputeCommandEncoder() else { return nil }
             enc.setComputePipelineState(binPipeline)
@@ -336,14 +391,21 @@ final class MetalPipeline: @unchecked Sendable {
             bayerH = fullH
         }
 
-        // ── 4-Pass Linear+Temporal Denoising Pipeline ──
+        // ── Linear+Temporal Denoising Pipeline ──
         // Pass 1: debayerWBLinear (Demosaic + LSC + WB -> Linear RGB)
-        // Pass 2: spatialDenoise (Luma + Chroma Bilateral in Linear space, shadow-adaptive)
-        // Pass 3: temporalDenoise (Motion-adaptive blend with frame history)
-        // Pass 4: applyLogOnly (Linear RGB -> S-Log3 / Log2)
+        // Pass 2: spatialDenoise (full-res luma detail preservation)
+        // Pass 3: half-res chroma extraction + chroma-only bilateral denoise
+        // Pass 4: recombine full-res luma with upsampled half-res chroma
+        // Pass 5: temporalDenoise (Motion-adaptive blend with frame history)
+        // Pass 6: applyLogOnly (Linear RGB -> S-Log3 / Log2)
         
+        let chromaW = max(1, (bayerW + 1) / 2)
+        let chromaH = max(1, (bayerH + 1) / 2)
         guard let linearOut = getOrCreateLinearTexture(width: bayerW, height: bayerH),
               let denoisedOut = getOrCreateDenoisedTexture(width: bayerW, height: bayerH),
+              let chromaRawOut = getOrCreateChromaRawTexture(width: chromaW, height: chromaH),
+              let chromaDenoisedOut = getOrCreateChromaDenoisedTexture(width: chromaW, height: chromaH),
+              let chromaMergedOut = getOrCreateChromaMergedTexture(width: bayerW, height: bayerH),
               let temporalHistoryOut = getOrCreateTemporalHistoryTexture(width: bayerW, height: bayerH),
               let fusedOut = getOrCreateFusedTexture(width: bayerW, height: bayerH) else { return nil }
 
@@ -365,7 +427,7 @@ final class MetalPipeline: @unchecked Sendable {
             enc.endEncoding()
         }
 
-        // Pass 2: Spatial Denoise in Linear Space (Luma + Chroma, ISO-adaptive radius)
+        // Pass 2: Spatial denoise full-res luma in linear space.
         if let enc = commandBuffer.makeComputeCommandEncoder() {
             enc.setComputePipelineState(denoisePipeline)
             enc.setTexture(linearOut, index: 0)
@@ -379,12 +441,43 @@ final class MetalPipeline: @unchecked Sendable {
             enc.endEncoding()
         }
 
-        // Pass 3: Temporal Denoise in Linear Space (Y+UV motion gating)
+        // Pass 3a: Average chroma into a permanent half-res UV working plane.
+        if let enc = commandBuffer.makeComputeCommandEncoder() {
+            enc.setComputePipelineState(extractChromaPipeline)
+            enc.setTexture(linearOut, index: 0)
+            enc.setTexture(chromaRawOut, index: 1)
+            dispatch(enc, width: chromaW, height: chromaH, state: extractChromaPipeline)
+            enc.endEncoding()
+        }
+
+        // Pass 3b: Cross-bilateral chroma denoise at half resolution, edge-guided by full-res luma.
+        if let enc = commandBuffer.makeComputeCommandEncoder() {
+            enc.setComputePipelineState(denoiseChromaPipeline)
+            enc.setTexture(chromaRawOut, index: 0)
+            enc.setTexture(linearOut, index: 1)
+            enc.setTexture(chromaDenoisedOut, index: 2)
+            var dParams = DenoiseParams(iso: iso, radius: iso > 200 ? 3 : 2, shotCoeff: noiseShotCoeff, readCoeff: noiseReadCoeff)
+            enc.setBytes(&dParams, length: MemoryLayout<DenoiseParams>.stride, index: 0)
+            dispatch(enc, width: chromaW, height: chromaH, state: denoiseChromaPipeline)
+            enc.endEncoding()
+        }
+
+        // Pass 4: Recombine full-res denoised luma with bilinear-upsampled half-res chroma.
+        if let enc = commandBuffer.makeComputeCommandEncoder() {
+            enc.setComputePipelineState(recombineChromaPipeline)
+            enc.setTexture(denoisedOut, index: 0)
+            enc.setTexture(chromaDenoisedOut, index: 1)
+            enc.setTexture(chromaMergedOut, index: 2)
+            dispatch(enc, width: bayerW, height: bayerH, state: recombineChromaPipeline)
+            enc.endEncoding()
+        }
+
+        // Pass 5: Temporal Denoise in Linear Space (Y+UV motion gating)
         let temporalOut = linearOut
         if temporalHistoryValid {
             if let enc = commandBuffer.makeComputeCommandEncoder() {
                 enc.setComputePipelineState(temporalPipeline)
-                enc.setTexture(denoisedOut, index: 0)
+                enc.setTexture(chromaMergedOut, index: 0)
                 enc.setTexture(temporalHistoryOut, index: 1)
                 enc.setTexture(temporalOut, index: 2)
 
@@ -399,7 +492,7 @@ final class MetalPipeline: @unchecked Sendable {
             }
         } else if let blit = commandBuffer.makeBlitCommandEncoder() {
             blit.copy(
-                from: denoisedOut,
+                from: chromaMergedOut,
                 sourceSlice: 0, sourceLevel: 0,
                 sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
                 sourceSize: MTLSize(width: bayerW, height: bayerH, depth: 1),
@@ -429,7 +522,7 @@ final class MetalPipeline: @unchecked Sendable {
             return nil
         }
 
-        // Pass 4: Log OETF
+        // Pass 6: Log OETF
         if let enc = commandBuffer.makeComputeCommandEncoder() {
             enc.setComputePipelineState(logOnlyPipeline)
             enc.setTexture(temporalOut, index: 0)
@@ -618,6 +711,14 @@ final class MetalPipeline: @unchecked Sendable {
     private func makeR16Texture(width: Int, height: Int) -> MTLTexture? {
         let desc = MTLTextureDescriptor.texture2DDescriptor(
             pixelFormat: .r16Unorm, width: width, height: height, mipmapped: false)
+        desc.usage = [.shaderRead, .shaderWrite]
+        desc.storageMode = .private
+        return device.makeTexture(descriptor: desc)
+    }
+
+    private func makeRGTexture(width: Int, height: Int) -> MTLTexture? {
+        let desc = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .rg16Float, width: width, height: height, mipmapped: false)
         desc.usage = [.shaderRead, .shaderWrite]
         desc.storageMode = .private
         return device.makeTexture(descriptor: desc)

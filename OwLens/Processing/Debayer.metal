@@ -301,7 +301,7 @@ kernel void debayerWBLog(
 
 // ──────────────────────────────────────────────────────────────────────
 // LINEAR OUTPUT: demosaic + LSC + WB — NO log curve.
-// Used with spatialDenoise → applyLogOnly 3-pass pipeline.
+// Used by the linear denoise pipeline before luma/chroma split and log encoding.
 // ──────────────────────────────────────────────────────────────────────
 
 kernel void debayerWBLinear(
@@ -554,7 +554,7 @@ kernel void chromaBilateral(
 
 // ──────────────────────────────────────────────────────────────────────
 // SPATIAL DENOISING (Linear Space)
-// Bilateral filter on BOTH luma and chroma with ISO-adaptive strength.
+// Bilateral filter on luma with ISO-adaptive strength.
 // Operates before log curve for better noise statistics.
 // ──────────────────────────────────────────────────────────────────────
 
@@ -596,10 +596,6 @@ kernel void spatialDenoise(
     float lumaRS = 0.012 * isoScale * shadowBoost;
     float lumaRS2 = lumaRS * lumaRS;
     
-    // Chroma: wider sigma — stronger color noise reduction
-    float chromaRS = 0.035 * isoScale * shadowBoost;
-    float chromaRS2 = chromaRS * chromaRS;
-    
     // Spatial sigma adapts to kernel radius
     float spatialS2 = float(radius) * float(radius) * 0.5;
     
@@ -610,8 +606,6 @@ kernel void spatialDenoise(
     
     float sumLuma = 0.0;
     float sumLumaW = 0.0;
-    float2 sumUV = float2(0.0);
-    float sumChromaW = 0.0;
     
     for (int dy = -radius; dy <= radius; dy++) {
         for (int dx = -radius; dx <= radius; dx++) {
@@ -628,19 +622,131 @@ kernel void spatialDenoise(
             float lumaW = spatialW * exp(-(lumaDiff * lumaDiff) / (2.0 * lumaRS2));
             sumLumaW += lumaW;
             sumLuma += sYUV.x * lumaW;
-            
-            // Chroma bilateral: edge-stopped by luma difference (wider threshold)
-            float chromaW = spatialW * exp(-(lumaDiff * lumaDiff) / (2.0 * chromaRS2));
-            sumChromaW += chromaW;
-            sumUV += sYUV.yz * chromaW;
         }
     }
     
     float finalY = (sumLumaW > 1e-4) ? (sumLuma / sumLumaW) : centerYUV.x;
-    float2 finalUV = (sumChromaW > 1e-4) ? (sumUV / sumChromaW) : centerYUV.yz;
     
-    float3 finalRGB = max(yuv2rgb(float3(finalY, finalUV.x, finalUV.y)), float3(0.0));
+    float3 finalRGB = max(yuv2rgb(float3(finalY, centerYUV.y, centerYUV.z)), float3(0.0));
     outTexture.write(float4(finalRGB, centerPx.a), gid);
+}
+
+kernel void extractHalfResChroma(
+    texture2d<float, access::read>  inTexture [[texture(0)]],
+    texture2d<float, access::write> outTexture [[texture(1)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    if (gid.x >= outTexture.get_width() || gid.y >= outTexture.get_height()) return;
+
+    int w = int(inTexture.get_width());
+    int h = int(inTexture.get_height());
+    int baseX = int(gid.x) * 2;
+    int baseY = int(gid.y) * 2;
+
+    float2 sumUV = float2(0.0);
+    float count = 0.0;
+    for (int dy = 0; dy < 2; dy++) {
+        for (int dx = 0; dx < 2; dx++) {
+            int sx = baseX + dx;
+            int sy = baseY + dy;
+            if (sx >= w || sy >= h) continue;
+            sumUV += rgb2yuv(inTexture.read(uint2(sx, sy)).rgb).yz;
+            count += 1.0;
+        }
+    }
+
+    float2 uv = (count > 0.0) ? (sumUV / count) : float2(0.5);
+    outTexture.write(float4(uv.x, uv.y, 0.0, 1.0), gid);
+}
+
+kernel void denoiseHalfResChroma(
+    texture2d<float, access::read>  chromaTexture [[texture(0)]],
+    texture2d<float, access::read>  lumaGuideTexture [[texture(1)]],
+    texture2d<float, access::write> outTexture [[texture(2)]],
+    constant DenoiseParams &params [[buffer(0)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    if (gid.x >= outTexture.get_width() || gid.y >= outTexture.get_height()) return;
+
+    float iso = max(params.iso, 33.0);
+    float isoScale = sqrt(iso / 33.0);
+    int radius = params.radius;
+    float maxDist2 = float(radius * radius);
+    float spatialS2 = float(radius) * float(radius) * 0.5;
+
+    int chromaW = int(chromaTexture.get_width());
+    int chromaH = int(chromaTexture.get_height());
+    int guideW = int(lumaGuideTexture.get_width());
+    int guideH = int(lumaGuideTexture.get_height());
+    int cx = int(gid.x);
+    int cy = int(gid.y);
+
+    int centerGuideX = clamp(cx * 2 + 1, 0, guideW - 1);
+    int centerGuideY = clamp(cy * 2 + 1, 0, guideH - 1);
+    float centerY = rgb2yuv(lumaGuideTexture.read(uint2(centerGuideX, centerGuideY)).rgb).x;
+    float luma01 = saturate(centerY);
+    float shadowBoost = mix(1.55, 0.9, luma01);
+    float chromaRS = 0.045 * isoScale * shadowBoost;
+    float chromaRS2 = chromaRS * chromaRS;
+
+    float2 sumUV = float2(0.0);
+    float sumW = 0.0;
+    for (int dy = -radius; dy <= radius; dy++) {
+        for (int dx = -radius; dx <= radius; dx++) {
+            float dist2 = float(dx * dx + dy * dy);
+            if (dist2 > maxDist2) continue;
+
+            int px = clamp(cx + dx, 0, chromaW - 1);
+            int py = clamp(cy + dy, 0, chromaH - 1);
+            int guideX = clamp(px * 2 + 1, 0, guideW - 1);
+            int guideY = clamp(py * 2 + 1, 0, guideH - 1);
+            float sampleY = rgb2yuv(lumaGuideTexture.read(uint2(guideX, guideY)).rgb).x;
+            float lumaDiff = sampleY - centerY;
+            float spatialW = exp(-dist2 / (2.0 * spatialS2));
+            float chromaWgt = spatialW * exp(-(lumaDiff * lumaDiff) / (2.0 * chromaRS2));
+
+            sumUV += chromaTexture.read(uint2(px, py)).rg * chromaWgt;
+            sumW += chromaWgt;
+        }
+    }
+
+    float2 centerUV = chromaTexture.read(gid).rg;
+    float2 finalUV = (sumW > 1e-4) ? (sumUV / sumW) : centerUV;
+    outTexture.write(float4(finalUV.x, finalUV.y, 0.0, 1.0), gid);
+}
+
+static inline float2 readChromaClamped(texture2d<float, access::read> chromaTexture, int x, int y) {
+    int w = int(chromaTexture.get_width());
+    int h = int(chromaTexture.get_height());
+    return chromaTexture.read(uint2(clamp(x, 0, w - 1), clamp(y, 0, h - 1))).rg;
+}
+
+kernel void recombineLumaWithHalfResChroma(
+    texture2d<float, access::read>  lumaTexture [[texture(0)]],
+    texture2d<float, access::read>  chromaTexture [[texture(1)]],
+    texture2d<float, access::write> outTexture [[texture(2)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    if (gid.x >= outTexture.get_width() || gid.y >= outTexture.get_height()) return;
+
+    float4 lumaPx = lumaTexture.read(gid);
+    float y = rgb2yuv(lumaPx.rgb).x;
+
+    float2 chromaCoord = (float2(gid) + 0.5) * 0.5 - 0.5;
+    int2 p0 = int2(floor(chromaCoord));
+    float2 f = fract(chromaCoord);
+
+    float2 uv00 = readChromaClamped(chromaTexture, p0.x,     p0.y);
+    float2 uv10 = readChromaClamped(chromaTexture, p0.x + 1, p0.y);
+    float2 uv01 = readChromaClamped(chromaTexture, p0.x,     p0.y + 1);
+    float2 uv11 = readChromaClamped(chromaTexture, p0.x + 1, p0.y + 1);
+
+    float2 uv0 = mix(uv00, uv10, f.x);
+    float2 uv1 = mix(uv01, uv11, f.x);
+    float2 uv = mix(uv0, uv1, f.y);
+
+    float3 rgb = max(yuv2rgb(float3(y, uv.x, uv.y)), float3(0.0));
+    outTexture.write(float4(rgb, lumaPx.a), gid);
 }
 
 kernel void temporalDenoise(

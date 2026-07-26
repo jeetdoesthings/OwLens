@@ -1109,7 +1109,7 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
 
         let w = activeEncodeWidth
         let h = activeEncodeHeight
-        // CFA-safe 2× bin (when huge) + demosaic + WB + log + crop/scale to encode size
+        // Demosaic + WB + luma/chroma denoise + log + crop/scale to encode size.
         guard let framed = pipeline.process(frameData.pixelBuffer, encodeWidth: w, encodeHeight: h) else { return }
 
         let cfaName: String
