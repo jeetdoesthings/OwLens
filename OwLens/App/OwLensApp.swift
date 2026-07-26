@@ -73,9 +73,9 @@ struct RootView: View {
 
                         if viewModel.showScopes {
                             ScopesOverlay(data: viewModel.scopeData)
-                                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
-                                .padding(.leading, 18)
-                                .padding(.top, 104)
+                                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
+                                .padding(.leading, 12)
+                                .padding(.bottom, 12)
                                 .allowsHitTesting(false)
                         }
 
