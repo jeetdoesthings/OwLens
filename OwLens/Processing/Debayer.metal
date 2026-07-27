@@ -15,6 +15,11 @@ struct DebayerParams {
     float4 lscCoefficients;
 };
 
+struct DefectPixelParams {
+    float shotCoeff;
+    float readCoeff;
+};
+
 struct WhiteBalanceParams {
     float3 gains;
     float3x3 colorMatrix;
@@ -32,6 +37,49 @@ static inline float sampleBayerClamp(texture2d<float, access::read> tex, int x, 
     int ny = clamp(y + dy, 0, int(tex.get_height()) - 1);
     float v = tex.read(uint2(nx, ny)).r;
     return linearize(v, black, white);
+}
+
+kernel void correctDefectPixelsBayer(
+    texture2d<float, access::read>  src [[texture(0)]],
+    texture2d<float, access::write> dst [[texture(1)]],
+    constant DebayerParams &params [[buffer(0)]],
+    constant DefectPixelParams &noise [[buffer(1)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    if (gid.x >= dst.get_width() || gid.y >= dst.get_height()) return;
+
+    float center = src.read(gid).r;
+    float neighbors[8];
+    int count = 0;
+
+    for (int dy = -1; dy <= 1; dy++) {
+        for (int dx = -1; dx <= 1; dx++) {
+            if (dx == 0 && dy == 0) continue;
+            int nx = clamp(int(gid.x) + dx, 0, int(src.get_width())  - 1);
+            int ny = clamp(int(gid.y) + dy, 0, int(src.get_height()) - 1);
+            // Only collect same-color Bayer neighbors.
+            if (((nx + ny) & 1) == ((int(gid.x) + int(gid.y)) & 1)) {
+                neighbors[count++] = src.read(uint2(nx, ny)).r;
+            }
+        }
+    }
+
+    // Simple median of up to 8 same-color neighbors.
+    for (int i = 0; i < count - 1; i++) {
+        for (int j = i + 1; j < count; j++) {
+            if (neighbors[j] < neighbors[i]) {
+                float tmp = neighbors[i]; neighbors[i] = neighbors[j]; neighbors[j] = tmp;
+            }
+        }
+    }
+    float median = neighbors[count / 2];
+
+    float signalNorm = center / params.whiteLevel;
+    float sigmaRaw = sqrt(noise.shotCoeff * signalNorm + noise.readCoeff) * params.whiteLevel;
+    float threshold = 5.0 * max(sigmaRaw, 1.0);
+
+    float out = (abs(center - median) > threshold) ? median : center;
+    dst.write(float4(out, 0.0, 0.0, 1.0), gid);
 }
 
 // CFA-preserving half-res bin: out(x,y) = in(2x+(x&1), 2y+(y&1))
@@ -575,6 +623,7 @@ struct RingTemporalParams {
 kernel void spatialDenoise(
     texture2d<float, access::read>  inTexture [[texture(0)]],
     texture2d<float, access::write> outTexture [[texture(1)]],
+    texture2d<float, access::read>  statsTexture [[texture(2)]],
     constant DenoiseParams &params [[buffer(0)]],
     uint2 gid [[thread_position_in_grid]])
 {
@@ -599,9 +648,17 @@ kernel void spatialDenoise(
         sigmaRef = 0.012 * isoScale;  // legacy hardcoded proxy
     }
     float luma01 = saturate(centerYUV.x);
-    // Shot-noise-aware proxy: push stronger denoise in shadows, lighter in highlights.
-    float shadowBoost = mix(1.45, 0.8, luma01);
-    
+    // Per-pixel local-sigma guide: stronger denoise where local variance is low,
+    // lighter denoise on edges/high-variance regions. Falls back to signal-based
+    // shadowBoost at 4K where the stats pass is skipped.
+    float shadowBoost;
+    if (statsTexture.get_width() > 1) {
+        float localSigma = max(statsTexture.read(gid).y, 1e-4);
+        shadowBoost = clamp(localSigma / sigmaRef, 0.5, 2.0);
+    } else {
+        shadowBoost = mix(1.45, 0.8, luma01);
+    }
+
     // Luma: tight sigma — smooth flat-area grain, preserve edges
     float lumaRS = sigmaRef * shadowBoost;
     float lumaRS2 = lumaRS * lumaRS;
@@ -673,6 +730,7 @@ kernel void denoiseHalfResChroma(
     texture2d<float, access::read>  chromaTexture [[texture(0)]],
     texture2d<float, access::read>  lumaGuideTexture [[texture(1)]],
     texture2d<float, access::write> outTexture [[texture(2)]],
+    texture2d<float, access::read>  statsTexture [[texture(3)]],
     constant DenoiseParams &params [[buffer(0)]],
     uint2 gid [[thread_position_in_grid]])
 {
@@ -695,13 +753,23 @@ kernel void denoiseHalfResChroma(
     int centerGuideY = clamp(cy * 2 + 1, 0, guideH - 1);
     float centerY = rgb2yuv(lumaGuideTexture.read(uint2(centerGuideX, centerGuideY)).rgb).x;
     float luma01 = saturate(centerY);
-    float shadowBoost = mix(1.55, 0.9, luma01);
     // Calibrated chroma sigma: use measured coefficients when available.
     float chromaSigmaRef;
     if (params.shotCoeff > 0.0) {
         chromaSigmaRef = sqrt(params.shotCoeff * 0.5 + params.readCoeff);
     } else {
         chromaSigmaRef = 0.045 * isoScale;
+    }
+    // Per-pixel local-sigma guide, sampled at the corresponding full-res luma location.
+    float shadowBoost;
+    if (statsTexture.get_width() > 1) {
+        uint2 statsCoord = uint2(
+            min(uint(centerGuideX), uint(statsTexture.get_width())  - 1),
+            min(uint(centerGuideY), uint(statsTexture.get_height()) - 1));
+        float localSigma = max(statsTexture.read(statsCoord).y, 1e-4);
+        shadowBoost = clamp(localSigma / chromaSigmaRef, 0.5, 2.0);
+    } else {
+        shadowBoost = mix(1.55, 0.9, luma01);
     }
     float chromaRS = chromaSigmaRef * shadowBoost;
     float chromaRS2 = chromaRS * chromaRS;
@@ -730,6 +798,30 @@ kernel void denoiseHalfResChroma(
     float2 centerUV = chromaTexture.read(gid).rg;
     float2 finalUV = (sumW > 1e-4) ? (sumUV / sumW) : centerUV;
     outTexture.write(float4(finalUV.x, finalUV.y, 0.0, 1.0), gid);
+}
+
+kernel void estimateLumaVariance(
+    texture2d<float, access::read>  lumaIn   [[texture(0)]],
+    texture2d<float, access::write> statsOut [[texture(1)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    if (gid.x >= statsOut.get_width() || gid.y >= statsOut.get_height()) return;
+
+    float sum = 0.0, sum2 = 0.0, count = 0.0;
+    for (int dy = -1; dy <= 1; dy++) {
+        for (int dx = -1; dx <= 1; dx++) {
+            int sx = clamp(int(gid.x) + dx, 0, int(lumaIn.get_width())  - 1);
+            int sy = clamp(int(gid.y) + dy, 0, int(lumaIn.get_height()) - 1);
+            float y = rgb2yuv(lumaIn.read(uint2(sx, sy)).rgb).x;
+            sum  += y;
+            sum2 += y * y;
+            count += 1.0;
+        }
+    }
+    float mean = sum / count;
+    float variance = max(sum2 / count - mean * mean, 0.0);
+    float sigma = sqrt(variance);
+    statsOut.write(float4(mean, sigma, 0.0, 1.0), gid);
 }
 
 static inline float2 readChromaClamped(texture2d<float, access::read> chromaTexture, int x, int y) {

@@ -11,6 +11,11 @@ struct DebayerParams {
     var lscCoefficients: SIMD4<Float>
 }
 
+struct DefectPixelParams {
+    var shotCoeff: Float
+    var readCoeff: Float
+}
+
 struct WhiteBalanceParams {
     var gains: SIMD3<Float>
     var colorMatrix: simd_float3x3
@@ -79,6 +84,8 @@ final class MetalPipeline: @unchecked Sendable {
     private let temporalRingPipeline: MTLComputePipelineState
     private let storeChromaHistoryPipeline: MTLComputePipelineState
     private let logOnlyPipeline: MTLComputePipelineState
+    private let lumaStatsPipeline: MTLComputePipelineState
+    private let defectPixelPipeline: MTLComputePipelineState
     private var textureCache: CVMetalTextureCache?
     private let scaler: MPSImageBilinearScale
 
@@ -108,6 +115,10 @@ final class MetalPipeline: @unchecked Sendable {
     private var pooledChromaMergedW: Int = 0
     private var pooledChromaMergedH: Int = 0
 
+    private var pooledCorrectedBayerTex: MTLTexture?
+    private var pooledCorrectedBayerW: Int = 0
+    private var pooledCorrectedBayerH: Int = 0
+
     // Temporal ring buffer (N-slot history, per-channel resolution split)
     private let temporalRingCapacity = 3
     private var lumaHistoryArray: MTLTexture?
@@ -118,7 +129,18 @@ final class MetalPipeline: @unchecked Sendable {
     private var chromaHistoryH: Int = 0
     private var temporalRingCursor: Int = 0
     private var temporalRingValidCount: Int = 0
-    
+
+    // Local-sigma luma stats (full-res; skipped at 4K for performance)
+    private var pooledLumaStatsTex: MTLTexture?
+    private var pooledLumaStatsW: Int = 0
+    private var pooledLumaStatsH: Int = 0
+    private lazy var dummyStatsTex: MTLTexture? = {
+        let desc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rg16Float, width: 1, height: 1, mipmapped: false)
+        desc.usage = [.shaderRead]
+        desc.storageMode = .private
+        return device.makeTexture(descriptor: desc)
+    }()
+
     private var pooledCropTex: MTLTexture?
     private var pooledCropW: Int = 0
     private var pooledCropH: Int = 0
@@ -156,7 +178,9 @@ final class MetalPipeline: @unchecked Sendable {
               let recombineChromaFunc = library.makeFunction(name: "recombineLumaWithHalfResChroma"),
               let temporalRingFunc = library.makeFunction(name: "temporalDenoiseRing"),
               let storeChromaFunc = library.makeFunction(name: "storeChromaHistory"),
-              let logOnlyFunc = library.makeFunction(name: "applyLogOnly") else {
+              let logOnlyFunc = library.makeFunction(name: "applyLogOnly"),
+              let lumaStatsFunc = library.makeFunction(name: "estimateLumaVariance"),
+              let defectPixelFunc = library.makeFunction(name: "correctDefectPixelsBayer") else {
             return nil
         }
         self.device = device
@@ -172,6 +196,8 @@ final class MetalPipeline: @unchecked Sendable {
             self.temporalRingPipeline = try device.makeComputePipelineState(function: temporalRingFunc)
             self.storeChromaHistoryPipeline = try device.makeComputePipelineState(function: storeChromaFunc)
             self.logOnlyPipeline = try device.makeComputePipelineState(function: logOnlyFunc)
+            self.lumaStatsPipeline = try device.makeComputePipelineState(function: lumaStatsFunc)
+            self.defectPixelPipeline = try device.makeComputePipelineState(function: defectPixelFunc)
         } catch {
             print("[MetalPipeline] Failed to create compute pipelines: \(error)")
             return nil
@@ -261,6 +287,31 @@ final class MetalPipeline: @unchecked Sendable {
         pooledChromaMergedW = width
         pooledChromaMergedH = height
         return tex
+    }
+
+    private func getOrCreateCorrectedBayerTexture(width: Int, height: Int) -> MTLTexture? {
+        if let tex = pooledCorrectedBayerTex, pooledCorrectedBayerW == width, pooledCorrectedBayerH == height { return tex }
+        let desc = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .r16Float, width: width, height: height, mipmapped: false)
+        desc.usage = [.shaderRead, .shaderWrite]
+        desc.storageMode = .private
+        pooledCorrectedBayerTex = device.makeTexture(descriptor: desc)
+        pooledCorrectedBayerW = width
+        pooledCorrectedBayerH = height
+        return pooledCorrectedBayerTex
+    }
+
+    private func getOrCreateLumaStatsTexture(width: Int, height: Int) -> MTLTexture? {
+        if let tex = pooledLumaStatsTex, pooledLumaStatsW == width, pooledLumaStatsH == height { return tex }
+        let desc = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .rg16Float,
+            width: width, height: height, mipmapped: false)
+        desc.usage = [.shaderRead, .shaderWrite]
+        desc.storageMode = .private
+        pooledLumaStatsTex = device.makeTexture(descriptor: desc)
+        pooledLumaStatsW = width
+        pooledLumaStatsH = height
+        return pooledLumaStatsTex
     }
 
     // MARK: - Temporal ring buffer allocation
@@ -372,6 +423,24 @@ final class MetalPipeline: @unchecked Sendable {
 
         guard let commandBuffer = commandQueue.makeCommandBuffer() else { return nil }
 
+        // Bayer RAW defect-pixel correction (before any downsample/demosaic).
+        guard let correctedBayer = getOrCreateCorrectedBayerTexture(width: fullW, height: fullH),
+              let encDPC = commandBuffer.makeComputeCommandEncoder() else { return nil }
+        encDPC.setComputePipelineState(defectPixelPipeline)
+        encDPC.setTexture(fullBayer, index: 0)
+        encDPC.setTexture(correctedBayer, index: 1)
+        var debayerParams = DebayerParams(
+            bayerPattern: bayerPattern,
+            blackLevel: blackLevel,
+            whiteLevel: max(whiteLevel, blackLevel + 1e-6),
+            lscCoefficients: lscCoefficients
+        )
+        var defectNoiseParams = DefectPixelParams(shotCoeff: noiseShotCoeff, readCoeff: noiseReadCoeff)
+        encDPC.setBytes(&debayerParams, length: MemoryLayout<DebayerParams>.stride, index: 0)
+        encDPC.setBytes(&defectNoiseParams, length: MemoryLayout<DefectPixelParams>.stride, index: 1)
+        dispatch(encDPC, width: fullW, height: fullH, state: defectPixelPipeline)
+        encDPC.endEncoding()
+
         // Optional CFA-safe half reduction. This is phase-preserving, not true averaged sensor binning,
         // so only use it when it leaves a real downscale/crop buffer instead of causing output upscale.
         let bayerIn: MTLTexture
@@ -384,7 +453,7 @@ final class MetalPipeline: @unchecked Sendable {
             guard let halfTex = getOrCreateBinTexture(width: halfW, height: halfH),
                   let enc = commandBuffer.makeComputeCommandEncoder() else { return nil }
             enc.setComputePipelineState(binPipeline)
-            enc.setTexture(fullBayer, index: 0)
+            enc.setTexture(correctedBayer, index: 0)
             enc.setTexture(halfTex, index: 1)
             dispatch(enc, width: halfW, height: halfH, state: binPipeline)
             enc.endEncoding()
@@ -392,7 +461,7 @@ final class MetalPipeline: @unchecked Sendable {
             bayerW = halfW
             bayerH = halfH
         } else {
-            bayerIn = fullBayer
+            bayerIn = correctedBayer
             bayerW = fullW
             bayerH = fullH
         }
@@ -435,16 +504,31 @@ final class MetalPipeline: @unchecked Sendable {
             enc.endEncoding()
         }
 
+        // Pass 1.5: Per-pixel local-sigma guide. Skipped at 4K to meet frame-time budget.
+        let useLocalSigma = bayerW < 3000
+        let lumaStatsTex: MTLTexture? = useLocalSigma
+            ? getOrCreateLumaStatsTexture(width: bayerW, height: bayerH)
+            : dummyStatsTex
+        if useLocalSigma, let statsTex = lumaStatsTex,
+           let enc = commandBuffer.makeComputeCommandEncoder() {
+            enc.setComputePipelineState(lumaStatsPipeline)
+            enc.setTexture(linearOut, index: 0)
+            enc.setTexture(statsTex, index: 1)
+            dispatch(enc, width: bayerW, height: bayerH, state: lumaStatsPipeline)
+            enc.endEncoding()
+        }
+
         // Pass 2: Spatial denoise full-res luma in linear space.
         if let enc = commandBuffer.makeComputeCommandEncoder() {
             enc.setComputePipelineState(denoisePipeline)
             enc.setTexture(linearOut, index: 0)
             enc.setTexture(denoisedOut, index: 1)
-            
+            enc.setTexture(lumaStatsTex, index: 2)
+
             let radius: Int32 = iso > 200 ? 3 : 2
             var dParams = DenoiseParams(iso: iso, radius: radius, shotCoeff: noiseShotCoeff, readCoeff: noiseReadCoeff)
             enc.setBytes(&dParams, length: MemoryLayout<DenoiseParams>.stride, index: 0)
-            
+
             dispatch(enc, width: bayerW, height: bayerH, state: denoisePipeline)
             enc.endEncoding()
         }
@@ -464,6 +548,7 @@ final class MetalPipeline: @unchecked Sendable {
             enc.setTexture(chromaRawOut, index: 0)
             enc.setTexture(linearOut, index: 1)
             enc.setTexture(chromaDenoisedOut, index: 2)
+            enc.setTexture(lumaStatsTex, index: 3)
             var dParams = DenoiseParams(iso: iso, radius: iso > 200 ? 3 : 2, shotCoeff: noiseShotCoeff, readCoeff: noiseReadCoeff)
             enc.setBytes(&dParams, length: MemoryLayout<DenoiseParams>.stride, index: 0)
             dispatch(enc, width: chromaW, height: chromaH, state: denoiseChromaPipeline)
