@@ -52,6 +52,10 @@ struct RingTemporalParams {
     var validSlots: Int32
     var chromaW: Int32
     var chromaH: Int32
+    var cursor: Int32
+    var lambda: Float
+    var shotCoeff: Float
+    var readCoeff: Float
 }
 struct StoreChromaParams {
     var slice: Int32
@@ -67,19 +71,13 @@ final class MetalPipeline: @unchecked Sendable {
     let device: MTLDevice
     let commandQueue: MTLCommandQueue
     private let binPipeline: MTLComputePipelineState
-    private let fusedPipeline: MTLComputePipelineState
-    private let chromaBilateralPipeline: MTLComputePipelineState
     private let linearPipeline: MTLComputePipelineState
     private let denoisePipeline: MTLComputePipelineState
     private let extractChromaPipeline: MTLComputePipelineState
     private let denoiseChromaPipeline: MTLComputePipelineState
     private let recombineChromaPipeline: MTLComputePipelineState
-    private let temporalPipeline: MTLComputePipelineState
     private let temporalRingPipeline: MTLComputePipelineState
     private let storeChromaHistoryPipeline: MTLComputePipelineState
-    // Keep legacy pipelines for fallback / future use
-    private let debayerPipeline: MTLComputePipelineState
-    private let wbPipeline: MTLComputePipelineState
     private let logOnlyPipeline: MTLComputePipelineState
     private var textureCache: CVMetalTextureCache?
     private let scaler: MPSImageBilinearScale
@@ -121,10 +119,6 @@ final class MetalPipeline: @unchecked Sendable {
     private var temporalRingCursor: Int = 0
     private var temporalRingValidCount: Int = 0
     
-    private var pooledBGRATex: MTLTexture?
-    private var pooledBGRAW: Int = 0
-    private var pooledBGRAH: Int = 0
-    
     private var pooledCropTex: MTLTexture?
     private var pooledCropW: Int = 0
     private var pooledCropH: Int = 0
@@ -155,18 +149,13 @@ final class MetalPipeline: @unchecked Sendable {
               let queue = device.makeCommandQueue(),
               let library = device.makeDefaultLibrary(),
               let binFunc = library.makeFunction(name: "binBayerCFA"),
-              let fusedFunc = library.makeFunction(name: "debayerWBLog"),
-              let chromaFunc = library.makeFunction(name: "chromaBilateral"),
               let linearFunc = library.makeFunction(name: "debayerWBLinear"),
               let denoiseFunc = library.makeFunction(name: "spatialDenoise"),
               let extractChromaFunc = library.makeFunction(name: "extractHalfResChroma"),
               let denoiseChromaFunc = library.makeFunction(name: "denoiseHalfResChroma"),
               let recombineChromaFunc = library.makeFunction(name: "recombineLumaWithHalfResChroma"),
-              let temporalFunc = library.makeFunction(name: "temporalDenoise"),
               let temporalRingFunc = library.makeFunction(name: "temporalDenoiseRing"),
               let storeChromaFunc = library.makeFunction(name: "storeChromaHistory"),
-              let debayerFunc = library.makeFunction(name: "debayerBilinear"),
-              let wbFunc = library.makeFunction(name: "applyWhiteBalanceAndColorMatrix"),
               let logOnlyFunc = library.makeFunction(name: "applyLogOnly") else {
             return nil
         }
@@ -175,18 +164,13 @@ final class MetalPipeline: @unchecked Sendable {
         self.scaler = MPSImageBilinearScale(device: device)
         do {
             self.binPipeline = try device.makeComputePipelineState(function: binFunc)
-            self.fusedPipeline = try device.makeComputePipelineState(function: fusedFunc)
-            self.chromaBilateralPipeline = try device.makeComputePipelineState(function: chromaFunc)
             self.linearPipeline = try device.makeComputePipelineState(function: linearFunc)
             self.denoisePipeline = try device.makeComputePipelineState(function: denoiseFunc)
             self.extractChromaPipeline = try device.makeComputePipelineState(function: extractChromaFunc)
             self.denoiseChromaPipeline = try device.makeComputePipelineState(function: denoiseChromaFunc)
             self.recombineChromaPipeline = try device.makeComputePipelineState(function: recombineChromaFunc)
-            self.temporalPipeline = try device.makeComputePipelineState(function: temporalFunc)
             self.temporalRingPipeline = try device.makeComputePipelineState(function: temporalRingFunc)
             self.storeChromaHistoryPipeline = try device.makeComputePipelineState(function: storeChromaFunc)
-            self.debayerPipeline = try device.makeComputePipelineState(function: debayerFunc)
-            self.wbPipeline = try device.makeComputePipelineState(function: wbFunc)
             self.logOnlyPipeline = try device.makeComputePipelineState(function: logOnlyFunc)
         } catch {
             print("[MetalPipeline] Failed to create compute pipelines: \(error)")
@@ -301,21 +285,6 @@ final class MetalPipeline: @unchecked Sendable {
     func clearTemporalHistory() {
         temporalRingCursor = 0
         temporalRingValidCount = 0
-    }
-
-    private func getOrCreateBGRATexture(width: Int, height: Int) -> MTLTexture? {
-        if let tex = pooledBGRATex, pooledBGRAW == width, pooledBGRAH == height {
-            return tex
-        }
-        let desc = MTLTextureDescriptor.texture2DDescriptor(
-            pixelFormat: .bgra8Unorm, width: width, height: height, mipmapped: false)
-        desc.usage = [.shaderWrite, .shaderRead]
-        desc.storageMode = .shared
-        let tex = device.makeTexture(descriptor: desc)
-        pooledBGRATex = tex
-        pooledBGRAW = width
-        pooledBGRAH = height
-        return tex
     }
 
     private func getOrCreateCropTexture(width: Int, height: Int) -> MTLTexture? {
@@ -541,7 +510,11 @@ final class MetalPipeline: @unchecked Sendable {
                     slotCount: Int32(temporalRingCapacity),
                     validSlots: Int32(temporalRingValidCount),
                     chromaW: Int32(chromaW),
-                    chromaH: Int32(chromaH)
+                    chromaH: Int32(chromaH),
+                    cursor: Int32(temporalRingCursor),
+                    lambda: 0.7,
+                    shotCoeff: noiseShotCoeff,
+                    readCoeff: noiseReadCoeff
                 )
                 enc.setBytes(&ringParams, length: MemoryLayout<RingTemporalParams>.stride, index: 0)
 

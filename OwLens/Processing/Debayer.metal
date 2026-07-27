@@ -161,19 +161,6 @@ static inline float3 encodeLogCurve(float3 rgb, int curveType) {
     return saturate(result);
 }
 
-kernel void applyLogCurve(
-    texture2d<float, access::read> inTexture [[texture(0)]],
-    texture2d<float, access::write> outTexture [[texture(1)]],
-    constant int &curveType [[buffer(0)]],
-    uint2 gid [[thread_position_in_grid]])
-{
-    if (gid.x >= outTexture.get_width() || gid.y >= outTexture.get_height()) return;
-
-    float4 pixel = inTexture.read(gid);
-    float3 result = encodeLogCurve(float3(pixel.r, pixel.g, pixel.b), curveType);
-    outTexture.write(float4(result, pixel.a), gid);
-}
-
 kernel void applyLogOnly(
     texture2d<float, access::read> inTexture [[texture(0)]],
     texture2d<float, access::write> outTexture [[texture(1)]],
@@ -579,6 +566,10 @@ struct RingTemporalParams {
     int   validSlots;
     int   chromaW;
     int   chromaH;
+    int   cursor;
+    float lambda;
+    float shotCoeff;
+    float readCoeff;
 };
 
 kernel void spatialDenoise(
@@ -844,8 +835,12 @@ kernel void temporalDenoiseRing(
     float isoScale = sqrt(iso / 33.0);
     float luma01 = saturate(currentYUV.x);
     float shadowBoost = mix(1.4, 0.85, luma01);
-    float lumaThreshold   = max(0.006 * isoScale * shadowBoost, 1e-5);
-    float chromaThreshold = max(0.010 * isoScale * shadowBoost, 1e-5);
+
+    float sigmaRef = (params.shotCoeff > 0.0)
+        ? sqrt(params.shotCoeff * 0.5 + params.readCoeff)
+        : 0.01 * isoScale;
+    float lumaThreshold   = max(sigmaRef * shadowBoost, 1e-5);
+    float chromaThreshold = max(sigmaRef * 1.5 * shadowBoost, 1e-5);
 
     float totalWeight = 1.0;
     float3 weightedRGB = currentPx.rgb;
@@ -856,17 +851,20 @@ kernel void temporalDenoiseRing(
     for (int i = 0; i < params.slotCount; i++) {
         if (i >= params.validSlots) break;
 
+        // Newest slot is (cursor - 1) mod slotCount; oldest is cursor.
+        int slot = (int(params.cursor) - 1 - i + params.slotCount) % params.slotCount;
+
         // Luma history at full resolution
         uint2 lumaCoord = uint2(
             clamp(int(gid.x), 0, lumaW - 1),
             clamp(int(gid.y), 0, lumaH - 1));
-        float3 lumaYUV = rgb2yuv(lumaHistory.read(lumaCoord, i).rgb);
+        float3 lumaYUV = rgb2yuv(lumaHistory.read(lumaCoord, slot).rgb);
 
         // Chroma history at half resolution — clamp threads outside chroma bounds
         uint2 chromaCoord = uint2(
             min(uint(gid.x), uint(params.chromaW - 1)),
             min(uint(gid.y), uint(params.chromaH - 1)));
-        float2 chromaUV = chromaHistory.read(chromaCoord, i).rg;
+        float2 chromaUV = chromaHistory.read(chromaCoord, slot).rg;
         float3 histYUV = float3(lumaYUV.x, chromaUV.x, chromaUV.y);
 
         float lumaDiff   = abs(currentYUV.x - histYUV.x);
@@ -876,7 +874,9 @@ kernel void temporalDenoiseRing(
         float chromaMotion = saturate(chromaDiff / chromaThreshold);
         float motion = max(lumaMotion, chromaMotion);
 
-        float slotWeight = params.maxBlend * (1.0 - motion);
+        // i=0 newest gets λ^0 = 1; older slots decay.
+        float recency = pow(params.lambda, float(i));
+        float slotWeight = params.maxBlend * (1.0 - motion) * recency;
         slotWeight = clamp(slotWeight, 0.0, 0.95);
 
         // Reconstruct RGB from luma history Y and chroma history UV

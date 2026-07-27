@@ -234,6 +234,8 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
     nonisolated(unsafe) private var noiseCoeffs: (shot: Float, read: Float) = (0.012, 0.0004)
     /// Noise profile for per-ISO coefficient lookup (nil on unknown device).
     nonisolated(unsafe) private var noiseProfileForISO: NoiseProfile?
+    /// Last ISO seen by processFrame; used to detect scene-cut ISO jumps.
+    nonisolated(unsafe) private var lastProcessedISO: Float = 0
 
     enum ControlPanel: String, Identifiable {
         case exposure, iso, shutter, wb, focus, fps, format, log, bitrate, mic, lens, save
@@ -315,6 +317,7 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
         // Stop stills + drain queue so no Metal submits after background
         captureController.stopSession()
         frameBuffer.flush()
+        metalPipeline?.clearTemporalHistory()
         if isRecording {
             stopRecording()
         }
@@ -327,6 +330,7 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
         if captureController.activeDevice != nil {
             captureController.setCaptureFPS(selectedFPS.rawValue)
             captureController.startSession()
+            metalPipeline?.clearTemporalHistory()
             if !controlsLocked {
                 applyManualExposureAndWB()
             }
@@ -563,6 +567,7 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
                 } else {
                     // ISO/shutter ranges can change per lens
                     self.seedControlRanges()
+                    self.metalPipeline?.clearTemporalHistory()
                     if !self.controlsLocked {
                         self.applyManualExposureAndWB()
                     }
@@ -747,6 +752,7 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
 
         lockAutoModesForRecording()
         metalPipeline?.curveType = selectedCurve
+        metalPipeline?.clearTemporalHistory()
         activeEncodeWidth = selectedFormat.width
         activeEncodeHeight = selectedFormat.height
         activeFPS = selectedFPS.rawValue
@@ -833,6 +839,7 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
                 self?.saveFinishedRecording(at: url)
             }
         }
+        metalPipeline?.clearTemporalHistory()
 
         let realNote = "frames=\(frameCount) drops=\(droppedFrames) fps=\(selectedFPS.label) fmt=\(selectedFormat.shortLabel)"
         print("[CameraViewModel] Recording stopped \(realNote)")
@@ -1094,6 +1101,12 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
         }
         pipeline.noiseShotCoeff = noiseCoeffs.shot
         pipeline.noiseReadCoeff = noiseCoeffs.read
+
+        // Scene-cut detection: >2 stop ISO jump invalidates temporal history.
+        if lastProcessedISO > 0, abs(frameData.iso - lastProcessedISO) > 2.0 * lastProcessedISO {
+            pipeline.clearTemporalHistory()
+        }
+        lastProcessedISO = frameData.iso
 
         if pipeline.isAutoWBEnabled, let gains = frameData.whiteBalanceGains {
             let g = max(gains.greenGain, 0.001)
