@@ -34,6 +34,19 @@ struct FusedParams {
     var curveType: Int32
     var wbGains: SIMD3<Float>
     var lscCoefficients: SIMD4<Float>
+    var greenBalance: Float
+}
+
+struct LSCParams {
+    var radialR: Float
+    var radialG: Float
+    var radialB: Float
+    var radial4R: Float
+    var radial4G: Float
+    var radial4B: Float
+    var azimuthR: Float
+    var azimuthG: Float
+    var azimuthB: Float
 }
 struct BilateralParams {
     var iso: Float
@@ -161,6 +174,11 @@ final class MetalPipeline: @unchecked Sendable {
     var blackLevel: Float = 0
     var whiteLevel: Float = 16383.0 / 65535.0
     var lscCoefficients: SIMD4<Float> = SIMD4<Float>(repeating: 0)
+    var lscParams: LSCParams = LSCParams(
+        radialR: 0, radialG: 0, radialB: 0,
+        radial4R: 0, radial4G: 0, radial4B: 0,
+        azimuthR: 0, azimuthG: 0, azimuthB: 0)
+    var greenBalance: Float = 1.0
     var iso: Float = 0
     var noiseShotCoeff: Float = 0.012
     var noiseReadCoeff: Float = 0.0004
@@ -497,9 +515,11 @@ final class MetalPipeline: @unchecked Sendable {
                 whiteLevel: max(whiteLevel, blackLevel + 1e-6),
                 curveType: Int32(curveType.rawValue),
                 wbGains: wbParams.gains,
-                lscCoefficients: lscCoefficients
+                lscCoefficients: lscCoefficients,
+                greenBalance: greenBalance
             )
             enc.setBytes(&params, length: MemoryLayout<FusedParams>.stride, index: 0)
+            enc.setBytes(&lscParams, length: MemoryLayout<LSCParams>.stride, index: 1)
             dispatch(enc, width: bayerW, height: bayerH, state: linearPipeline)
             enc.endEncoding()
         }

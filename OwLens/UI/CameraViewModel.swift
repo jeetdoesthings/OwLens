@@ -229,7 +229,7 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
     nonisolated(unsafe) private var lastScopeUpdateTime: CFTimeInterval = 0
     nonisolated(unsafe) var isAppActive = true
     /// Measured LSC override from device calibration (set once at setup).
-    nonisolated(unsafe) private var lscOverride: SIMD4<Float>?
+    nonisolated(unsafe) private var lscOverride: LSCCoefficients?
     /// Measured noise coefficients from device calibration (set once at setup).
     nonisolated(unsafe) private var noiseCoeffs: (shot: Float, read: Float) = (0.012, 0.0004)
     /// Noise profile for per-ISO coefficient lookup (nil on unknown device).
@@ -380,7 +380,7 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
         activeFPS = selectedFPS.rawValue
 
 // LSC and noise profile overrides from device calibration
-        lscOverride = caps.lscOverride?.asSIMD
+        lscOverride = caps.lscOverride
         noiseProfileForISO = caps.noiseProfile
         if let prof = caps.noiseProfile {
             let c = prof.coefficients(at: 33.0)  // base ISO; updated per-frame in processFrame
@@ -1092,7 +1092,10 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
         pipeline.bayerPattern = frameData.cfaPattern
         pipeline.blackLevel = frameData.blackLevel
         pipeline.whiteLevel = frameData.whiteLevel
-        pipeline.lscCoefficients = lscOverride ?? frameData.lscCoefficients
+
+        // LSC: calibration > device table > frame default (live DNG).
+        pipeline.lscParams = lscOverride?.asLSCParams ?? Self.simd4ToLSCParams(frameData.lscCoefficients)
+        pipeline.greenBalance = 1.0 // calibration will override in Phase 6
         pipeline.iso = frameData.iso
 
         // Recompute noise coefficients from measured profile (ISO-dependent)
@@ -1173,6 +1176,17 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
                 self.frameCount = Int(self.frameIndex)
             }
         }
+    }
+
+    /// Convert legacy SIMD4 LSC coefficients (R, Gr, Gb, B) to the expanded LSCParams.
+    nonisolated private static func simd4ToLSCParams(_ coeffs: SIMD4<Float>) -> LSCParams {
+        LSCParams(
+            radialR: coeffs[0],
+            radialG: (coeffs[1] + coeffs[2]) * 0.5,
+            radialB: coeffs[3],
+            radial4R: 0, radial4G: 0, radial4B: 0,
+            azimuthR: 0, azimuthG: 0, azimuthB: 0
+        )
     }
 
     private func syncLiveAutoValues(from frameData: RawFrameData) {

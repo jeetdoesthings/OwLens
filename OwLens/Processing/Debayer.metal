@@ -234,12 +234,26 @@ struct FusedParams {
     int   curveType;
     float3 wbGains;
     float4 lscCoefficients;
+    float greenBalance;
+};
+
+struct LSCParams {
+    float radialR;
+    float radialG;
+    float radialB;
+    float radial4R;
+    float radial4G;
+    float radial4B;
+    float azimuthR;
+    float azimuthG;
+    float azimuthB;
 };
 
 kernel void debayerWBLog(
     texture2d<float, access::read>  rawTexture [[texture(0)]],
     texture2d<float, access::write> outTexture [[texture(1)]],
     constant FusedParams &params   [[buffer(0)]],
+    constant LSCParams &lsc       [[buffer(1)]],
     uint2 gid [[thread_position_in_grid]])
 {
     if (gid.x >= outTexture.get_width() || gid.y >= outTexture.get_height()) return;
@@ -295,13 +309,20 @@ kernel void debayerWBLog(
     g = max(g, 0.0);
     b = max(b, 0.0);
 
-    // Per-channel Lens Shading Correction (LSC)
-    float2 uv = float2(float(x) + 0.5, float(y) + 0.5) / float2(float(outTexture.get_width()), float(outTexture.get_height()));
-    float2 d = uv - float2(0.5, 0.5);
-    float r2 = dot(d, d);
-    float gainR = 1.0 + params.lscCoefficients[0] * r2;
-    float gainG = 1.0 + ((params.lscCoefficients[1] + params.lscCoefficients[2]) * 0.5) * r2;
-    float gainB = 1.0 + params.lscCoefficients[3] * r2;
+    // Gr/Gb green balance before LSC/WB.
+    g *= params.greenBalance;
+
+    // Per-channel Lens Shading Correction (LSC): 4-term radial + azimuth model.
+    float outW = float(outTexture.get_width());
+    float outH = float(outTexture.get_height());
+    float2 uv = (float2(float(x) + 0.5, float(y) + 0.5) / float2(outW, outH)) - 0.5;
+    float r2 = dot(uv, uv);
+    float r4 = r2 * r2;
+    float theta = atan2(uv.y, uv.x);
+
+    float gainR = 1.0 + lsc.radialR * r2 + lsc.radial4R * r4 + lsc.azimuthR * cos(2.0 * theta);
+    float gainG = 1.0 + lsc.radialG * r2 + lsc.radial4G * r4 + lsc.azimuthG * cos(2.0 * theta);
+    float gainB = 1.0 + lsc.radialB * r2 + lsc.radial4B * r4 + lsc.azimuthB * cos(2.0 * theta);
     float3 rgb = float3(r * gainR, g * gainG, b * gainB);
     rgb = min(rgb, float3(8.0));
 
@@ -343,6 +364,7 @@ kernel void debayerWBLinear(
     texture2d<float, access::read>  rawTexture [[texture(0)]],
     texture2d<float, access::write> outTexture [[texture(1)]],
     constant FusedParams &params   [[buffer(0)]],
+    constant LSCParams &lsc       [[buffer(1)]],
     uint2 gid [[thread_position_in_grid]])
 {
     if (gid.x >= outTexture.get_width() || gid.y >= outTexture.get_height()) return;
@@ -397,13 +419,20 @@ kernel void debayerWBLinear(
     g = max(g, 0.0);
     b = max(b, 0.0);
 
-    // Per-channel Lens Shading Correction (LSC)
-    float2 uv = float2(float(x) + 0.5, float(y) + 0.5) / float2(float(outTexture.get_width()), float(outTexture.get_height()));
-    float2 d = uv - float2(0.5, 0.5);
-    float r2 = dot(d, d);
-    float gainR = 1.0 + params.lscCoefficients[0] * r2;
-    float gainG = 1.0 + ((params.lscCoefficients[1] + params.lscCoefficients[2]) * 0.5) * r2;
-    float gainB = 1.0 + params.lscCoefficients[3] * r2;
+    // Gr/Gb green balance before LSC/WB.
+    g *= params.greenBalance;
+
+    // Per-channel Lens Shading Correction (LSC): 4-term radial + azimuth model.
+    float outW = float(outTexture.get_width());
+    float outH = float(outTexture.get_height());
+    float2 uv = (float2(float(x) + 0.5, float(y) + 0.5) / float2(outW, outH)) - 0.5;
+    float r2 = dot(uv, uv);
+    float r4 = r2 * r2;
+    float theta = atan2(uv.y, uv.x);
+
+    float gainR = 1.0 + lsc.radialR * r2 + lsc.radial4R * r4 + lsc.azimuthR * cos(2.0 * theta);
+    float gainG = 1.0 + lsc.radialG * r2 + lsc.radial4G * r4 + lsc.azimuthG * cos(2.0 * theta);
+    float gainB = 1.0 + lsc.radialB * r2 + lsc.radial4B * r4 + lsc.azimuthB * cos(2.0 * theta);
     float3 rgb = float3(r * gainR, g * gainG, b * gainB);
     rgb = min(rgb, float3(8.0));
 

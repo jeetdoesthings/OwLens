@@ -51,12 +51,53 @@ enum VideoCodecOption: String, CaseIterable, Identifiable {
 
 /// Per-device lens shading correction coefficients from DNG / calibration.
 struct LSCCoefficients: Sendable {
-    let r: Float
-    let g: Float
-    let b: Float
-    let avg: Float
+    let radialR: Float
+    let radialG: Float
+    let radialB: Float
+    let radial4R: Float
+    let radial4G: Float
+    let radial4B: Float
+    let azimuthR: Float
+    let azimuthG: Float
+    let azimuthB: Float
 
-    var asSIMD: SIMD4<Float> { SIMD4<Float>(r, g, b, avg) }
+    /// Legacy initializer: radial-only coefficients, higher-order terms default to zero.
+    init(r: Float, g: Float, b: Float, avg: Float = 1.0) {
+        self.radialR = r - 1.0
+        self.radialG = g - 1.0
+        self.radialB = b - 1.0
+        self.radial4R = 0
+        self.radial4G = 0
+        self.radial4B = 0
+        self.azimuthR = 0
+        self.azimuthG = 0
+        self.azimuthB = 0
+    }
+
+    /// Full 4-term initializer.
+    init(
+        radialR: Float, radialG: Float, radialB: Float,
+        radial4R: Float = 0, radial4G: Float = 0, radial4B: Float = 0,
+        azimuthR: Float = 0, azimuthG: Float = 0, azimuthB: Float = 0
+    ) {
+        self.radialR = radialR
+        self.radialG = radialG
+        self.radialB = radialB
+        self.radial4R = radial4R
+        self.radial4G = radial4G
+        self.radial4B = radial4B
+        self.azimuthR = azimuthR
+        self.azimuthG = azimuthG
+        self.azimuthB = azimuthB
+    }
+
+    var asLSCParams: LSCParams {
+        LSCParams(
+            radialR: radialR, radialG: radialG, radialB: radialB,
+            radial4R: radial4R, radial4G: radial4G, radial4B: radial4B,
+            azimuthR: azimuthR, azimuthG: azimuthG, azimuthB: azimuthB
+        )
+    }
 }
 
 // MARK: - NoiseProfile
