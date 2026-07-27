@@ -430,6 +430,9 @@ final class MetalPipeline: @unchecked Sendable {
     /// Process RAW to log RGB using the linear denoise path.
     /// Uses CFA-preserving 2× reduction only when the reduced frame still covers the encode size.
     func process(_ pixelBuffer: CVPixelBuffer, encodeWidth: Int = 1920, encodeHeight: Int = 1440) -> MTLTexture? {
+#if DEBUG
+        let t0 = CACurrentMediaTime()
+#endif
         let fullW = CVPixelBufferGetWidth(pixelBuffer)
         let fullH = CVPixelBufferGetHeight(pixelBuffer)
         guard fullW > 0, fullH > 0 else { return nil }
@@ -683,6 +686,10 @@ final class MetalPipeline: @unchecked Sendable {
         
         commandBuffer.commit()
         commandBuffer.waitUntilCompleted()
+#if DEBUG
+        let ms = (CACurrentMediaTime() - t0) * 1000.0
+        print("[MetalPipeline] frame time: \(String(format: "%.2f", ms)) ms")
+#endif
         return finalTex
     }
 

@@ -256,6 +256,13 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
     override init() {
         metalPipeline = MetalPipeline()
         super.init()
+#if DEBUG
+        if let pipeline = metalPipeline {
+            Task { @MainActor in
+                _ = pipeline.runSyntheticHotPixelTest()
+            }
+        }
+#endif
         loadFilesFolderBookmark()
         metalPipeline?.curveType = selectedCurve
         activeEncodeWidth = selectedFormat.width

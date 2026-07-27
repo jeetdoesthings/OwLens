@@ -28,4 +28,5 @@ Carthage/Build/
 # User-specific ignores
 *.md
 !README.md
+!docs/**/*.md
 .DS_Store
