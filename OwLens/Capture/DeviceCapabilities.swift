@@ -350,6 +350,7 @@ struct DeviceCapabilities: Sendable {
             return (false, [])
         }
         print("[DeviceCapabilities] RAW probe camera type=\(camera.deviceType.rawValue) virtual=\(camera.isVirtualDevice)")
+        print("[DeviceCapabilities] RAW probe sensor resolution=\(camera.activeFormat.formatDescription) dimensions=\(CMVideoFormatDescriptionGetDimensions(camera.activeFormat.formatDescription))")
         session.addInput(input)
 
         let photoOutput = AVCapturePhotoOutput()
@@ -364,6 +365,15 @@ struct DeviceCapabilities: Sendable {
         let all = photoOutput.availableRawPhotoPixelFormatTypes
         let bayer = all.filter { AVCapturePhotoOutput.isBayerRAWPixelFormat($0) }
         print("[DeviceCapabilities] RAW probe all=\(all.map { fourCCString($0) }) bayer=\(bayer.map { fourCCString($0) })")
+
+        // Log sensor resolution from active format — RAW is always full sensor res on iOS
+        let dims = CMVideoFormatDescriptionGetDimensions(camera.activeFormat.formatDescription)
+        print("[DeviceCapabilities] RAW probe sensor native resolution = \(dims.width)×\(dims.height) (all bayer formats use this resolution)")
+
+        // On iOS, AVCapturePhotoOutput exposes RAW at the sensor's native resolution only.
+        // There is no multi-resolution RAW option — binning must be done in post (Metal binBayerCFA).
+        print("[DeviceCapabilities] RAW probe: \(bayer.count) bayer format(s), single resolution only (sensor native)")
+
         return (!bayer.isEmpty, bayer)
     }
 

@@ -568,6 +568,17 @@ struct DenoiseParams {
 struct TemporalParams {
     float iso;
     float maxBlend;
+    float shotCoeff;
+    float readCoeff;
+};
+
+struct RingTemporalParams {
+    float iso;
+    float maxBlend;
+    int   slotCount;
+    int   validSlots;
+    int   chromaW;
+    int   chromaH;
 };
 
 kernel void spatialDenoise(
@@ -587,13 +598,21 @@ kernel void spatialDenoise(
     float maxDist2 = float(radius * radius);
     
     // ISO-adaptive sigma values (tuned for linear-space data)
+    // Calibrated path: use measured shot/read coefficients when available.
+    // Fallback: sqrt(iso/33) heuristic.
     float isoScale = sqrt(iso / 33.0);
+    float sigmaRef;  // noise std-dev at mid-gray reference signal (0.5)
+    if (params.shotCoeff > 0.0) {
+        sigmaRef = sqrt(params.shotCoeff * 0.5 + params.readCoeff);
+    } else {
+        sigmaRef = 0.012 * isoScale;  // legacy hardcoded proxy
+    }
     float luma01 = saturate(centerYUV.x);
     // Shot-noise-aware proxy: push stronger denoise in shadows, lighter in highlights.
     float shadowBoost = mix(1.45, 0.8, luma01);
     
     // Luma: tight sigma — smooth flat-area grain, preserve edges
-    float lumaRS = 0.012 * isoScale * shadowBoost;
+    float lumaRS = sigmaRef * shadowBoost;
     float lumaRS2 = lumaRS * lumaRS;
     
     // Spatial sigma adapts to kernel radius
@@ -686,7 +705,14 @@ kernel void denoiseHalfResChroma(
     float centerY = rgb2yuv(lumaGuideTexture.read(uint2(centerGuideX, centerGuideY)).rgb).x;
     float luma01 = saturate(centerY);
     float shadowBoost = mix(1.55, 0.9, luma01);
-    float chromaRS = 0.045 * isoScale * shadowBoost;
+    // Calibrated chroma sigma: use measured coefficients when available.
+    float chromaSigmaRef;
+    if (params.shotCoeff > 0.0) {
+        chromaSigmaRef = sqrt(params.shotCoeff * 0.5 + params.readCoeff);
+    } else {
+        chromaSigmaRef = 0.045 * isoScale;
+    }
+    float chromaRS = chromaSigmaRef * shadowBoost;
     float chromaRS2 = chromaRS * chromaRS;
 
     float2 sumUV = float2(0.0);
@@ -766,10 +792,18 @@ kernel void temporalDenoise(
     float iso = max(params.iso, 33.0);
     float isoScale = sqrt(iso / 33.0);
 
+    // Calibrated motion thresholds: use measured noise sigma when available.
+    float sigmaRef;
+    if (params.shotCoeff > 0.0) {
+        sigmaRef = sqrt(params.shotCoeff * 0.5 + params.readCoeff);
+    } else {
+        sigmaRef = 0.01 * isoScale;  // legacy proxy
+    }
+
     float luma01 = saturate(currentYUV.x);
     float shadowBoost = mix(1.4, 0.85, luma01);
-    float lumaThreshold = max(0.006 * isoScale * shadowBoost, 1e-5);
-    float chromaThreshold = max(0.010 * isoScale * shadowBoost, 1e-5);
+    float lumaThreshold = max(sigmaRef * shadowBoost, 1e-5);
+    float chromaThreshold = max(sigmaRef * 1.5 * shadowBoost, 1e-5);
 
     float lumaDiff = abs(currentYUV.x - historyYUV.x);
     float chromaDiff = length(currentYUV.yz - historyYUV.yz);
@@ -781,4 +815,116 @@ kernel void temporalDenoise(
     float historyBlend = clamp(params.maxBlend * (1.0 - motion), 0.0, 0.95);
     float3 mixedRGB = mix(currentPx.rgb, historyPx.rgb, historyBlend);
     outTexture.write(float4(max(mixedRGB, float3(0.0)), currentPx.a), gid);
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// TEMPORAL DENOISE — RING BUFFER (N-slot weighted average)
+// texture(0) = current (full-res RGBA)
+// texture(1) = output   (full-res RGBA)
+// texture(2) = lumaHistory   (full-res 2D-array RGBA)
+// texture(3) = chromaHistory  (half-res 2D-array RG16Float)
+// buffer(0) = RingTemporalParams
+// Dispatched at full luma resolution; chroma history is read at half-res coordinates.
+// ──────────────────────────────────────────────────────────────────────
+
+kernel void temporalDenoiseRing(
+    texture2d<float, access::read>  currentTexture [[texture(0)]],
+    texture2d<float, access::write> outTexture     [[texture(1)]],
+    texture2d_array<float, access::read> lumaHistory   [[texture(2)]],
+    texture2d_array<float, access::read> chromaHistory  [[texture(3)]],
+    constant RingTemporalParams &params [[buffer(0)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    if (gid.x >= outTexture.get_width() || gid.y >= outTexture.get_height()) return;
+
+    float4 currentPx = currentTexture.read(gid);
+    float3 currentYUV = rgb2yuv(currentPx.rgb);
+
+    float iso = max(params.iso, 33.0);
+    float isoScale = sqrt(iso / 33.0);
+    float luma01 = saturate(currentYUV.x);
+    float shadowBoost = mix(1.4, 0.85, luma01);
+    float lumaThreshold   = max(0.006 * isoScale * shadowBoost, 1e-5);
+    float chromaThreshold = max(0.010 * isoScale * shadowBoost, 1e-5);
+
+    float totalWeight = 1.0;
+    float3 weightedRGB = currentPx.rgb;
+
+    int lumaW = int(lumaHistory.get_width());
+    int lumaH = int(lumaHistory.get_height());
+
+    for (int i = 0; i < params.slotCount; i++) {
+        if (i >= params.validSlots) break;
+
+        // Luma history at full resolution
+        uint2 lumaCoord = uint2(
+            clamp(int(gid.x), 0, lumaW - 1),
+            clamp(int(gid.y), 0, lumaH - 1));
+        float3 lumaYUV = rgb2yuv(lumaHistory.read(lumaCoord, i).rgb);
+
+        // Chroma history at half resolution — skip threads outside chroma bounds
+        if (int(gid.x) >= params.chromaW || int(gid.y) >= params.chromaH) continue;
+        uint2 chromaCoord = uint2(gid.x, gid.y);
+        float2 chromaUV = chromaHistory.read(chromaCoord, i).rg;
+        float3 histYUV = float3(lumaYUV.x, chromaUV.x, chromaUV.y);
+
+        float lumaDiff   = abs(currentYUV.x - histYUV.x);
+        float chromaDiff = length(currentYUV.yz - histYUV.yz);
+
+        float lumaMotion   = saturate(lumaDiff / lumaThreshold);
+        float chromaMotion = saturate(chromaDiff / chromaThreshold);
+        float motion = max(lumaMotion, chromaMotion);
+
+        float slotWeight = params.maxBlend * (1.0 - motion);
+        slotWeight = clamp(slotWeight, 0.0, 0.95);
+
+        // Reconstruct RGB from luma history Y and chroma history UV
+        float3 histRGB = max(yuv2rgb(histYUV), float3(0.0));
+        weightedRGB += histRGB * slotWeight;
+        totalWeight += slotWeight;
+    }
+
+    float3 result = weightedRGB / max(totalWeight, 1e-6);
+    outTexture.write(float4(max(result, float3(0.0)), currentPx.a), gid);
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// STORE CHROMA HISTORY — Extract half-res UV from full-res denoised RGB
+// for the temporal chroma ring buffer.
+// texture(0) = full-res denoised RGB input
+// texture(1) = half-res 2D-array UV output (chroma ring slot)
+// buffer(0) = StoreChromaParams { int slice; }
+// ──────────────────────────────────────────────────────────────────────
+
+struct StoreChromaParams {
+    int slice;
+};
+
+kernel void storeChromaHistory(
+    texture2d<float, access::read>  fullResRGB [[texture(0)]],
+    texture2d_array<float, access::write> halfResUVArray [[texture(1)]],
+    constant StoreChromaParams &params [[buffer(0)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    if (gid.x >= halfResUVArray.get_width() || gid.y >= halfResUVArray.get_height()) return;
+
+    int w = int(fullResRGB.get_width());
+    int h = int(fullResRGB.get_height());
+    int baseX = int(gid.x) * 2;
+    int baseY = int(gid.y) * 2;
+
+    float2 sumUV = float2(0.0);
+    float count = 0.0;
+    for (int dy = 0; dy < 2; dy++) {
+        for (int dx = 0; dx < 2; dx++) {
+            int sx = baseX + dx;
+            int sy = baseY + dy;
+            if (sx >= w || sy >= h) continue;
+            sumUV += rgb2yuv(fullResRGB.read(uint2(sx, sy)).rgb).yz;
+            count += 1.0;
+        }
+    }
+
+    float2 uv = (count > 0.0) ? (sumUV / count) : float2(0.5);
+    halfResUVArray.write(float4(uv.x, uv.y, 0.0, 1.0), gid, params.slice);
 }
