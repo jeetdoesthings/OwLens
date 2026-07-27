@@ -17,9 +17,9 @@ struct CameraPreviewView: UIViewRepresentable {
         mtkView.delegate = context.coordinator
         mtkView.framebufferOnly = true
         mtkView.colorPixelFormat = .bgra8Unorm
-        mtkView.preferredFramesPerSecond = 60
-        mtkView.enableSetNeedsDisplay = false
-        mtkView.isPaused = false
+        // Draw only when SwiftUI calls setNeedsDisplay via updateUIView, not on a timer.
+        mtkView.enableSetNeedsDisplay = true
+        mtkView.isPaused = true
         mtkView.autoResizeDrawable = true
         mtkView.clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: overlayOnly ? 0 : 1)
         mtkView.backgroundColor = overlayOnly ? .clear : .black
@@ -42,6 +42,10 @@ struct CameraPreviewView: UIViewRepresentable {
         uiView.isOpaque = !overlayOnly
         uiView.layer.isOpaque = !overlayOnly
         (uiView.layer as? CAMetalLayer)?.isOpaque = !overlayOnly
+        // Request a redraw only when SwiftUI updates this view (typically because
+        // currentTexture changed). This avoids the previous 60 Hz timer-driven redraw
+        // that wasted GPU time re-rendering the same frame.
+        uiView.setNeedsDisplay()
     }
  
     func makeCoordinator() -> Coordinator {

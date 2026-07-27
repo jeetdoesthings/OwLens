@@ -1134,15 +1134,21 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
 
     nonisolated private func drainBuffer() {
         // Only the newest frame — never process a backlog (that made preview laggy/choppy)
-        if let frame = frameBuffer.dequeueLatest() {
-            processFrame(frame)
+        guard let frame = frameBuffer.dequeueLatest() else {
+            processLock.lock()
+            isProcessing = false
+            processLock.unlock()
+            return
         }
-        processLock.lock()
-        isProcessing = false
-        let remaining = frameBuffer.currentCount
-        processLock.unlock()
-        if remaining > 0 {
-            scheduleProcess()
+        processFrame(frame) { [weak self] in
+            guard let self else { return }
+            processLock.lock()
+            isProcessing = false
+            let remaining = frameBuffer.currentCount
+            processLock.unlock()
+            if remaining > 0 {
+                scheduleProcess()
+            }
         }
     }
 
@@ -1150,9 +1156,9 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
         let buffer: CVPixelBuffer
     }
 
-    nonisolated private func processFrame(_ frameData: RawFrameData) {
-        guard isAppActive else { return }
-        guard let pipeline = metalPipeline else { return }
+    nonisolated private func processFrame(_ frameData: RawFrameData, completion: @escaping () -> Void) {
+        guard isAppActive else { completion(); return }
+        guard let pipeline = metalPipeline else { completion(); return }
 
         pipeline.bayerPattern = frameData.cfaPattern
         pipeline.blackLevel = frameData.blackLevel
@@ -1175,7 +1181,8 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
         pipeline.noiseShotCoeff = noiseCoeffs.shot
         pipeline.noiseReadCoeff = noiseCoeffs.read
 
-        // Scene-cut detection: >2 stop ISO jump invalidates temporal history.
+        // Scene-cut detection: >2 stop ISO jump is a secondary trigger; primary motion
+        // detection now happens inside the temporal kernel via a global frame metric.
         if lastProcessedISO > 0, abs(frameData.iso - lastProcessedISO) > 2.0 * lastProcessedISO {
             pipeline.clearTemporalHistory()
         }
@@ -1196,54 +1203,57 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
         let w = activeEncodeWidth
         let h = activeEncodeHeight
         // Demosaic + WB + luma/chroma denoise + log + crop/scale to encode size.
-        guard let framed = pipeline.process(frameData.pixelBuffer, encodeWidth: w, encodeHeight: h) else { return }
+        pipeline.process(frameData.pixelBuffer, encodeWidth: w, encodeHeight: h) { [weak self] framed in
+            defer { completion() }
+            guard let self, let framed else { return }
 
-        let cfaName: String
-        switch frameData.cfaPattern {
-        case 0: cfaName = "RGGB"
-        case 1: cfaName = "GRBG"
-        case 2: cfaName = "GBRG"
-        case 3: cfaName = "BGGR"
-        default: cfaName = "?\(frameData.cfaPattern)"
-        }
-        let drops = frameBuffer.droppedCount
-        let newScopeData: ScopeData?
-        let scopeNow = CACurrentMediaTime()
-        if showScopesUnsafe && scopeNow - lastScopeUpdateTime >= 0.1 {
-            lastScopeUpdateTime = scopeNow
-            newScopeData = pipeline.makeScopeData(from: framed)
-        } else {
-            newScopeData = nil
-        }
-
-        // BGRA conversion + video encoding is fully asynchronous (zero CPU blocking)
-        if isRecordingUnsafe {
-            pipeline.textureToPixelBufferBGRA(framed) { [weak self] pb in
-                guard let self = self, let pb = pb else { return }
-                let sendablePB = SendablePixelBuffer(buffer: pb)
-                self.processQueue.async {
+            let cfaName: String
+            switch frameData.cfaPattern {
+            case 0: cfaName = "RGGB"
+            case 1: cfaName = "GRBG"
+            case 2: cfaName = "GBRG"
+            case 3: cfaName = "BGGR"
+            default: cfaName = "?\(frameData.cfaPattern)"
+            }
+            let drops = frameBuffer.droppedCount
+            let scopeNow = CACurrentMediaTime()
+            if showScopesUnsafe && scopeNow - lastScopeUpdateTime >= 0.1 {
+                lastScopeUpdateTime = scopeNow
+                pipeline.makeScopeData(from: framed) { [weak self] scope in
+                    guard let self, let scope else { return }
                     Task { @MainActor [weak self] in
-                        guard let self = self else { return }
-                        if self.videoWriter.appendFrame(pixelBuffer: sendablePB.buffer) {
-                            self.frameIndex += 1
+                        guard let self else { return }
+                        self.scopeData = scope
+                    }
+                }
+            }
+
+            // BGRA conversion + video encoding is fully asynchronous (zero CPU blocking)
+            if isRecordingUnsafe {
+                pipeline.textureToPixelBufferBGRA(framed) { [weak self] pb in
+                    guard let self = self, let pb = pb else { return }
+                    let sendablePB = SendablePixelBuffer(buffer: pb)
+                    self.processQueue.async {
+                        Task { @MainActor [weak self] in
+                            guard let self = self else { return }
+                            if self.videoWriter.appendFrame(pixelBuffer: sendablePB.buffer) {
+                                self.frameIndex += 1
+                            }
                         }
                     }
                 }
             }
-        }
 
-        // Only preview texture + UI counters go to MainActor
-        Task { @MainActor [weak self] in
-            guard let self else { return }
-            self.syncLiveAutoValues(from: frameData)
-            self.currentTexture = framed
-            self.cfaLabel = cfaName
-            self.droppedFrames = drops
-            if let newScopeData {
-                self.scopeData = newScopeData
-            }
-            if self.isRecording {
-                self.frameCount = Int(self.frameIndex)
+            // Only preview texture + UI counters go to MainActor
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.syncLiveAutoValues(from: frameData)
+                self.currentTexture = framed
+                self.cfaLabel = cfaName
+                self.droppedFrames = drops
+                if self.isRecording {
+                    self.frameCount = Int(self.frameIndex)
+                }
             }
         }
     }

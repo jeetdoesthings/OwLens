@@ -688,8 +688,9 @@ kernel void spatialDenoise(
         shadowBoost = mix(1.45, 0.8, luma01);
     }
 
-    // Luma: tight sigma — smooth flat-area grain, preserve edges
-    float lumaRS = sigmaRef * shadowBoost;
+    // Luma: tight sigma — smooth flat-area grain, preserve edges.
+    // Boost sigma by 1.3x to remove more residual grain without losing edges.
+    float lumaRS = sigmaRef * shadowBoost * 1.3;
     float lumaRS2 = lumaRS * lumaRS;
     
     // Spatial sigma adapts to kernel radius
@@ -702,6 +703,8 @@ kernel void spatialDenoise(
     
     float sumLuma = 0.0;
     float sumLumaW = 0.0;
+    float2 sumUV = float2(0.0);
+    float sumUVW = 0.0;
     
     for (int dy = -radius; dy <= radius; dy++) {
         for (int dx = -radius; dx <= radius; dx++) {
@@ -718,12 +721,22 @@ kernel void spatialDenoise(
             float lumaW = spatialW * exp(-(lumaDiff * lumaDiff) / (2.0 * lumaRS2));
             sumLumaW += lumaW;
             sumLuma += sYUV.x * lumaW;
+            
+            // Chroma smoothing: use the same edge-stopping weights to reduce chroma
+            // noise, but keep 50% of the original chroma to avoid color bleeding.
+            sumUV += sYUV.yz * lumaW;
+            sumUVW += lumaW;
         }
     }
     
     float finalY = (sumLumaW > 1e-4) ? (sumLuma / sumLumaW) : centerYUV.x;
+    float2 finalUV = centerYUV.yz;
+    if (sumUVW > 1e-4) {
+        float2 denoisedUV = sumUV / sumUVW;
+        finalUV = mix(centerYUV.yz, denoisedUV, 0.5);
+    }
     
-    float3 finalRGB = max(yuv2rgb(float3(finalY, centerYUV.y, centerYUV.z)), float3(0.0));
+    float3 finalRGB = max(yuv2rgb(float3(finalY, finalUV.x, finalUV.y)), float3(0.0));
     outTexture.write(float4(finalRGB, centerPx.a), gid);
 }
 
@@ -767,7 +780,8 @@ kernel void denoiseHalfResChroma(
 
     float iso = max(params.iso, 33.0);
     float isoScale = sqrt(iso / 33.0);
-    int radius = params.radius;
+    // Use a slightly wider chroma radius because chroma noise is coarser than luma.
+    int radius = params.radius + 1;
     float maxDist2 = float(radius * radius);
     float spatialS2 = float(radius) * float(radius) * 0.5;
 
@@ -945,21 +959,32 @@ kernel void temporalDenoiseRing(
     texture2d_array<float, access::read> lumaHistory   [[texture(2)]],
     texture2d_array<float, access::read> chromaHistory  [[texture(3)]],
     constant RingTemporalParams &params [[buffer(0)]],
+    device const float* globalMotionMetric [[buffer(1)]],
     uint2 gid [[thread_position_in_grid]])
 {
     if (gid.x >= outTexture.get_width() || gid.y >= outTexture.get_height()) return;
 
     float4 currentPx = currentTexture.read(gid);
+
+    // If global motion is high, skip temporal blending entirely for this frame.
+    if (globalMotionMetric != nullptr && *globalMotionMetric > 0.03) {
+        outTexture.write(currentPx, gid);
+        return;
+    }
     float3 currentYUV = rgb2yuv(currentPx.rgb);
 
     float iso = max(params.iso, 33.0);
     float isoScale = sqrt(iso / 33.0);
     float luma01 = saturate(currentYUV.x);
-    float shadowBoost = mix(1.4, 0.85, luma01);
+    // Tighten the shadow/highlight boost so the motion threshold is smaller; small
+    // frame-to-frame differences then register as motion and do not get averaged.
+    float shadowBoost = mix(1.0, 0.65, luma01);
 
     float sigmaRef = (params.shotCoeff > 0.0)
         ? sqrt(params.shotCoeff * 0.5 + params.readCoeff)
         : 0.01 * isoScale;
+    // Tighten motion thresholds so small frame-to-frame differences register as motion
+    // and do not get averaged into ghost trails.
     float lumaThreshold   = max(sigmaRef * shadowBoost, 1e-5);
     float chromaThreshold = max(sigmaRef * 1.5 * shadowBoost, 1e-5);
 
@@ -981,10 +1006,11 @@ kernel void temporalDenoiseRing(
             clamp(int(gid.y), 0, lumaH - 1));
         float3 lumaYUV = rgb2yuv(lumaHistory.read(lumaCoord, slot).rgb);
 
-        // Chroma history at half resolution — clamp threads outside chroma bounds
+        // Chroma history at half resolution — map full-res thread coords to half-res.
+        // The chroma ring stores half-resolution UV produced by averaging 2x2 full-res blocks.
         uint2 chromaCoord = uint2(
-            min(uint(gid.x), uint(params.chromaW - 1)),
-            min(uint(gid.y), uint(params.chromaH - 1)));
+            min(uint(gid.x) / 2u, uint(params.chromaW - 1)),
+            min(uint(gid.y) / 2u, uint(params.chromaH - 1)));
         float2 chromaUV = chromaHistory.read(chromaCoord, slot).rg;
         float3 histYUV = float3(lumaYUV.x, chromaUV.x, chromaUV.y);
 
@@ -998,6 +1024,10 @@ kernel void temporalDenoiseRing(
         // i=0 newest gets λ^0 = 1; older slots decay.
         float recency = pow(params.lambda, float(i));
         float slotWeight = params.maxBlend * (1.0 - motion) * recency;
+        // Hard motion gate: when motion is clearly present, do not blend history at all.
+        if (motion > 0.5) {
+            slotWeight = 0.0;
+        }
         slotWeight = clamp(slotWeight, 0.0, 0.95);
 
         // Reconstruct RGB from luma history Y and chroma history UV
@@ -1008,6 +1038,56 @@ kernel void temporalDenoiseRing(
 
     float3 result = weightedRGB / max(totalWeight, 1e-6);
     outTexture.write(float4(max(result, float3(0.0)), currentPx.a), gid);
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// GLOBAL MOTION ESTIMATE — coarse frame-to-frame luma difference metric.
+// texture(0) = current pre-temporal RGB
+// texture(1) = luma history array (newest slot is (cursor-1) mod slotCount)
+// buffer(0) = device float* where the metric is written
+// buffer(1) = cursor int
+// buffer(2) = slotCount int
+// Single-threaded 16x12 grid sampling to avoid atomics; metric is ~O(200) reads.
+// ──────────────────────────────────────────────────────────────────────
+
+kernel void estimateGlobalMotion(
+    texture2d<float, access::read> currentRGB [[texture(0)]],
+    texture2d_array<float, access::read> lumaHistory [[texture(1)]],
+    device float* motionMetric [[buffer(0)]],
+    constant int &cursor [[buffer(1)]],
+    constant int &slotCount [[buffer(2)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    // Single thread computes the metric to avoid atomics.
+    if (gid.x != 0 || gid.y != 0) return;
+
+    int w = int(currentRGB.get_width());
+    int h = int(currentRGB.get_height());
+    if (w <= 0 || h <= 0 || slotCount <= 0) {
+        *motionMetric = 0.0;
+        return;
+    }
+
+    int newestSlot = (cursor - 1 + slotCount) % slotCount;
+
+    const int gridW = 16;
+    const int gridH = 12;
+    float sumDiff = 0.0;
+    int count = 0;
+
+    for (int gy = 0; gy < gridH; gy++) {
+        for (int gx = 0; gx < gridW; gx++) {
+            int x = (w * gx) / gridW;
+            int y = (h * gy) / gridH;
+            uint2 coord = uint2(clamp(x, 0, w - 1), clamp(y, 0, h - 1));
+            float curY = rgb2yuv(currentRGB.read(coord).rgb).x;
+            float histY = rgb2yuv(lumaHistory.read(coord, newestSlot).rgb).x;
+            sumDiff += abs(curY - histY);
+            count++;
+        }
+    }
+
+    *motionMetric = (count > 0) ? (sumDiff / float(count)) : 0.0;
 }
 
 // ──────────────────────────────────────────────────────────────────────

@@ -42,7 +42,14 @@ extension MetalPipeline {
         }
 
         // Run through the production pipeline at native resolution.
-        guard let output = process(buffer, encodeWidth: width, encodeHeight: height) else {
+        var output: MTLTexture?
+        let sem = DispatchSemaphore(value: 0)
+        process(buffer, encodeWidth: width, encodeHeight: height) { result in
+            output = result
+            sem.signal()
+        }
+        sem.wait()
+        guard let output else {
             print("[SyntheticTest] process returned nil")
             return false
         }
