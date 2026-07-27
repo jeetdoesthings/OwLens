@@ -515,7 +515,7 @@ final class MetalPipeline: @unchecked Sendable {
         if let chromaArr = chromaHistoryArray {
             if let enc = commandBuffer.makeComputeCommandEncoder() {
                 enc.setComputePipelineState(storeChromaHistoryPipeline)
-                enc.setTexture(denoisedOut, index: 0)
+                enc.setTexture(chromaMergedOut, index: 0)
                 enc.setTexture(chromaArr, index: 1)
                 var scParams = StoreChromaParams(slice: Int32(temporalRingCursor))
                 enc.setBytes(&scParams, length: MemoryLayout<StoreChromaParams>.stride, index: 0)
@@ -567,10 +567,11 @@ final class MetalPipeline: @unchecked Sendable {
         }
 
         // Push current frame into ring buffer (luma at full-res via blit, chroma already stored above).
+        // Use the pre-temporal source so luma and chroma history reference the same input frame.
         if let lumaArr = lumaHistoryArray,
            let blit = commandBuffer.makeBlitCommandEncoder() {
             blit.copy(
-                from: temporalOut,
+                from: chromaMergedOut,
                 sourceSlice: 0, sourceLevel: 0,
                 sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
                 sourceSize: MTLSize(width: bayerW, height: bayerH, depth: 1),

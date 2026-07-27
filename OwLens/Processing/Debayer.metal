@@ -465,19 +465,19 @@ fragment float4 displayFragment(
 // ──────────────────────────────────────────────────────────────────────
 
 static inline float3 rgb2yuv(float3 rgb) {
-    float y = dot(rgb, float3(0.299, 0.587, 0.114));
-    float u = dot(rgb, float3(-0.1687, -0.3313, 0.5)) + 0.5;
-    float v = dot(rgb, float3(0.5, -0.4187, -0.0813)) + 0.5;
+    float y  = dot(rgb, float3(0.2126, 0.7152, 0.0722));
+    float u  = dot(rgb, float3(-0.1146, -0.3854, 0.5)) + 0.5;
+    float v  = dot(rgb, float3(0.5, -0.4542, -0.0458)) + 0.5;
     return float3(y, u, v);
 }
 
 static inline float3 yuv2rgb(float3 yuv) {
-    float y = yuv.x;
-    float u = yuv.y - 0.5;
-    float v = yuv.z - 0.5;
-    float r = y + 1.402 * v;
-    float g = y - 0.3441 * u - 0.7141 * v;
-    float b = y + 1.772 * u;
+    float y  = yuv.x;
+    float u  = yuv.y - 0.5;
+    float v  = yuv.z - 0.5;
+    float r  = y + 1.5748 * v;
+    float g  = y - 0.1873 * u - 0.4681 * v;
+    float b  = y + 1.8556 * u;
     return float3(r, g, b);
 }
 
@@ -862,9 +862,10 @@ kernel void temporalDenoiseRing(
             clamp(int(gid.y), 0, lumaH - 1));
         float3 lumaYUV = rgb2yuv(lumaHistory.read(lumaCoord, i).rgb);
 
-        // Chroma history at half resolution — skip threads outside chroma bounds
-        if (int(gid.x) >= params.chromaW || int(gid.y) >= params.chromaH) continue;
-        uint2 chromaCoord = uint2(gid.x, gid.y);
+        // Chroma history at half resolution — clamp threads outside chroma bounds
+        uint2 chromaCoord = uint2(
+            min(uint(gid.x), uint(params.chromaW - 1)),
+            min(uint(gid.y), uint(params.chromaH - 1)));
         float2 chromaUV = chromaHistory.read(chromaCoord, i).rg;
         float3 histYUV = float3(lumaYUV.x, chromaUV.x, chromaUV.y);
 
