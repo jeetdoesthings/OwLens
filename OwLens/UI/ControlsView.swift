@@ -224,12 +224,19 @@ struct ControlsView: View {
             viewModel.startCalibrationForSelectedLens()
         } label: {
             ZStack(alignment: .topTrailing) {
-                Image(systemName: "camera.badge.gear")
-                    .font(.system(size: 14, weight: .semibold))
+                Image(systemName: "camera.fill")
+                    .font(.system(size: 13, weight: .semibold))
                     .foregroundColor(isCalibrated ? .black : .white.opacity(disabled ? 0.35 : 0.84))
                     .frame(width: 34, height: 34)
                     .background(isCalibrated ? Color.green : Color.black.opacity(disabled ? 0.22 : 0.52))
                     .clipShape(Circle())
+                    .overlay(
+                        Image(systemName: "gearshape.fill")
+                            .font(.system(size: 8, weight: .bold))
+                            .foregroundColor(isCalibrated ? .black.opacity(0.7) : .white.opacity(disabled ? 0.35 : 0.7))
+                            .offset(x: -3, y: -3),
+                        alignment: .bottomTrailing
+                    )
 
                 if isCalibrated {
                     Circle()

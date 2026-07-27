@@ -48,13 +48,39 @@ extension MetalPipeline {
         }
 
         // Read back the center region and the hot pixel location.
+        // The production pipeline returns a private texture; blit to a shared staging texture
+        // so CPU getBytes is legal on both device and simulator.
         let readW = output.width
         let readH = output.height
         let bytesPerPixel = 8 // rgba16Float
         let rowBytes = readW * bytesPerPixel
         var outputBytes = [UInt16](repeating: 0, count: readW * readH * 4)
+
+        let readbackDesc = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: output.pixelFormat, width: readW, height: readH, mipmapped: false)
+        readbackDesc.usage = [.shaderRead]
+        readbackDesc.storageMode = .shared
+        guard let readbackTex = device.makeTexture(descriptor: readbackDesc),
+              let readbackCB = commandQueue.makeCommandBuffer(),
+              let blit = readbackCB.makeBlitCommandEncoder() else {
+            print("[SyntheticTest] failed to create readback resources")
+            return false
+        }
+        blit.copy(
+            from: output,
+            sourceSlice: 0, sourceLevel: 0,
+            sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
+            sourceSize: MTLSize(width: readW, height: readH, depth: 1),
+            to: readbackTex,
+            destinationSlice: 0, destinationLevel: 0,
+            destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0)
+        )
+        blit.endEncoding()
+        readbackCB.commit()
+        readbackCB.waitUntilCompleted()
+
         outputBytes.withUnsafeMutableBytes { raw in
-            output.getBytes(raw.baseAddress!,
+            readbackTex.getBytes(raw.baseAddress!,
                            bytesPerRow: rowBytes,
                            from: MTLRegionMake2D(0, 0, readW, readH),
                            mipmapLevel: 0)
