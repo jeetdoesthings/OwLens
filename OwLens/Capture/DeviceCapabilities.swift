@@ -100,6 +100,8 @@ struct LSCCoefficients: Sendable {
     }
 }
 
+extension LSCCoefficients: Codable {}
+
 // MARK: - NoiseProfile
 
 /// Measured per-device noise model (shot + read coefficients) from dark-frame calibration.

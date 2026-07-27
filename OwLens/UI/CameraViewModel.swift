@@ -148,6 +148,10 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
     }
     @Published var focusPointLocation: CGPoint? = nil
 
+    // Calibration UI state
+    @Published var showCalibrationSheet = false
+    @Published var calibrationLensToCalibrate: LensOption?
+
     /// Discrete stop lists (snap slider).
     @Published private(set) var isoStops: [Float] = ExposureStops.isoStops(in: 50...2000)
     @Published private(set) var wbStops: [Float] = ExposureStops.wbStops()
@@ -236,6 +240,11 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
     nonisolated(unsafe) private var noiseProfileForISO: NoiseProfile?
     /// Last ISO seen by processFrame; used to detect scene-cut ISO jumps.
     nonisolated(unsafe) private var lastProcessedISO: Float = 0
+    /// Optional calibration frame collector. When set, incoming frames are routed here
+    /// instead of the normal preview/record pipeline.
+    nonisolated(unsafe) private var calibrationCollector: ((RawFrameData) -> Bool)?
+    /// Active calibration key for per-frame coefficient lookup.
+    nonisolated(unsafe) private var activeCalibrationKey: (machine: String, lensID: String)?
 
     enum ControlPanel: String, Identifiable {
         case exposure, iso, shutter, wb, focus, fps, format, log, bitrate, mic, lens, save
@@ -567,6 +576,7 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
                 } else {
                     // ISO/shutter ranges can change per lens
                     self.seedControlRanges()
+                    self.resolveCalibrationForCurrentLens()
                     self.metalPipeline?.clearTemporalHistory()
                     if !self.controlsLocked {
                         self.applyManualExposureAndWB()
@@ -574,6 +584,47 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
                     self.refreshStatusLine()
                 }
             }
+        }
+    }
+
+    /// Whether a given lens has persisted calibration data.
+    func isCalibrated(_ lens: LensOption) -> Bool {
+        guard let machine = capabilities?.machineIdentifier else { return false }
+        return NoiseCalibrationStore.shared.isCalibrated(deviceMachine: machine, lensID: lens.uniqueID)
+    }
+
+    /// Launch calibration for the currently selected lens.
+    func startCalibrationForSelectedLens() {
+        guard let lens = selectedLens else { return }
+        calibrationLensToCalibrate = lens
+        showCalibrationSheet = true
+    }
+
+    /// Resolve calibration data for the current device + lens combo.
+    private func resolveCalibrationForCurrentLens() {
+        guard let machine = capabilities?.machineIdentifier,
+              let lens = selectedLens else {
+            activeCalibrationKey = nil
+            lscOverride = nil
+            return
+        }
+
+        let store = NoiseCalibrationStore.shared
+        let calibrated = store.isCalibrated(deviceMachine: machine, lensID: lens.uniqueID)
+
+        if calibrated {
+            activeCalibrationKey = (machine, lens.uniqueID)
+        } else {
+            activeCalibrationKey = nil
+        }
+
+        // LSC and green balance — resolved once per lens (not ISO-dependent)
+        lscOverride = store.lensShadingCoefficients(deviceMachine: machine, lensID: lens.uniqueID)
+
+        print("[CameraViewModel] Lens calibration: \(calibrated ? "ACTIVE" : "fallback heuristic") · \(lens.shortLabel)")
+        if calibrated, let key = activeCalibrationKey,
+           let coeffs = store.noiseCoefficients(forISO: 100, deviceMachine: key.machine, lensID: key.lensID) {
+            print("[CameraViewModel]   noise @ ISO 100: shot=\(String(format: "%.5f", coeffs.shot)) read=\(String(format: "%.6f", coeffs.read))")
         }
     }
 
@@ -1049,6 +1100,13 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
     nonisolated private func handleIncomingFrame(_ frameData: RawFrameData) {
         // Never enqueue GPU work while backgrounded (IOGPUMetalError 00000006)
         guard isAppActive else { return }
+
+        // Route to calibration collector when active; skip normal preview pipeline.
+        if let collector = calibrationCollector {
+            let continueCollecting = collector(frameData)
+            if continueCollecting { return }
+        }
+
         frameBuffer.enqueue(frameData)
         scheduleProcess()
     }
@@ -1095,11 +1153,16 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
 
         // LSC: calibration > device table > frame default (live DNG).
         pipeline.lscParams = lscOverride?.asLSCParams ?? Self.simd4ToLSCParams(frameData.lscCoefficients)
-        pipeline.greenBalance = 1.0 // calibration will override in Phase 6
+        pipeline.greenBalance = activeCalibrationKey.flatMap {
+            NoiseCalibrationStore.shared.greenBalance(deviceMachine: $0.machine, lensID: $0.lensID)
+        } ?? 1.0
         pipeline.iso = frameData.iso
 
-        // Recompute noise coefficients from measured profile (ISO-dependent)
-        if let prof = noiseProfileForISO {
+        // Recompute noise coefficients from calibration or measured profile (ISO-dependent)
+        if let key = activeCalibrationKey,
+           let coeffs = NoiseCalibrationStore.shared.noiseCoefficients(forISO: frameData.iso, deviceMachine: key.machine, lensID: key.lensID) {
+            noiseCoeffs = coeffs
+        } else if let prof = noiseProfileForISO {
             noiseCoeffs = prof.coefficients(at: frameData.iso)
         }
         pipeline.noiseShotCoeff = noiseCoeffs.shot
@@ -1213,5 +1276,59 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
         } else {
             isAutoWhiteBalanceAdjusting = false
         }
+    }
+}
+
+// MARK: - Calibration frame provider
+
+extension CameraViewModel: CalibrationFrameProvider {
+    var deviceMachine: String {
+        capabilities?.machineIdentifier ?? DeviceCapabilities.hardwareMachineIdentifier()
+    }
+
+    func captureFrames(iso: Float, count: Int) async -> [RawFrameData] {
+        let previousAutoExposure = isAutoExposureEnabled
+        let previousISO = isoValue
+
+        // Switch to manual exposure at the requested ISO for calibration.
+        isAutoExposureEnabled = false
+        isoValue = iso
+        applyManualExposureAndWB()
+
+        // Allow exposure to settle before sampling frames.
+        try? await Task.sleep(nanoseconds: 300_000_000)
+
+        var frames: [RawFrameData] = []
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            var resumed = false
+            self.calibrationCollector = { frame in
+                frames.append(frame)
+                if frames.count >= count {
+                    if !resumed {
+                        resumed = true
+                        self.calibrationCollector = nil
+                        continuation.resume()
+                    }
+                    return false
+                }
+                return true
+            }
+            // Safety timeout: resume after 10 s even if the pipeline stalls.
+            Task { @MainActor in
+                try? await Task.sleep(nanoseconds: 10_000_000_000)
+                if !resumed {
+                    resumed = true
+                    self.calibrationCollector = nil
+                    continuation.resume()
+                }
+            }
+        }
+
+        // Restore prior exposure state.
+        isAutoExposureEnabled = previousAutoExposure
+        isoValue = previousISO
+        applyManualExposureAndWB()
+
+        return frames
     }
 }

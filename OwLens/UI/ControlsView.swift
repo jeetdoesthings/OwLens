@@ -208,11 +208,41 @@ struct ControlsView: View {
             railToggle(systemName: "chart.xyaxis.line", active: viewModel.showScopes, accessibilityLabel: "Scopes") {
                 viewModel.toggleScopes()
             }
+
+            calibrationButton
         }
         .padding(6)
         .background(Color.black.opacity(0.32))
         .clipShape(RoundedRectangle(cornerRadius: chromeRadius, style: .continuous))
         .padding(.leading, 12)
+    }
+
+    private var calibrationButton: some View {
+        let disabled = viewModel.controlsLocked || viewModel.isRecording || viewModel.isDeviceUnsupportedForLog
+        let isCalibrated = viewModel.selectedLens.map(viewModel.isCalibrated) ?? false
+        return Button {
+            viewModel.startCalibrationForSelectedLens()
+        } label: {
+            ZStack(alignment: .topTrailing) {
+                Image(systemName: "camera.badge.gear")
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundColor(isCalibrated ? .black : .white.opacity(disabled ? 0.35 : 0.84))
+                    .frame(width: 34, height: 34)
+                    .background(isCalibrated ? Color.green : Color.black.opacity(disabled ? 0.22 : 0.52))
+                    .clipShape(Circle())
+
+                if isCalibrated {
+                    Circle()
+                        .fill(Color.white)
+                        .frame(width: 8, height: 8)
+                        .offset(x: 2, y: -2)
+                }
+            }
+        }
+        .buttonStyle(.plain)
+        .disabled(disabled)
+        .accessibilityLabel("Calibrate lens")
+        .help("Calibrate current lens")
     }
 
     private func railToggle(

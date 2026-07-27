@@ -21,6 +21,7 @@ struct RootView: View {
     @State private var tapFocusPoint: CGPoint? = nil
     @State private var focusReticleOpacity: Double = 0
     @State private var touchDownDate: Date? = nil
+    @StateObject private var calibrationViewModel = CalibrationViewModel()
 
     var body: some View {
         ZStack {
@@ -208,6 +209,15 @@ struct RootView: View {
         }
         .onDisappear {
             viewModel.teardownCamera()
+        }
+        .sheet(isPresented: $viewModel.showCalibrationSheet) {
+            CalibrationView(viewModel: calibrationViewModel) {
+                viewModel.showCalibrationSheet = false
+                viewModel.calibrationLensToCalibrate = nil
+            }
+        }
+        .task {
+            calibrationViewModel.configure(with: viewModel)
         }
     }
 
