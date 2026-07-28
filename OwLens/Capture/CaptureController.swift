@@ -829,12 +829,22 @@ final class CaptureController: NSObject, ObservableObject {
 
     func setCaptureFPS(_ fps: Double) {
         let clamped = max(1, min(30, fps))
+        // Stop the timer on the capture queue first to prevent firing mid-change.
         captureQueue.async { [weak self] in
             guard let self else { return }
+            self.captureTimer?.cancel()
+            self.captureTimer = nil
             self.targetFPS = clamped
             self.minFrameInterval = 1.0 / clamped
+            // Only start the new timer if the session is running and enough time
+            // has passed since the last capture start (avoids firing during config).
             guard self.session.isRunning else { return }
-            self.startFrameTimer(fps: clamped)
+            // Small delay before restarting to ensure any in-flight capture completes.
+            let deadline = DispatchTime.now() + DispatchTimeInterval.milliseconds(Int(100))
+            self.captureQueue.asyncAfter(deadline: deadline) { [weak self] in
+                guard let self, self.session.isRunning else { return }
+                self.startFrameTimer(fps: clamped)
+            }
         }
     }
 
@@ -849,6 +859,8 @@ final class CaptureController: NSObject, ObservableObject {
     // MARK: - Continuous RAW Capture Loop
 
     private func startFrameTimer(fps: Double) {
+        // Don't start if session isn't running (can happen during configuration changes)
+        guard session.isRunning else { return }
         captureTimer?.cancel()
         captureTimer = nil
         minFrameInterval = 1.0 / max(1, fps)
