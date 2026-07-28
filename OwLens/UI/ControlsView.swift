@@ -385,7 +385,8 @@ struct ControlsView: View {
     }
 
     private var focusModeControl: some View {
-        Button {
+        let panelActive = viewModel.activePanel == .focus
+        return Button {
             guard !exposureControlsDisabled else { return }
             viewModel.togglePanel(.focus)
         } label: {
@@ -395,9 +396,9 @@ struct ControlsView: View {
                 Text(viewModel.isAutoFocus ? "AF" : "MF")
                     .font(.system(size: 11, weight: .bold, design: .rounded))
             }
-            .foregroundColor(viewModel.isAutoFocus ? .black : .white.opacity(exposureControlsDisabled ? 0.35 : 0.88))
+            .foregroundColor(panelActive ? .black : .white.opacity(exposureControlsDisabled ? 0.35 : 0.88))
             .frame(width: 48, height: 40)
-            .background(viewModel.isAutoFocus ? Color.white : Color.black.opacity(exposureControlsDisabled ? 0.22 : 0.52))
+            .background(panelActive ? Color.white : Color.black.opacity(exposureControlsDisabled ? 0.22 : 0.52))
             .clipShape(RoundedRectangle(cornerRadius: chromeRadius, style: .continuous))
         }
         .buttonStyle(.plain)

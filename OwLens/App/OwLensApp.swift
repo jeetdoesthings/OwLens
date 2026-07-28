@@ -51,10 +51,6 @@ struct RootView: View {
                             .opacity(viewModel.previewDisplayMode == .log || viewModel.showClipping || viewModel.showFocusPeaking ? 1 : 0)
                             .allowsHitTesting(viewModel.previewDisplayMode == .log)
                             .ignoresSafeArea()
-                            .onTapGesture { location in
-                                let normalized = CGPoint(x: location.x / geo.size.width, y: location.y / geo.size.height)
-                                viewModel.triggerTapToFocus(at: location, normalized: normalized)
-                            }
                         
                         if let focusPt = viewModel.focusPointLocation {
                             Rectangle()
