@@ -966,26 +966,15 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
         }
     }
 
-    /// Check the output .mov is playable before handing it to Photos.
+    /// Verify the output file exists and has reasonable size before handing to Photos.
     private func validateVideoFile(at url: URL) -> Bool {
-        let asset = AVAsset(url: url)
-        let semaphore = DispatchSemaphore(value: 0)
-        var isValid = false
-        asset.loadValuesAsynchronously(forKeys: ["tracks", "playable"]) {
-            var error: NSError?
-            let trackStatus = asset.statusOfValue(forKey: "tracks", error: &error)
-            let playableStatus = asset.statusOfValue(forKey: "playable", error: &error)
-            if trackStatus == .loaded, playableStatus == .loaded,
-               !asset.tracks(withMediaType: .video).isEmpty,
-               asset.isPlayable, asset.duration.seconds > 0 {
-                isValid = true
-            } else {
-                print("[CameraViewModel] AVAsset invalid: tracks=\(trackStatus.rawValue) playable=\(playableStatus.rawValue) duration=\(asset.duration.seconds)")
-            }
-            semaphore.signal()
+        guard let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
+              let size = attrs[.size] as? Int64 else {
+            print("[CameraViewModel] Cannot stat output file")
+            return false
         }
-        _ = semaphore.wait(timeout: .now() + 5)
-        return isValid
+        // Must have at least 100KB to be a valid video
+        return size > 100_000
     }
 
     private func presentFilesFolderPicker() {

@@ -434,8 +434,6 @@ kernel void spatialDenoise(
     
     float sumLuma = 0.0;
     float sumLumaW = 0.0;
-    float2 sumUV = float2(0.0);
-    float sumUVW = 0.0;
     
     for (int dy = -radius; dy <= radius; dy++) {
         for (int dx = -radius; dx <= radius; dx++) {
@@ -452,22 +450,16 @@ kernel void spatialDenoise(
             float lumaW = spatialW * exp(-(lumaDiff * lumaDiff) / (2.0 * lumaRS2));
             sumLumaW += lumaW;
             sumLuma += sYUV.x * lumaW;
-            
-            // Chroma smoothing: use the same edge-stopping weights to reduce chroma
-            // noise, but keep 50% of the original chroma to avoid color bleeding.
-            sumUV += sYUV.yz * lumaW;
-            sumUVW += lumaW;
+            // NOTE: Chroma is NOT smoothed here. The dedicated half-res chroma
+            // pipeline (extractHalfResChroma -> denoiseHalfResChroma -> recombine)
+            // handles all chroma denoising. Any chroma work in this pass would
+            // be discarded by the recombine kernel which reads UV exclusively
+            // from chromaDenoisedOut.
         }
     }
     
     float finalY = (sumLumaW > 1e-4) ? (sumLuma / sumLumaW) : centerYUV.x;
-    float2 finalUV = centerYUV.yz;
-    if (sumUVW > 1e-4) {
-        float2 denoisedUV = sumUV / sumUVW;
-        finalUV = mix(centerYUV.yz, denoisedUV, 0.5);
-    }
-    
-    float3 finalRGB = max(yuv2rgb(float3(finalY, finalUV.x, finalUV.y)), float3(0.0));
+    float3 finalRGB = max(yuv2rgb(float3(finalY, centerYUV.y, centerYUV.z)), float3(0.0));
     outTexture.write(float4(finalRGB, centerPx.a), gid);
 }
 
@@ -657,7 +649,8 @@ kernel void temporalDenoiseRing(
     float4 currentPx = currentTexture.read(gid);
 
     // If global motion is high, skip temporal blending entirely for this frame.
-    if (globalMotionMetric != nullptr && *globalMotionMetric > 0.03) {
+    // Threshold 0.02 catches moderate camera pans and partial-frame motion.
+    if (globalMotionMetric != nullptr && *globalMotionMetric > 0.02) {
         outTexture.write(currentPx, gid);
         return;
     }
@@ -714,8 +707,9 @@ kernel void temporalDenoiseRing(
         // i=0 newest gets λ^0 = 1; older slots decay.
         float recency = pow(params.lambda, float(i));
         float slotWeight = params.maxBlend * (1.0 - motion) * recency;
-        // Hard motion gate: when motion is clearly present, do not blend history at all.
-        if (motion > 0.5) {
+        // Hard motion gate: stop blending history when per-pixel motion is moderate.
+        // Lower threshold (0.3 vs old 0.5) prevents ghost trails from moving edges.
+        if (motion > 0.3) {
             slotWeight = 0.0;
         }
         slotWeight = clamp(slotWeight, 0.0, 0.95);
@@ -762,8 +756,7 @@ kernel void estimateGlobalMotion(
 
     const int gridW = 16;
     const int gridH = 12;
-    const int totalTiles = gridW * gridH; // 192
-    float tileDiffs[192];
+    float sumDiff = 0.0;
     int count = 0;
 
     for (int gy = 0; gy < gridH; gy++) {
@@ -773,30 +766,14 @@ kernel void estimateGlobalMotion(
             uint2 coord = uint2(clamp(x, 0, w - 1), clamp(y, 0, h - 1));
             float curY = rgb2yuv(currentRGB.read(coord).rgb).x;
             float histY = rgb2yuv(lumaHistory.read(coord, newestSlot).rgb).x;
-            tileDiffs[count] = abs(curY - histY);
+            sumDiff += abs(curY - histY);
             count++;
         }
     }
 
-    // Find the 75th percentile value (index = count * 3 / 4).
-    // Partial sort: just find the value at the target rank using quickselect.
-    int targetIdx = (count * 3) / 4;
-    if (targetIdx >= count) targetIdx = count - 1;
-    if (targetIdx < 0) targetIdx = 0;
-
-    // Simple insertion sort of just the top-quartile region using partial selection.
-    // Since count is small (192), do a full sort for simplicity.
-    for (int i = 0; i < count - 1; i++) {
-        for (int j = i + 1; j < count; j++) {
-            if (tileDiffs[j] < tileDiffs[i]) {
-                float tmp = tileDiffs[i];
-                tileDiffs[i] = tileDiffs[j];
-                tileDiffs[j] = tmp;
-            }
-        }
-    }
-
-    *motionMetric = (count > 0) ? tileDiffs[targetIdx] : 0.0;
+    // Mean across all tiles. With a properly tuned threshold this catches
+    // both full-frame and partial motion adequately without expensive sorting.
+    *motionMetric = (count > 0) ? (sumDiff / float(count)) : 0.0;
 }
 
 // ──────────────────────────────────────────────────────────────────────

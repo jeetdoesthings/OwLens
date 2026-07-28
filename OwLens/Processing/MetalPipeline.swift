@@ -644,7 +644,9 @@ final class MetalPipeline: @unchecked Sendable {
 
                 let isoClamped = max(iso, 33.0)
                 let isoNorm = min(max((isoClamped - 33.0) / (1600.0 - 33.0), 0.0), 1.0)
-                let maxBlend: Float = 0.15 + 0.20 * isoNorm
+                // Reduced ceiling (from 0.35 to 0.25) to prevent ghost trails during motion.
+                // At ISO 1600: maxBlend ≈ 0.25; at ISO 33: maxBlend ≈ 0.10.
+                let maxBlend: Float = 0.10 + 0.15 * isoNorm
                 var ringParams = RingTemporalParams(
                     iso: isoClamped,
                     maxBlend: maxBlend,
