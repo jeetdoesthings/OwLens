@@ -1208,7 +1208,7 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
         // Set quality mode: full quality when recording, preview otherwise.
         pipeline.processingQuality = isRecordingUnsafe ? .recordQuality : .previewFast
         // Demosaic + WB + luma/chroma denoise + log + crop/scale to encode size.
-        pipeline.process(frameData.pixelBuffer, encodeWidth: w, encodeHeight: h) { [weak self] framed in
+        pipeline.process(frameData.pixelBuffer, encodeWidth: w, encodeHeight: h, encodeAsBGRA: isRecordingUnsafe) { [weak self] framed, bgraPB in
             defer { completion() }
             guard let self, let framed else { return }
 
@@ -1222,7 +1222,7 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
             }
             let drops = frameBuffer.droppedCount
             let scopeNow = CACurrentMediaTime()
-            if showScopesUnsafe && scopeNow - lastScopeUpdateTime >= 0.1 {
+            if showScopesUnsafe && !isRecordingUnsafe && scopeNow - lastScopeUpdateTime >= 0.1 {
                 lastScopeUpdateTime = scopeNow
                 pipeline.makeScopeData(from: framed) { [weak self] scope in
                     guard let self, let scope else { return }
@@ -1233,17 +1233,15 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
                 }
             }
 
-            // BGRA conversion + video encoding is fully asynchronous (zero CPU blocking)
-            if isRecordingUnsafe {
-                pipeline.textureToPixelBufferBGRA(framed) { [weak self] pb in
-                    guard let self = self, let pb = pb else { return }
-                    let sendablePB = SendablePixelBuffer(buffer: pb)
-                    self.processQueue.async {
-                        Task { @MainActor [weak self] in
-                            guard let self = self else { return }
-                            if self.videoWriter.appendFrame(pixelBuffer: sendablePB.buffer) {
-                                self.frameIndex += 1
-                            }
+            // BGRA pixel buffer is now produced inside the main command buffer (encodeAsBGRA flag).
+            // Just append directly without extra GPU submission.
+            if isRecordingUnsafe, let bgraPB {
+                let sendablePB = SendablePixelBuffer(buffer: bgraPB)
+                processQueue.async {
+                    Task { @MainActor [weak self] in
+                        guard let self else { return }
+                        if self.videoWriter.appendFrame(pixelBuffer: sendablePB.buffer) {
+                            self.frameIndex += 1
                         }
                     }
                 }
