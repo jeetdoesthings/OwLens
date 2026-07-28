@@ -1303,7 +1303,8 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
 
         if isAutoWhiteBalanceEnabled {
             if let gains = frameData.whiteBalanceGains {
-                let temperatureAndTint = device.temperatureAndTintValues(for: gains)
+                let clamped = clampWhiteBalanceGains(gains, for: device)
+                let temperatureAndTint = device.temperatureAndTintValues(for: clamped)
                 wbKelvin = max(2000, min(10000, temperatureAndTint.temperature))
             }
             isAutoWhiteBalanceAdjusting = device.isAdjustingWhiteBalance
