@@ -14,6 +14,10 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
     // MARK: - Published State
 
     @Published var currentTexture: MTLTexture?
+    /// Incremented with every new texture frame. UInt64 is Equatable so SwiftUI can
+    /// reliably detect the change and call updateUIView on CameraPreviewView, even
+    /// though MTLTexture itself is not Equatable.
+    @Published var textureChangeCount: UInt64 = 0
     @Published var isRecording = false
     @Published var controlsLocked = false
     @Published var thermalState: ProcessInfo.ThermalState = .nominal
@@ -1249,6 +1253,7 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
                 guard let self else { return }
                 self.syncLiveAutoValues(from: frameData)
                 self.currentTexture = framed
+                self.textureChangeCount &+= 1
                 self.cfaLabel = cfaName
                 self.droppedFrames = drops
                 if self.isRecording {

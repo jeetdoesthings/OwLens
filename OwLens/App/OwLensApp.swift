@@ -44,6 +44,7 @@ struct RootView: View {
                         CameraPreviewView(
                             metalPipeline: pipeline,
                             currentTexture: $viewModel.currentTexture,
+                            textureChangeCount: $viewModel.textureChangeCount,
                             showClipping: $viewModel.showClipping,
                             showFocusPeaking: $viewModel.showFocusPeaking,
                             overlayOnly: viewModel.previewDisplayMode == .normalVideo

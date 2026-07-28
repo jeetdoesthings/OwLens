@@ -8,6 +8,9 @@ import QuartzCore
 struct CameraPreviewView: UIViewRepresentable {
     let metalPipeline: MetalPipeline
     @Binding var currentTexture: MTLTexture?
+    /// Equatable counter that forces updateUIView on every new texture, because
+    /// MTLTexture is not Equatable and SwiftUI otherwise can't detect changes.
+    @Binding var textureChangeCount: UInt64
     @Binding var showClipping: Bool
     @Binding var showFocusPeaking: Bool
     var overlayOnly: Bool = false
@@ -17,9 +20,9 @@ struct CameraPreviewView: UIViewRepresentable {
         mtkView.delegate = context.coordinator
         mtkView.framebufferOnly = true
         mtkView.colorPixelFormat = .bgra8Unorm
-        // Run the display link at a fixed rate so draw(in:) is called reliably, even when
-        // SwiftUI's binding diff can't detect MTLTexture identity changes (pooled textures).
-        // The lastDrawnTexture guard below skips redundant draws when nothing changed.
+        // Run the display link at a fixed rate so draw(in:) is called ~30 times per
+        // second. The coordinator's currentTexture is updated via updateUIView which is
+        // reliably called because textureChangeCount (UInt64, Equatable) changes every frame.
         mtkView.enableSetNeedsDisplay = false
         mtkView.isPaused = false
         mtkView.preferredFramesPerSecond = 30
@@ -47,8 +50,8 @@ struct CameraPreviewView: UIViewRepresentable {
         uiView.isOpaque = !overlayOnly
         uiView.layer.isOpaque = !overlayOnly
         (uiView.layer as? CAMetalLayer)?.isOpaque = !overlayOnly
-        // No need for setNeedsDisplay: the display link runs continuously and draw(in:)
-        // uses the lastDrawnTexture guard to skip redundant work.
+        // The display link runs continuously so draw(in:) picks up new textures
+        // within ~33 ms of the coordinator receiving them via updateUIView.
     }
  
     func makeCoordinator() -> Coordinator {
@@ -61,10 +64,8 @@ struct CameraPreviewView: UIViewRepresentable {
         var showClipping: Bool = false
         var showFocusPeaking: Bool = false
         var overlayOnly: Bool = false
-        /// Tracks the last texture we rendered so we can skip redundant draws when the
-        /// display link ticks faster than new frames arrive or when the same pooled
-        /// texture object is reused.
-        private var lastDrawnTexture: MTLTexture?
+        /// No redundant-draw guard needed: the display link runs at 30 fps and frames
+        /// arrive at ~24 fps. The ~6 extra fullscreen blits per second are negligible.
         private let renderCommandQueue: MTLCommandQueue?
         private let renderPipeline: MTLRenderPipelineState?
  
@@ -92,12 +93,6 @@ struct CameraPreviewView: UIViewRepresentable {
         func draw(in view: MTKView) {
             // Skip Metal when app not active (avoids IOGPU background permission error)
             if UIApplication.shared.applicationState != .active {
-                lastDrawnTexture = nil
-                return
-            }
-            // Same texture as last draw — nothing new to render. The display link ticks
-            // at 30 fps but frames arrive at ~24 fps, so we skip ~6 draws per second.
-            if let currentTexture, let lastDrawnTexture, currentTexture === lastDrawnTexture {
                 return
             }
             guard let drawable = view.currentDrawable,
@@ -191,7 +186,6 @@ struct CameraPreviewView: UIViewRepresentable {
  
             commandBuffer.present(drawable)
             commandBuffer.commit()
-            lastDrawnTexture = currentTexture
         }
     }
 }
