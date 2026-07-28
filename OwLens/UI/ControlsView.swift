@@ -95,15 +95,14 @@ struct ControlsView: View {
     }
 
     private var recordingState: some View {
-        HStack(spacing: 7) {
+        HStack(spacing: 5) {
             Circle()
                 .fill(Color.red)
                 .frame(width: 8, height: 8)
-            Image(systemName: "record.circle.fill")
-                .font(.system(size: 12, weight: .bold))
         }
         .foregroundColor(.white.opacity(0.9))
-        .frame(width: 46, height: 32)
+        .padding(.horizontal, 8)
+        .frame(height: 32)
         .background(Color.black.opacity(0.54))
         .clipShape(RoundedRectangle(cornerRadius: chromeRadius, style: .continuous))
         .accessibilityLabel(viewModel.isRecording ? "Recording" : "Camera readiness")

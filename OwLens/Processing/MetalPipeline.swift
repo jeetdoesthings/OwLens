@@ -86,6 +86,7 @@ enum ProcessingQuality {
 final class MetalPipeline: @unchecked Sendable {
     let device: MTLDevice
     let commandQueue: MTLCommandQueue
+    private let scopeCommandQueue: MTLCommandQueue
     private let binPipeline: MTLComputePipelineState
     private let linearPipeline: MTLComputePipelineState
     private let denoisePipeline: MTLComputePipelineState
@@ -209,8 +210,10 @@ final class MetalPipeline: @unchecked Sendable {
               let motionMetricBuffer = device.makeBuffer(length: MemoryLayout<Float>.stride, options: .storageModeShared) else {
             return nil
         }
+        guard let scopeQueue = device.makeCommandQueue() else { return nil }
         self.device = device
         self.commandQueue = queue
+        self.scopeCommandQueue = scopeQueue
         self.scaler = MPSImageBilinearScale(device: device)
         do {
             self.binPipeline = try device.makeComputePipelineState(function: binFunc)
@@ -842,7 +845,7 @@ final class MetalPipeline: @unchecked Sendable {
         let width = max(16, sampleWidth)
         let height = max(16, sampleHeight)
         guard let output = getOrCreateScopeTexture(width: width, height: height),
-              let cb = commandQueue.makeCommandBuffer() else {
+              let cb = scopeCommandQueue.makeCommandBuffer() else {
             completion(nil)
             return
         }
