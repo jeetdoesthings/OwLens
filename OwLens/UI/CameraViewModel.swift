@@ -1123,7 +1123,10 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
 
     nonisolated private func handleIncomingFrame(_ frameData: RawFrameData) {
         // Never enqueue GPU work while backgrounded (IOGPUMetalError 00000006)
-        guard isAppActive else { return }
+        guard isAppActive else {
+            print("[handleIncomingFrame] SKIP isAppActive=false")
+            return
+        }
 
         // Route calibration frames through MainActor so the continuation
         // (created on MainActor by captureFrames) can safely be resumed.
@@ -1135,6 +1138,7 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
             // The collector callback may resume a withCheckedContinuation from
             // any thread, which is allowed by SE-0300.
             let continueCollecting = collector(frameData)
+            print("[handleIncomingFrame] calibration frame consumed continueCollecting=\(continueCollecting)")
             if continueCollecting { return }
         }
 
@@ -1333,6 +1337,7 @@ extension CameraViewModel: CalibrationFrameProvider {
     func captureFrames(iso: Float, count: Int) async -> [RawFrameData] {
         let previousAutoExposure = isAutoExposureEnabled
         let previousISO = isoValue
+        print("[captureFrames] START iso=\(iso) count=\(count) autoExposure=\(previousAutoExposure)")
 
         // Switch to manual exposure at the requested ISO for calibration.
         isAutoExposureEnabled = false
@@ -1351,6 +1356,7 @@ extension CameraViewModel: CalibrationFrameProvider {
             self.calibrationCollector = { frame in
                 os_unfair_lock_lock(lock)
                 frames.append(frame)
+                print("[captureFrames] collected frame #\(frames.count)/\(count)")
                 if frames.count >= count {
                     self.calibrationCollector = nil
                     os_unfair_lock_unlock(lock)
@@ -1361,10 +1367,12 @@ extension CameraViewModel: CalibrationFrameProvider {
                 return true
             }
             os_unfair_lock_unlock(lock)
+            print("[captureFrames] collector set, waiting for \(count) frames...")
 
             // Safety timeout: resume after 10 s even if the pipeline stalls.
             Task { @MainActor in
                 try? await Task.sleep(nanoseconds: 10_000_000_000)
+                print("[captureFrames] timeout fired, collected \(frames.count)/\(count)")
                 os_unfair_lock_lock(lock)
                 // Only timeout if the collector is still set (frames haven't reached count)
                 if self.calibrationCollector != nil {
@@ -1376,6 +1384,8 @@ extension CameraViewModel: CalibrationFrameProvider {
                 }
             }
         }
+
+        print("[captureFrames] DONE collected \(frames.count)/\(count) frames")
 
         // Restore prior exposure state.
         isAutoExposureEnabled = previousAutoExposure
