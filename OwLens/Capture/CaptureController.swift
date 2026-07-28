@@ -50,6 +50,8 @@ final class CaptureController: NSObject, ObservableObject {
     private var lastCaptureStart: CFTimeInterval = 0
     private var selectedAudioPortUID: String?
     private var isReconfiguringAudio = false
+    /// Whether the capture timer runs in recording mode (tighter settings).
+    private var isRecordingMode = false
 
     private var cachedBlackLevel: Float?
     private var cachedWhiteLevel: Float?
@@ -836,6 +838,36 @@ final class CaptureController: NSObject, ObservableObject {
         }
     }
 
+    /// Switch capture pipeline to recording mode (tighter settings) or back to preview.
+    /// Recording mode reduces in-flight captures and disables burst helpers to minimize
+    /// per-frame latency and dropped frames.
+    func setRecordingMode(_ recording: Bool) {
+        captureQueue.async { [weak self] in
+            guard let self else { return }
+            self.isRecordingMode = recording
+            if recording {
+                self.maxInFlight = 1
+                // Disable burst helpers that add latency during recording.
+                if self.photoOutput.isZeroShutterLagSupported {
+                    self.photoOutput.isZeroShutterLagEnabled = false
+                }
+                if self.photoOutput.isResponsiveCaptureSupported {
+                    self.photoOutput.isResponsiveCaptureEnabled = false
+                }
+                if self.photoOutput.isFastCapturePrioritizationSupported {
+                    self.photoOutput.isFastCapturePrioritizationEnabled = false
+                }
+            } else {
+                self.maxInFlight = 3
+                self.enableBurstHelpersIfSafe()
+            }
+            // Restart timer with new settings (poll rate adapts via captureOneRawFrame).
+            if self.session.isRunning {
+                self.startFrameTimer(fps: self.targetFPS)
+            }
+        }
+    }
+
     // MARK: - Continuous RAW Capture Loop
 
     private func startFrameTimer(fps: Double) {
@@ -843,7 +875,8 @@ final class CaptureController: NSObject, ObservableObject {
         captureTimer = nil
         minFrameInterval = 1.0 / max(1, fps)
         // Aggressive poll so we never sit idle after a free slot
-        let poll = min(1.0 / 120.0, minFrameInterval / 2)
+        // In recording mode poll at minFrameInterval to reduce CPU load.
+        let poll = isRecordingMode ? minFrameInterval : min(1.0 / 120.0, minFrameInterval / 2)
         let timer = DispatchSource.makeTimerSource(queue: captureQueue)
         timer.schedule(deadline: .now(), repeating: poll)
         timer.setEventHandler { [weak self] in

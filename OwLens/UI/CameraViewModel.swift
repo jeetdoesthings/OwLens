@@ -152,7 +152,8 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
     }
     @Published var focusPointLocation: CGPoint? = nil
 
-    // Calibration UI state
+    
+    // Calibration UI state (unused — kept for future use)
     @Published var showCalibrationSheet = false
     @Published var calibrationLensToCalibrate: LensOption?
 
@@ -831,6 +832,7 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
         activeEncodeWidth = selectedFormat.width
         activeEncodeHeight = selectedFormat.height
         activeFPS = selectedFPS.rawValue
+        captureController.setRecordingMode(true)
 
         let fileName = "OwLens_\(selectedFormat.shortLabel)_\(selectedFPS.label)fps_HEVC_\(Int(Date().timeIntervalSince1970)).mov"
         let outputURL = FileManager.default.temporaryDirectory.appendingPathComponent(fileName)
@@ -901,6 +903,7 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
         recordingTimer?.invalidate()
         recordingTimer = nil
         statusText = "Saving…"
+        captureController.setRecordingMode(false)
 
         videoWriter.finish { [weak self] url in
             guard let url else {
@@ -1123,24 +1126,7 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
 
     nonisolated private func handleIncomingFrame(_ frameData: RawFrameData) {
         // Never enqueue GPU work while backgrounded (IOGPUMetalError 00000006)
-        guard isAppActive else {
-            print("[handleIncomingFrame] SKIP isAppActive=false")
-            return
-        }
-
-        // Route calibration frames through MainActor so the continuation
-        // (created on MainActor by captureFrames) can safely be resumed.
-        os_unfair_lock_lock(calibrationLock)
-        let collector = calibrationCollector
-        os_unfair_lock_unlock(calibrationLock)
-        if let collector {
-            // Deliver frame to collector (it appends to frames array safely).
-            // The collector callback may resume a withCheckedContinuation from
-            // any thread, which is allowed by SE-0300.
-            let continueCollecting = collector(frameData)
-            print("[handleIncomingFrame] calibration frame consumed continueCollecting=\(continueCollecting)")
-            if continueCollecting { return }
-        }
+        guard isAppActive else { return }
 
         frameBuffer.enqueue(frameData)
         scheduleProcess()
