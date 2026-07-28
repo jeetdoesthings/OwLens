@@ -838,23 +838,12 @@ final class CaptureController: NSObject, ObservableObject {
         }
     }
 
-    /// Switch capture pipeline to recording mode (tighter settings) or back to preview.
+    /// Adjust capture pipeline behavior for recording.
     /// Recording mode reduces in-flight captures to minimize per-frame latency.
+    /// Must be called from the main thread.
     func setRecordingMode(_ recording: Bool) {
-        // Must happen on the calling thread (main), not capture queue, because
-        // AVCapturePhotoOutput properties are not thread-safe and setting them
-        // from a background queue can deadlock AVFoundation internals.
         isRecordingMode = recording
-        if recording {
-            maxInFlight = 1
-        } else {
-            maxInFlight = 3
-        }
-        // Restart timer with new settings on the capture queue.
-        captureQueue.async { [weak self] in
-            guard let self, self.session.isRunning else { return }
-            self.startFrameTimer(fps: self.targetFPS)
-        }
+        maxInFlight = recording ? 1 : 3
     }
 
     // MARK: - Continuous RAW Capture Loop
