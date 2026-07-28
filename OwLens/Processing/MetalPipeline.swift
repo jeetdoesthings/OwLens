@@ -94,6 +94,7 @@ final class MetalPipeline: @unchecked Sendable {
     private let recombineChromaPipeline: MTLComputePipelineState
     private let temporalRingPipeline: MTLComputePipelineState
     private let storeChromaHistoryPipeline: MTLComputePipelineState
+    private let storeLumaHistoryPipeline: MTLComputePipelineState
     private let globalMotionPipeline: MTLComputePipelineState
     private let logOnlyPipeline: MTLComputePipelineState
     private let lumaStatsPipeline: MTLComputePipelineState
@@ -204,6 +205,7 @@ final class MetalPipeline: @unchecked Sendable {
               let logOnlyFunc = library.makeFunction(name: "applyLogOnly"),
               let lumaStatsFunc = library.makeFunction(name: "estimateLumaVariance"),
               let defectPixelFunc = library.makeFunction(name: "correctDefectPixelsBayer"),
+              let storeLumaHistoryFunc = library.makeFunction(name: "storeLumaHistory"),
               let motionMetricBuffer = device.makeBuffer(length: MemoryLayout<Float>.stride, options: .storageModeShared) else {
             return nil
         }
@@ -223,6 +225,7 @@ final class MetalPipeline: @unchecked Sendable {
             self.logOnlyPipeline = try device.makeComputePipelineState(function: logOnlyFunc)
             self.lumaStatsPipeline = try device.makeComputePipelineState(function: lumaStatsFunc)
             self.defectPixelPipeline = try device.makeComputePipelineState(function: defectPixelFunc)
+            self.storeLumaHistoryPipeline = try device.makeComputePipelineState(function: storeLumaHistoryFunc)
             self.motionMetricBuffer = motionMetricBuffer
         } catch {
             print("[MetalPipeline] Failed to create compute pipelines: \(error)")
@@ -349,7 +352,14 @@ final class MetalPipeline: @unchecked Sendable {
            chromaHistoryW == chromaW, chromaHistoryH == chromaH,
            lumaHistoryArray != nil { return }
 
-        lumaHistoryArray = makeTexture2DArray(width: lumaW, height: lumaH, arrayLength: temporalRingCapacity)
+        // Luma history stored as single-channel R16Unorm (not rgba16Float) to save 4x bandwidth.
+        // The storeLumaHistory kernel converts RGB to Y before writing.
+        let lumaDesc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .r16Unorm, width: lumaW, height: lumaH, mipmapped: false)
+        lumaDesc.textureType = .type2DArray
+        lumaDesc.arrayLength = temporalRingCapacity
+        lumaDesc.usage = [.shaderRead, .shaderWrite]
+        lumaDesc.storageMode = .private
+        lumaHistoryArray = device.makeTexture(descriptor: lumaDesc)
         chromaHistoryArray = makeTexture2DArray(width: chromaW, height: chromaH, arrayLength: temporalRingCapacity)
         lumaHistoryW = lumaW
         lumaHistoryH = lumaH
@@ -442,41 +452,33 @@ final class MetalPipeline: @unchecked Sendable {
                  encodeWidth: Int = 1920,
                  encodeHeight: Int = 1440,
                  completion: @escaping (MTLTexture?) -> Void) {
+        process(pixelBuffer, encodeWidth: encodeWidth, encodeHeight: encodeHeight, encodeAsBGRA: false) { texture, _ in
+            completion(texture)
+        }
+    }
+
+    func process(_ pixelBuffer: CVPixelBuffer,
+                 encodeWidth: Int = 1920,
+                 encodeHeight: Int = 1440,
+                 encodeAsBGRA: Bool = false,
+                 completion: @escaping (MTLTexture?, CVPixelBuffer?) -> Void) {
 #if DEBUG
         let t0 = CACurrentMediaTime()
 #endif
         let fullW = CVPixelBufferGetWidth(pixelBuffer)
         let fullH = CVPixelBufferGetHeight(pixelBuffer)
-        guard fullW > 0, fullH > 0 else { completion(nil); return }
+        guard fullW > 0, fullH > 0 else { completion(nil, nil); return }
 
         guard let fullBayer = makeRawTexture(from: pixelBuffer) else {
             print("[MetalPipeline] Failed to create input texture")
-            completion(nil); return
+            completion(nil, nil); return
         }
 
-        guard let commandBuffer = commandQueue.makeCommandBuffer() else { completion(nil); return }
-
-        // Bayer RAW defect-pixel correction (before any downsample/demosaic).
-        guard let correctedBayer = getOrCreateCorrectedBayerTexture(width: fullW, height: fullH),
-              let encDPC = commandBuffer.makeComputeCommandEncoder() else { completion(nil); return }
-        encDPC.setComputePipelineState(defectPixelPipeline)
-        encDPC.setTexture(fullBayer, index: 0)
-        encDPC.setTexture(correctedBayer, index: 1)
-        var debayerParams = DebayerParams(
-            bayerPattern: bayerPattern,
-            blackLevel: blackLevel,
-            whiteLevel: max(whiteLevel, blackLevel + 1e-6),
-            lscCoefficients: lscCoefficients
-        )
-        var defectNoiseParams = DefectPixelParams(shotCoeff: noiseShotCoeff, readCoeff: noiseReadCoeff)
-        encDPC.setBytes(&debayerParams, length: MemoryLayout<DebayerParams>.stride, index: 0)
-        encDPC.setBytes(&defectNoiseParams, length: MemoryLayout<DefectPixelParams>.stride, index: 1)
-        dispatch(encDPC, width: fullW, height: fullH, state: defectPixelPipeline)
-        encDPC.endEncoding()
+        guard let commandBuffer = commandQueue.makeCommandBuffer() else { completion(nil, nil); return }
 
         // Optional CFA-safe half reduction. This is phase-preserving, not true averaged sensor binning,
         // so only use it when it leaves a real downscale/crop buffer instead of causing output upscale.
-        let bayerIn: MTLTexture
+        var bayerIn: MTLTexture
         let bayerW: Int
         let bayerH: Int
         let halfW = (fullW / 2) & ~1
@@ -484,9 +486,9 @@ final class MetalPipeline: @unchecked Sendable {
         let canReduceRaw = halfW >= encodeWidth && halfH >= encodeHeight
         if canReduceRaw {
             guard let halfTex = getOrCreateBinTexture(width: halfW, height: halfH),
-                  let enc = commandBuffer.makeComputeCommandEncoder() else { completion(nil); return }
+                  let enc = commandBuffer.makeComputeCommandEncoder() else { completion(nil, nil); return }
             enc.setComputePipelineState(binPipeline)
-            enc.setTexture(correctedBayer, index: 0)
+            enc.setTexture(fullBayer, index: 0)
             enc.setTexture(halfTex, index: 1)
             dispatch(enc, width: halfW, height: halfH, state: binPipeline)
             enc.endEncoding()
@@ -494,9 +496,31 @@ final class MetalPipeline: @unchecked Sendable {
             bayerW = halfW
             bayerH = halfH
         } else {
-            bayerIn = correctedBayer
+            bayerIn = fullBayer
             bayerW = fullW
             bayerH = fullH
+        }
+
+        // Skip defect pixel correction at 4K where a single hot pixel is 1/12M and invisible.
+        if bayerW <= 3000 {
+            // Defect pixel correction operates on (possibly binned) Bayer data.
+            guard let correctedBayerPass = getOrCreateCorrectedBayerTexture(width: bayerW, height: bayerH),
+                  let encDPC = commandBuffer.makeComputeCommandEncoder() else { completion(nil, nil); return }
+            encDPC.setComputePipelineState(defectPixelPipeline)
+            encDPC.setTexture(bayerIn, index: 0)
+            encDPC.setTexture(correctedBayerPass, index: 1)
+            var debayerParams = DebayerParams(
+                bayerPattern: bayerPattern,
+                blackLevel: blackLevel,
+                whiteLevel: max(whiteLevel, blackLevel + 1e-6),
+                lscCoefficients: lscCoefficients
+            )
+            var defectNoiseParams = DefectPixelParams(shotCoeff: noiseShotCoeff, readCoeff: noiseReadCoeff)
+            encDPC.setBytes(&debayerParams, length: MemoryLayout<DebayerParams>.stride, index: 0)
+            encDPC.setBytes(&defectNoiseParams, length: MemoryLayout<DefectPixelParams>.stride, index: 1)
+            dispatch(encDPC, width: bayerW, height: bayerH, state: defectPixelPipeline)
+            encDPC.endEncoding()
+            bayerIn = correctedBayerPass
         }
 
         // ── Linear+Temporal Denoising Pipeline ──
@@ -514,7 +538,7 @@ final class MetalPipeline: @unchecked Sendable {
               let chromaRawOut = getOrCreateChromaRawTexture(width: chromaW, height: chromaH),
               let chromaDenoisedOut = getOrCreateChromaDenoisedTexture(width: chromaW, height: chromaH),
               let chromaMergedOut = getOrCreateChromaMergedTexture(width: bayerW, height: bayerH),
-              let fusedOut = getOrCreateFusedTexture(width: bayerW, height: bayerH) else { completion(nil); return }
+              let fusedOut = getOrCreateFusedTexture(width: bayerW, height: bayerH) else { completion(nil, nil); return }
 
         // Ensure temporal ring buffers exist at the correct per-channel resolutions.
         ensureTemporalRing(lumaW: bayerW, lumaH: bayerH, chromaW: chromaW, chromaH: chromaH)
@@ -618,9 +642,8 @@ final class MetalPipeline: @unchecked Sendable {
 
         // Pass 5: Temporal Denoise — N-slot ring buffer weighted average.
         let temporalOut = linearOut
-        // In previewFast mode, skip temporal if ring has fewer than 2 valid slots.
-        let doTemporal = temporalRingValidCount > 0 &&
-            (processingQuality == .recordQuality || temporalRingValidCount >= 2)
+        // Require at least two valid history frames before temporal blending.
+        let doTemporal = temporalRingValidCount > 1
         if doTemporal {
             // Estimate global motion metric.
             if let enc = commandBuffer.makeComputeCommandEncoder() {
@@ -680,29 +703,31 @@ final class MetalPipeline: @unchecked Sendable {
             )
             blit.endEncoding()
         } else {
-            completion(nil); return
+            completion(nil, nil); return
         }
 
-        // Push current frame into ring buffer (luma at full-res via blit, chroma already stored above).
-        // Use the pre-temporal source so luma and chroma history reference the same input frame.
+        // Push luma history into ring buffer via compute kernel (RGB→Y conversion).
         if let lumaArr = lumaHistoryArray,
-           let blit = commandBuffer.makeBlitCommandEncoder() {
-            blit.copy(
-                from: chromaMergedOut,
-                sourceSlice: 0, sourceLevel: 0,
-                sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
-                sourceSize: MTLSize(width: bayerW, height: bayerH, depth: 1),
-                to: lumaArr,
-                destinationSlice: temporalRingCursor, destinationLevel: 0,
-                destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0)
-            )
-            blit.endEncoding()
+           let enc = commandBuffer.makeComputeCommandEncoder() {
+            enc.setComputePipelineState(storeLumaHistoryPipeline)
+            enc.setTexture(chromaMergedOut, index: 0)
+            enc.setTexture(lumaArr, index: 1)
+            var scParams = StoreChromaParams(slice: Int32(temporalRingCursor))
+            enc.setBytes(&scParams, length: MemoryLayout<StoreChromaParams>.stride, index: 0)
+            dispatch(enc, width: bayerW, height: bayerH, state: storeLumaHistoryPipeline)
+            enc.endEncoding()
             temporalRingCursor = (temporalRingCursor + 1) % temporalRingCapacity
             if temporalRingValidCount < temporalRingCapacity {
                 temporalRingValidCount += 1
             }
         } else {
-            completion(nil); return
+            completion(nil, nil); return
+        }
+
+        // Allocate BGRA pixel buffer for writing inside main CB.
+        var bgraOut: CVPixelBuffer?
+        if encodeAsBGRA {
+            bgraOut = getOrCreatePixelBuffer(width: encodeWidth, height: encodeHeight)
         }
 
         // Pass 6: Log OETF
@@ -718,6 +743,14 @@ final class MetalPipeline: @unchecked Sendable {
             enc.endEncoding()
         }
 
+        if let bgraPB = bgraOut, let texCache = textureCache {
+            var cvTexOut: CVMetalTexture?
+            CVMetalTextureCacheCreateTextureFromImage(nil, texCache, bgraPB, nil, .bgra8Unorm, encodeWidth, encodeHeight, 0, &cvTexOut)
+            if let cvTex = cvTexOut, let bgraTex = CVMetalTextureGetTexture(cvTex) {
+                scaler.encode(commandBuffer: commandBuffer, sourceTexture: fusedOut, destinationTexture: bgraTex)
+            }
+        }
+
         let finalTex = cropToAspectAndScale(fusedOut, targetWidth: encodeWidth, targetHeight: encodeHeight, cb: commandBuffer) ?? fusedOut
 
         commandBuffer.addCompletedHandler { _ in
@@ -725,7 +758,7 @@ final class MetalPipeline: @unchecked Sendable {
             let ms = (CACurrentMediaTime() - t0) * 1000.0
             print("[MetalPipeline] frame time: \(String(format: "%.2f", ms)) ms")
 #endif
-            completion(finalTex)
+            completion(finalTex, bgraOut)
         }
         commandBuffer.commit()
     }
