@@ -209,26 +209,6 @@ final class VideoWriter {
         return wroteAny
     }
 
-    /// Pad to full wall-clock duration at target FPS so file length matches shoot time.
-    private func padToWallClockLocked() {
-        guard hasStartedSession,
-              let hold = lastPixelBuffer,
-              let adaptor = pixelBufferAdaptor,
-              let input = videoInput else { return }
-
-        let elapsed = max(0, CACurrentMediaTime() - startHostTime)
-        // Round to nearest frame so 10.0s @ 24 → exactly 240 frames
-        let targetCount = Int64((elapsed * targetFPS).rounded())
-        while frameCount < targetCount {
-            guard input.isReadyForMoreMediaData else { break }
-            if writeCFR(hold, index: frameCount, adaptor: adaptor) {
-                frameCount += 1
-            } else {
-                break
-            }
-        }
-    }
-
     private func writeCFR(
         _ pixelBuffer: CVPixelBuffer,
         index: Int64,
@@ -293,7 +273,8 @@ final class VideoWriter {
             return
         }
 
-        padToWallClockLocked()
+        // Skip padToWallClockLocked: synchronous hold-frame padding blocked stopRecording().
+        // Real frames are already written; extra padding is not needed for playback or Photos compatibility.
 
         let url = assetWriter?.outputURL
         isRecording = false
