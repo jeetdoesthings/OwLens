@@ -25,6 +25,14 @@ final class VideoWriter {
     var isRecording = false
     private(set) var droppedFrames: Int = 0
 
+    /// Whether the writer is ready to accept a new frame without backpressure dropping.
+    /// Check before queuing BGRA conversion + append.
+    var isReady: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return isRecording && (videoInput?.isReadyForMoreMediaData ?? false)
+    }
+
     func start(
         outputURL: URL,
         width: Int,

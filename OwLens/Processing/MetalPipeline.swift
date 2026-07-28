@@ -48,18 +48,9 @@ struct LSCParams {
     var azimuthG: Float
     var azimuthB: Float
 }
-struct BilateralParams {
-    var iso: Float
-}
 struct DenoiseParams {
     var iso: Float
     var radius: Int32
-    var shotCoeff: Float
-    var readCoeff: Float
-}
-struct TemporalParams {
-    var iso: Float
-    var maxBlend: Float
     var shotCoeff: Float
     var readCoeff: Float
 }
