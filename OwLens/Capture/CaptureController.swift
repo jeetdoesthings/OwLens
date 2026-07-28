@@ -839,8 +839,8 @@ final class CaptureController: NSObject, ObservableObject {
             // Only start the new timer if the session is running and enough time
             // has passed since the last capture start (avoids firing during config).
             guard self.session.isRunning else { return }
-            // Small delay before restarting to ensure any in-flight capture completes.
-            let deadline = DispatchTime.now() + DispatchTimeInterval.milliseconds(Int(100))
+            // Restart timer immediately; session.isRunning guard prevents firing during teardown.
+            let deadline = DispatchTime.now()
             self.captureQueue.asyncAfter(deadline: deadline) { [weak self] in
                 guard let self, self.session.isRunning else { return }
                 self.startFrameTimer(fps: clamped)
