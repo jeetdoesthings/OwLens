@@ -72,7 +72,7 @@ struct RootView: View {
                             ScopesOverlay(data: viewModel.scopeData)
                                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomTrailing)
                                 .padding(.trailing, 16)
-                                .padding(.bottom, 100)
+                                .padding(.bottom, 4)
                                 .allowsHitTesting(false)
                         }
 
