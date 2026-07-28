@@ -17,9 +17,12 @@ struct CameraPreviewView: UIViewRepresentable {
         mtkView.delegate = context.coordinator
         mtkView.framebufferOnly = true
         mtkView.colorPixelFormat = .bgra8Unorm
-        // Draw only when SwiftUI calls setNeedsDisplay via updateUIView, not on a timer.
-        mtkView.enableSetNeedsDisplay = true
-        mtkView.isPaused = true
+        // Run the display link at a fixed rate so draw(in:) is called reliably, even when
+        // SwiftUI's binding diff can't detect MTLTexture identity changes (pooled textures).
+        // The lastDrawnTexture guard below skips redundant draws when nothing changed.
+        mtkView.enableSetNeedsDisplay = false
+        mtkView.isPaused = false
+        mtkView.preferredFramesPerSecond = 30
         mtkView.autoResizeDrawable = true
         mtkView.clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: overlayOnly ? 0 : 1)
         mtkView.backgroundColor = overlayOnly ? .clear : .black
@@ -33,6 +36,8 @@ struct CameraPreviewView: UIViewRepresentable {
     }
  
     func updateUIView(_ uiView: MTKView, context: Context) {
+        // Propagate latest texture to the coordinator — the display link ticks at 30 Hz
+        // so draw(in:) picks it up naturally within ~33 ms of the change.
         context.coordinator.currentTexture = currentTexture
         context.coordinator.showClipping = showClipping
         context.coordinator.showFocusPeaking = showFocusPeaking
@@ -42,10 +47,8 @@ struct CameraPreviewView: UIViewRepresentable {
         uiView.isOpaque = !overlayOnly
         uiView.layer.isOpaque = !overlayOnly
         (uiView.layer as? CAMetalLayer)?.isOpaque = !overlayOnly
-        // Request a redraw only when SwiftUI updates this view (typically because
-        // currentTexture changed). This avoids the previous 60 Hz timer-driven redraw
-        // that wasted GPU time re-rendering the same frame.
-        uiView.setNeedsDisplay()
+        // No need for setNeedsDisplay: the display link runs continuously and draw(in:)
+        // uses the lastDrawnTexture guard to skip redundant work.
     }
  
     func makeCoordinator() -> Coordinator {
@@ -58,6 +61,10 @@ struct CameraPreviewView: UIViewRepresentable {
         var showClipping: Bool = false
         var showFocusPeaking: Bool = false
         var overlayOnly: Bool = false
+        /// Tracks the last texture we rendered so we can skip redundant draws when the
+        /// display link ticks faster than new frames arrive or when the same pooled
+        /// texture object is reused.
+        private var lastDrawnTexture: MTLTexture?
         private let renderCommandQueue: MTLCommandQueue?
         private let renderPipeline: MTLRenderPipelineState?
  
@@ -85,6 +92,12 @@ struct CameraPreviewView: UIViewRepresentable {
         func draw(in view: MTKView) {
             // Skip Metal when app not active (avoids IOGPU background permission error)
             if UIApplication.shared.applicationState != .active {
+                lastDrawnTexture = nil
+                return
+            }
+            // Same texture as last draw — nothing new to render. The display link ticks
+            // at 30 fps but frames arrive at ~24 fps, so we skip ~6 draws per second.
+            if let currentTexture, let lastDrawnTexture, currentTexture === lastDrawnTexture {
                 return
             }
             guard let drawable = view.currentDrawable,
@@ -178,6 +191,7 @@ struct CameraPreviewView: UIViewRepresentable {
  
             commandBuffer.present(drawable)
             commandBuffer.commit()
+            lastDrawnTexture = currentTexture
         }
     }
 }

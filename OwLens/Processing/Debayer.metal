@@ -74,9 +74,11 @@ kernel void correctDefectPixelsBayer(
     }
     float median = neighbors[count / 2];
 
-    float signalNorm = center / params.whiteLevel;
+    float signalNorm = saturate(center / params.whiteLevel);
     float sigmaRaw = sqrt(noise.shotCoeff * signalNorm + noise.readCoeff) * params.whiteLevel;
-    float threshold = 5.0 * max(sigmaRaw, 1.0);
+    // sigmaRaw is in normalized [0,1] space (whiteLevel scales it). The old floor of
+    // 1.0 assumed raw 16-bit units — it was way too high for normalized data.
+    float threshold = 5.0 * max(sigmaRaw, 1e-3);
 
     float out = (abs(center - median) > threshold) ? median : center;
     dst.write(float4(out, 0.0, 0.0, 1.0), gid);
