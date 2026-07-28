@@ -839,32 +839,21 @@ final class CaptureController: NSObject, ObservableObject {
     }
 
     /// Switch capture pipeline to recording mode (tighter settings) or back to preview.
-    /// Recording mode reduces in-flight captures and disables burst helpers to minimize
-    /// per-frame latency and dropped frames.
+    /// Recording mode reduces in-flight captures to minimize per-frame latency.
     func setRecordingMode(_ recording: Bool) {
+        // Must happen on the calling thread (main), not capture queue, because
+        // AVCapturePhotoOutput properties are not thread-safe and setting them
+        // from a background queue can deadlock AVFoundation internals.
+        isRecordingMode = recording
+        if recording {
+            maxInFlight = 1
+        } else {
+            maxInFlight = 3
+        }
+        // Restart timer with new settings on the capture queue.
         captureQueue.async { [weak self] in
-            guard let self else { return }
-            self.isRecordingMode = recording
-            if recording {
-                self.maxInFlight = 1
-                // Disable burst helpers that add latency during recording.
-                if self.photoOutput.isZeroShutterLagSupported {
-                    self.photoOutput.isZeroShutterLagEnabled = false
-                }
-                if self.photoOutput.isResponsiveCaptureSupported {
-                    self.photoOutput.isResponsiveCaptureEnabled = false
-                }
-                if self.photoOutput.isFastCapturePrioritizationSupported {
-                    self.photoOutput.isFastCapturePrioritizationEnabled = false
-                }
-            } else {
-                self.maxInFlight = 3
-                self.enableBurstHelpersIfSafe()
-            }
-            // Restart timer with new settings (poll rate adapts via captureOneRawFrame).
-            if self.session.isRunning {
-                self.startFrameTimer(fps: self.targetFPS)
-            }
+            guard let self, self.session.isRunning else { return }
+            self.startFrameTimer(fps: self.targetFPS)
         }
     }
 
