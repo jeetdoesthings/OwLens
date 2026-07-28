@@ -79,6 +79,13 @@ struct StoreChromaParams {
     var slice: Int32
 }
 
+enum ProcessingQuality {
+    /// Lower latency, skips expensive passes. Used for preview when not recording.
+    case previewFast
+    /// Full quality. Used when recording or when user explicitly wants highest quality.
+    case recordQuality
+}
+
 /// Metal pipeline: Bayer → (optional CFA-safe phase-preserving 2× reduce) → linear debayer/WB
 /// → full-res luma denoise + half-res chroma denoise → temporal denoise → log OETF.
 ///
@@ -187,6 +194,8 @@ final class MetalPipeline: @unchecked Sendable {
     var noiseShotCoeff: Float = 0.012
     var noiseReadCoeff: Float = 0.0004
     var isAutoWBEnabled: Bool = true
+    /// Quality mode for the next process() call. Set before calling process().
+    var processingQuality: ProcessingQuality = .previewFast
 
     init?() {
         guard let device = MTLCreateSystemDefaultDevice(),
@@ -539,8 +548,8 @@ final class MetalPipeline: @unchecked Sendable {
             enc.endEncoding()
         }
 
-        // Pass 1.5: Per-pixel local-sigma guide. Skipped at 4K to meet frame-time budget.
-        let useLocalSigma = bayerW < 3000
+        // Pass 1.5: Per-pixel local-sigma guide. Skipped at 4K OR in previewFast mode.
+        let useLocalSigma = processingQuality == .recordQuality && bayerW < 3000
         let lumaStatsTex: MTLTexture? = useLocalSigma
             ? getOrCreateLumaStatsTexture(width: bayerW, height: bayerH)
             : dummyStatsTex
@@ -553,6 +562,9 @@ final class MetalPipeline: @unchecked Sendable {
             enc.endEncoding()
         }
 
+        // Pre-compute denoise radius (shared between luma and chroma denoise passes).
+        let denoiseRadius: Int32 = (processingQuality == .previewFast) ? 2 : (iso > 200 ? 3 : 2)
+
         // Pass 2: Spatial denoise full-res luma in linear space.
         if let enc = commandBuffer.makeComputeCommandEncoder() {
             enc.setComputePipelineState(denoisePipeline)
@@ -560,8 +572,7 @@ final class MetalPipeline: @unchecked Sendable {
             enc.setTexture(denoisedOut, index: 1)
             enc.setTexture(lumaStatsTex, index: 2)
 
-            let radius: Int32 = iso > 200 ? 3 : 2
-            var dParams = DenoiseParams(iso: iso, radius: radius, shotCoeff: noiseShotCoeff, readCoeff: noiseReadCoeff)
+            var dParams = DenoiseParams(iso: iso, radius: denoiseRadius, shotCoeff: noiseShotCoeff, readCoeff: noiseReadCoeff)
             enc.setBytes(&dParams, length: MemoryLayout<DenoiseParams>.stride, index: 0)
 
             dispatch(enc, width: bayerW, height: bayerH, state: denoisePipeline)
@@ -584,7 +595,7 @@ final class MetalPipeline: @unchecked Sendable {
             enc.setTexture(linearOut, index: 1)
             enc.setTexture(chromaDenoisedOut, index: 2)
             enc.setTexture(lumaStatsTex, index: 3)
-            var dParams = DenoiseParams(iso: iso, radius: iso > 200 ? 3 : 2, shotCoeff: noiseShotCoeff, readCoeff: noiseReadCoeff)
+            var dParams = DenoiseParams(iso: iso, radius: denoiseRadius, shotCoeff: noiseShotCoeff, readCoeff: noiseReadCoeff)
             enc.setBytes(&dParams, length: MemoryLayout<DenoiseParams>.stride, index: 0)
             dispatch(enc, width: chromaW, height: chromaH, state: denoiseChromaPipeline)
             enc.endEncoding()
@@ -600,8 +611,9 @@ final class MetalPipeline: @unchecked Sendable {
             enc.endEncoding()
         }
 
-        // Store half-res chroma history for the temporal chroma ring (Item 1 resolution split).
-        if let chromaArr = chromaHistoryArray {
+        // Store half-res chroma history for the temporal chroma ring.
+        // Skipped in previewFast mode to save bandwidth.
+        if processingQuality == .recordQuality, let chromaArr = chromaHistoryArray {
             if let enc = commandBuffer.makeComputeCommandEncoder() {
                 enc.setComputePipelineState(storeChromaHistoryPipeline)
                 enc.setTexture(chromaMergedOut, index: 0)
@@ -614,10 +626,11 @@ final class MetalPipeline: @unchecked Sendable {
         }
 
         // Pass 5: Temporal Denoise — N-slot ring buffer weighted average.
-        // First estimate global frame motion so the temporal kernel can skip blending
-        // when the camera/scene is moving, avoiding ghost trails.
         let temporalOut = linearOut
-        if temporalRingValidCount > 0 {
+        // In previewFast mode, skip temporal if ring has fewer than 2 valid slots.
+        let doTemporal = temporalRingValidCount > 0 &&
+            (processingQuality == .recordQuality || temporalRingValidCount >= 2)
+        if doTemporal {
             // Estimate global motion metric.
             if let enc = commandBuffer.makeComputeCommandEncoder() {
                 enc.setComputePipelineState(globalMotionPipeline)
@@ -640,7 +653,6 @@ final class MetalPipeline: @unchecked Sendable {
 
                 let isoClamped = max(iso, 33.0)
                 let isoNorm = min(max((isoClamped - 33.0) / (1600.0 - 33.0), 0.0), 1.0)
-                // Reduce ceiling temporal blend so history never dominates the current frame.
                 let maxBlend: Float = 0.15 + 0.20 * isoNorm
                 var ringParams = RingTemporalParams(
                     iso: isoClamped,

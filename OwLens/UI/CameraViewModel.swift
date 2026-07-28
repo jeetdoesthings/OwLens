@@ -1226,6 +1226,8 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
 
         let w = activeEncodeWidth
         let h = activeEncodeHeight
+        // Set quality mode: full quality when recording, preview otherwise.
+        pipeline.processingQuality = isRecordingUnsafe ? .recordQuality : .previewFast
         // Demosaic + WB + luma/chroma denoise + log + crop/scale to encode size.
         pipeline.process(frameData.pixelBuffer, encodeWidth: w, encodeHeight: h) { [weak self] framed in
             defer { completion() }
