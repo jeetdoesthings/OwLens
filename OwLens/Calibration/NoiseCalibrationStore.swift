@@ -11,10 +11,22 @@ final class NoiseCalibrationStore {
     }
 
     struct LensCalibration: Codable {
+        let schemaVersion: Int
         var noiseEntries: [NoiseEntry]
         var lensShading: LSCCoefficients?
         var greenBalance: Float?
         var calibratedAt: Date
+        /// ISO ladder used during capture, for reference.
+        let isoValues: [Float]
+
+        init(noiseEntries: [NoiseEntry], lensShading: LSCCoefficients?, greenBalance: Float?, isoValues: [Float]) {
+            self.schemaVersion = 1
+            self.noiseEntries = noiseEntries
+            self.lensShading = lensShading
+            self.greenBalance = greenBalance
+            self.isoValues = isoValues
+            self.calibratedAt = Date()
+        }
     }
 
     private var store: [String: LensCalibration] = [:]
@@ -33,6 +45,11 @@ final class NoiseCalibrationStore {
 
     func isCalibrated(deviceMachine: String, lensID: String) -> Bool {
         queue.sync { store[key(machine: deviceMachine, lensID: lensID)] != nil }
+    }
+
+    /// Load the full calibration for a device+lens combo.
+    func loadCalibration(deviceMachine: String, lensID: String) -> LensCalibration? {
+        queue.sync { store[key(machine: deviceMachine, lensID: lensID)] }
     }
 
     func noiseCoefficients(forISO iso: Float, deviceMachine: String, lensID: String) -> (shot: Float, read: Float)? {
@@ -54,21 +71,32 @@ final class NoiseCalibrationStore {
         }
     }
 
+    /// Save calibration data. Returns true on success, false on serialization failure.
+    @discardableResult
     func setCalibration(
         noiseEntries: [NoiseEntry],
         lensShading: LSCCoefficients?,
         greenBalance: Float?,
         deviceMachine: String,
-        lensID: String
-    ) {
-        queue.async {
+        lensID: String,
+        isoValues: [Float] = [33, 64, 100, 200, 400, 800]
+    ) -> Bool {
+        queue.sync {
             self.store[self.key(machine: deviceMachine, lensID: lensID)] = LensCalibration(
                 noiseEntries: noiseEntries,
                 lensShading: lensShading,
                 greenBalance: greenBalance,
-                calibratedAt: Date()
+                isoValues: isoValues
             )
-            self.save()
+            return self.save()
+        }
+    }
+
+    /// Remove calibration for a specific device+lens combo.
+    func removeCalibration(deviceMachine: String, lensID: String) {
+        queue.sync {
+            store.removeValue(forKey: key(machine: deviceMachine, lensID: lensID))
+            save()
         }
     }
 
@@ -98,8 +126,15 @@ final class NoiseCalibrationStore {
         store = decoded
     }
 
-    private func save() {
-        guard let data = try? JSONEncoder().encode(store) else { return }
-        try? data.write(to: fileURL, options: .atomic)
+    @discardableResult
+    private func save() -> Bool {
+        guard let data = try? JSONEncoder().encode(store) else { return false }
+        do {
+            try data.write(to: fileURL, options: .atomic)
+            return true
+        } catch {
+            print("[NoiseCalibrationStore] Save failed: \(error)")
+            return false
+        }
     }
 }

@@ -64,19 +64,26 @@ final class CalibrationViewModel: ObservableObject {
         var entries: [NoiseCalibrationStore.NoiseEntry] = []
 
         state = .capturing(progress: 0)
+        print("[Calibration] Starting calibration for \(lens.name) machine=\(machine) lensID=\(lensID)")
 
         for (index, iso) in isoValues.enumerated() {
             let progress = Float(index) / Float(isoValues.count)
             await MainActor.run { state = .capturing(progress: progress) }
 
+            print("[Calibration] Capturing \(framesPerISO) frames at ISO \(iso)...")
             let frames = await provider.captureFrames(iso: iso, count: framesPerISO)
+            print("[Calibration] ISO \(iso): got \(frames.count)/\(framesPerISO) frames")
+
             guard frames.count >= framesPerISO / 2 else {
-                await MainActor.run { state = .failed("Failed to capture frames at ISO \(Int(iso))") }
+                let msg = "Failed to capture frames at ISO \(Int(iso)) (got \(frames.count)/\(framesPerISO))"
+                print("[Calibration] \(msg)")
+                await MainActor.run { state = .failed(msg) }
                 return
             }
 
             let stats = computeNoiseStats(frames: frames)
             entries.append(NoiseCalibrationStore.NoiseEntry(iso: iso, shot: stats.shot, read: stats.read))
+            print("[Calibration] ISO \(iso): shot=\(String(format: "%.5f", stats.shot)) read=\(String(format: "%.6f", stats.read))")
         }
 
         await MainActor.run { state = .processing }
@@ -84,14 +91,16 @@ final class CalibrationViewModel: ObservableObject {
         // Flat-field frame for LSC and green balance.
         let flatFrames = await provider.captureFrames(iso: 100, count: 1)
         let (lsc, greenBalance) = computeFlatField(from: flatFrames.first)
+        print("[Calibration] Flat field: lsc=\(lsc != nil ? "yes" : "no") greenBalance=\(String(format: "%.4f", greenBalance ?? 1.0))")
 
-        NoiseCalibrationStore.shared.setCalibration(
+        let saved = NoiseCalibrationStore.shared.setCalibration(
             noiseEntries: entries,
             lensShading: lsc,
             greenBalance: greenBalance,
             deviceMachine: machine,
             lensID: lensID
         )
+        print("[Calibration] Save result: \(saved ? "saved" : "FAILED")")
 
         await MainActor.run { state = .done }
     }

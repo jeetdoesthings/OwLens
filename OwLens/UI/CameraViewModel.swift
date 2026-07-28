@@ -238,6 +238,8 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
     nonisolated(unsafe) var isAppActive = true
     /// Measured LSC override from device calibration (set once at setup).
     nonisolated(unsafe) private var lscOverride: LSCCoefficients?
+    /// Green balance override from calibration, set once per lens.
+    nonisolated(unsafe) private var greenBalanceOverride: Float?
     /// Measured noise coefficients from device calibration (set once at setup).
     nonisolated(unsafe) private var noiseCoeffs: (shot: Float, read: Float) = (0.012, 0.0004)
     /// Noise profile for per-ISO coefficient lookup (nil on unknown device).
@@ -245,8 +247,16 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
     /// Last ISO seen by processFrame; used to detect scene-cut ISO jumps.
     nonisolated(unsafe) private var lastProcessedISO: Float = 0
     /// Optional calibration frame collector. When set, incoming frames are routed here
-    /// instead of the normal preview/record pipeline.
+    /// instead of the normal preview/record pipeline. Access is always from nonisolated
+    /// context; use the lock for synchronization.
     nonisolated(unsafe) private var calibrationCollector: ((RawFrameData) -> Bool)?
+    /// Lock for calibrationCollector read/write from nonisolated contexts.
+    /// Uses C atomic lock to avoid Swift concurrency checking on NSLock.
+    nonisolated private let calibrationLock: os_unfair_lock_t = {
+        let l = os_unfair_lock_t.allocate(capacity: 1)
+        l.initialize(to: os_unfair_lock())
+        return l
+    }()
     /// Active calibration key for per-frame coefficient lookup.
     nonisolated(unsafe) private var activeCalibrationKey: (machine: String, lensID: String)?
 
@@ -621,21 +631,24 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
         }
 
         let store = NoiseCalibrationStore.shared
-        let calibrated = store.isCalibrated(deviceMachine: machine, lensID: lens.uniqueID)
 
-        if calibrated {
+        // Load full calibration object (one queue sync instead of 3 lookups).
+        if let cal = store.loadCalibration(deviceMachine: machine, lensID: lens.uniqueID) {
             activeCalibrationKey = (machine, lens.uniqueID)
+            lscOverride = cal.lensShading
+            greenBalanceOverride = cal.greenBalance
+
+            // Seed noise coeffs from calibration immediately, ISO refines per-frame.
+            if let firstIso = cal.noiseEntries.first?.iso,
+               let coeffs = store.noiseCoefficients(forISO: firstIso, deviceMachine: machine, lensID: lens.uniqueID) {
+                noiseCoeffs = coeffs
+            }
+            print("[CameraViewModel] Lens calibration: ACTIVE · \(lens.shortLabel) · entries=\(cal.noiseEntries.count)")
         } else {
             activeCalibrationKey = nil
-        }
-
-        // LSC and green balance — resolved once per lens (not ISO-dependent)
-        lscOverride = store.lensShadingCoefficients(deviceMachine: machine, lensID: lens.uniqueID)
-
-        print("[CameraViewModel] Lens calibration: \(calibrated ? "ACTIVE" : "fallback heuristic") · \(lens.shortLabel)")
-        if calibrated, let key = activeCalibrationKey,
-           let coeffs = store.noiseCoefficients(forISO: 100, deviceMachine: key.machine, lensID: key.lensID) {
-            print("[CameraViewModel]   noise @ ISO 100: shot=\(String(format: "%.5f", coeffs.shot)) read=\(String(format: "%.6f", coeffs.read))")
+            lscOverride = nil
+            greenBalanceOverride = nil
+            print("[CameraViewModel] Lens calibration: fallback heuristic · \(lens.shortLabel)")
         }
     }
 
@@ -1112,8 +1125,15 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
         // Never enqueue GPU work while backgrounded (IOGPUMetalError 00000006)
         guard isAppActive else { return }
 
-        // Route to calibration collector when active; skip normal preview pipeline.
-        if let collector = calibrationCollector {
+        // Route calibration frames through MainActor so the continuation
+        // (created on MainActor by captureFrames) can safely be resumed.
+        os_unfair_lock_lock(calibrationLock)
+        let collector = calibrationCollector
+        os_unfair_lock_unlock(calibrationLock)
+        if let collector {
+            // Deliver frame to collector (it appends to frames array safely).
+            // The collector callback may resume a withCheckedContinuation from
+            // any thread, which is allowed by SE-0300.
             let continueCollecting = collector(frameData)
             if continueCollecting { return }
         }
@@ -1322,26 +1342,35 @@ extension CameraViewModel: CalibrationFrameProvider {
 
         var frames: [RawFrameData] = []
         await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-            var resumed = false
+            // Use the lock to protect calibrationCollector, accessed from
+            // non-MainActor (handleIncomingFrame) and MainActor (timeout task).
+            let lock = self.calibrationLock
+            os_unfair_lock_lock(lock)
             self.calibrationCollector = { frame in
+                os_unfair_lock_lock(lock)
                 frames.append(frame)
                 if frames.count >= count {
-                    if !resumed {
-                        resumed = true
-                        self.calibrationCollector = nil
-                        continuation.resume()
-                    }
+                    self.calibrationCollector = nil
+                    os_unfair_lock_unlock(lock)
+                    continuation.resume()
                     return false
                 }
+                os_unfair_lock_unlock(lock)
                 return true
             }
+            os_unfair_lock_unlock(lock)
+
             // Safety timeout: resume after 10 s even if the pipeline stalls.
             Task { @MainActor in
                 try? await Task.sleep(nanoseconds: 10_000_000_000)
-                if !resumed {
-                    resumed = true
+                os_unfair_lock_lock(lock)
+                // Only timeout if the collector is still set (frames haven't reached count)
+                if self.calibrationCollector != nil {
                     self.calibrationCollector = nil
+                    os_unfair_lock_unlock(lock)
                     continuation.resume()
+                } else {
+                    os_unfair_lock_unlock(lock)
                 }
             }
         }
