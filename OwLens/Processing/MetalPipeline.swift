@@ -744,7 +744,12 @@ final class MetalPipeline: @unchecked Sendable {
  
         let srcAspect = Float(srcW) / Float(srcH)
         let dstAspect = Float(targetWidth) / Float(targetHeight)
- 
+
+        // Early exit: aspect matches within epsilon → just scale (no crop needed).
+        if abs(srcAspect - dstAspect) < 0.001 {
+            return scale(texture, width: targetWidth, height: targetHeight, cb: cb)
+        }
+
         var cropW = srcW
         var cropH = srcH
         var originX = 0

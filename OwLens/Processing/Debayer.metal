@@ -762,7 +762,8 @@ kernel void estimateGlobalMotion(
 
     const int gridW = 16;
     const int gridH = 12;
-    float sumDiff = 0.0;
+    const int totalTiles = gridW * gridH; // 192
+    float tileDiffs[192];
     int count = 0;
 
     for (int gy = 0; gy < gridH; gy++) {
@@ -772,12 +773,30 @@ kernel void estimateGlobalMotion(
             uint2 coord = uint2(clamp(x, 0, w - 1), clamp(y, 0, h - 1));
             float curY = rgb2yuv(currentRGB.read(coord).rgb).x;
             float histY = rgb2yuv(lumaHistory.read(coord, newestSlot).rgb).x;
-            sumDiff += abs(curY - histY);
+            tileDiffs[count] = abs(curY - histY);
             count++;
         }
     }
 
-    *motionMetric = (count > 0) ? (sumDiff / float(count)) : 0.0;
+    // Find the 75th percentile value (index = count * 3 / 4).
+    // Partial sort: just find the value at the target rank using quickselect.
+    int targetIdx = (count * 3) / 4;
+    if (targetIdx >= count) targetIdx = count - 1;
+    if (targetIdx < 0) targetIdx = 0;
+
+    // Simple insertion sort of just the top-quartile region using partial selection.
+    // Since count is small (192), do a full sort for simplicity.
+    for (int i = 0; i < count - 1; i++) {
+        for (int j = i + 1; j < count; j++) {
+            if (tileDiffs[j] < tileDiffs[i]) {
+                float tmp = tileDiffs[i];
+                tileDiffs[i] = tileDiffs[j];
+                tileDiffs[j] = tmp;
+            }
+        }
+    }
+
+    *motionMetric = (count > 0) ? tileDiffs[targetIdx] : 0.0;
 }
 
 // ──────────────────────────────────────────────────────────────────────
