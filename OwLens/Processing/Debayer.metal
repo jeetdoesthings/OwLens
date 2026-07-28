@@ -687,7 +687,7 @@ kernel void temporalDenoiseRing(
         uint2 lumaCoord = uint2(
             clamp(int(gid.x), 0, lumaW - 1),
             clamp(int(gid.y), 0, lumaH - 1));
-        float3 lumaYUV = rgb2yuv(lumaHistory.read(lumaCoord, slot).rgb);
+        float histY = lumaHistory.read(lumaCoord, slot).r;
 
         // Chroma history at half resolution — map full-res thread coords to half-res.
         // The chroma ring stores half-resolution UV produced by averaging 2x2 full-res blocks.
@@ -695,7 +695,7 @@ kernel void temporalDenoiseRing(
             min(uint(gid.x) / 2u, uint(params.chromaW - 1)),
             min(uint(gid.y) / 2u, uint(params.chromaH - 1)));
         float2 chromaUV = chromaHistory.read(chromaCoord, slot).rg;
-        float3 histYUV = float3(lumaYUV.x, chromaUV.x, chromaUV.y);
+        float3 histYUV = float3(histY, chromaUV.x, chromaUV.y);
 
         float lumaDiff   = abs(currentYUV.x - histYUV.x);
         float chromaDiff = length(currentYUV.yz - histYUV.yz);
@@ -709,7 +709,7 @@ kernel void temporalDenoiseRing(
         float slotWeight = params.maxBlend * (1.0 - motion) * recency;
         // Hard motion gate: stop blending history when per-pixel motion is moderate.
         // Lower threshold (0.3 vs old 0.5) prevents ghost trails from moving edges.
-        if (motion > 0.3) {
+        if (motion > 0.25) {
             slotWeight = 0.0;
         }
         slotWeight = clamp(slotWeight, 0.0, 0.95);
@@ -754,8 +754,8 @@ kernel void estimateGlobalMotion(
 
     int newestSlot = (cursor - 1 + slotCount) % slotCount;
 
-    const int gridW = 16;
-    const int gridH = 12;
+    const int gridW = 32;
+    const int gridH = 24;
     float sumDiff = 0.0;
     int count = 0;
 
@@ -815,4 +815,16 @@ kernel void storeChromaHistory(
 
     float2 uv = (count > 0.0) ? (sumUV / count) : float2(0.5);
     halfResUVArray.write(float4(uv.x, uv.y, 0.0, 1.0), gid, params.slice);
+}
+
+kernel void storeLumaHistory(
+    texture2d<float, access::read>  fullResRGB [[texture(0)]],
+    texture2d_array<float, access::write> lumaArray [[texture(1)]],
+    constant StoreChromaParams &params [[buffer(0)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    if (gid.x >= lumaArray.get_width() || gid.y >= lumaArray.get_height()) return;
+    float4 px = fullResRGB.read(gid);
+    float y = dot(px.rgb, float3(0.2126, 0.7152, 0.0722));
+    lumaArray.write(float4(y, 0.0, 0.0, 1.0), gid, params.slice);
 }
