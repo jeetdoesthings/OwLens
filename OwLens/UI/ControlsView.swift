@@ -878,6 +878,8 @@ struct ControlsView: View {
                             .frame(width: 57, height: 57)
                     }
                 }
+                .frame(width: 74, height: 74)
+                .contentShape(Circle())
             }
             .buttonStyle(.plain)
             .disabled(

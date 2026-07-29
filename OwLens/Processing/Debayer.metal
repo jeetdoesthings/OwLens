@@ -408,6 +408,14 @@ kernel void spatialDenoise(
         sigmaRef = 0.012 * isoScale;  // legacy hardcoded proxy
     }
     float luma01 = saturate(centerYUV.x);
+    // At base ISO (~33-50) the read noise is below 14-bit quantization.
+    // Skipping the bilateral filter entirely preserves edge detail while
+    // adding no visible noise — the sensor is already clean enough.
+    if (sigmaRef < 0.005) {
+        outTexture.write(float4(centerRGB, centerPx.a), gid);
+        return;
+    }
+
     // Per-pixel local-sigma guide: stronger denoise where local variance is low,
     // lighter denoise on edges/high-variance regions. Falls back to signal-based
     // shadowBoost at 4K where the stats pass is skipped.
@@ -419,9 +427,10 @@ kernel void spatialDenoise(
         shadowBoost = mix(1.45, 0.8, luma01);
     }
 
-    // Luma: tight sigma — smooth flat-area grain, preserve edges.
-    // Boost sigma by 1.3x to remove more residual grain without losing edges.
-    float lumaRS = sigmaRef * shadowBoost * 1.3;
+    // Luma bilateral radius: sigmaRef * shadowBoost (no fixed boost).
+    // The 1.3x multiplier was removed because it blurred detail at all ISOs
+    // indiscriminately — the shadow boost already handles edge preservation.
+    float lumaRS = sigmaRef * shadowBoost;
     float lumaRS2 = lumaRS * lumaRS;
     
     // Spatial sigma adapts to kernel radius
@@ -525,6 +534,11 @@ kernel void denoiseHalfResChroma(
         chromaSigmaRef = sqrt(params.shotCoeff * 0.5 + params.readCoeff);
     } else {
         chromaSigmaRef = 0.045 * isoScale;
+    }
+    // Skip chroma denoise at base ISO where chroma noise is invisible.
+    if (chromaSigmaRef < 0.005) {
+        outTexture.write(chromaTexture.read(gid), gid);
+        return;
     }
     // Per-pixel local-sigma guide, sampled at the corresponding full-res luma location.
     float shadowBoost;
@@ -707,11 +721,13 @@ kernel void temporalDenoiseRing(
         // i=0 newest gets λ^0 = 1; older slots decay.
         float recency = pow(params.lambda, float(i));
         float slotWeight = params.maxBlend * (1.0 - motion) * recency;
-        // Hard motion gate: stop blending history when per-pixel motion is moderate.
-        // Lower threshold (0.3 vs old 0.5) prevents ghost trails from moving edges.
-        if (motion > 0.25) {
-            slotWeight = 0.0;
-        }
+        // Soft motion gate: smooth taper replaces hard binary cutoff to eliminate
+        // ghosting from threshold-edge content. At motion=0.15 the gate starts
+        // reducing weight, reaching zero by motion=0.35. This replaces the old
+        // motion > 0.25 hard gate which created visible ghosting on pixels that
+        // straddled the threshold between adjacent frames.
+        float motionGate = 1.0 - smoothstep(0.15, 0.35, motion);
+        slotWeight *= motionGate;
         slotWeight = clamp(slotWeight, 0.0, 0.95);
 
         // Reconstruct RGB from luma history Y and chroma history UV
