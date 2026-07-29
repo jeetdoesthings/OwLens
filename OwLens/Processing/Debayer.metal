@@ -15,6 +15,11 @@ struct DebayerParams {
     float4 lscCoefficients;
 };
 
+struct DefectPixelParams {
+    float shotCoeff;
+    float readCoeff;
+};
+
 struct WhiteBalanceParams {
     float3 gains;
     float3x3 colorMatrix;
@@ -32,6 +37,51 @@ static inline float sampleBayerClamp(texture2d<float, access::read> tex, int x, 
     int ny = clamp(y + dy, 0, int(tex.get_height()) - 1);
     float v = tex.read(uint2(nx, ny)).r;
     return linearize(v, black, white);
+}
+
+kernel void correctDefectPixelsBayer(
+    texture2d<float, access::read>  src [[texture(0)]],
+    texture2d<float, access::write> dst [[texture(1)]],
+    constant DebayerParams &params [[buffer(0)]],
+    constant DefectPixelParams &noise [[buffer(1)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    if (gid.x >= dst.get_width() || gid.y >= dst.get_height()) return;
+
+    float center = src.read(gid).r;
+    float neighbors[8];
+    int count = 0;
+
+    for (int dy = -1; dy <= 1; dy++) {
+        for (int dx = -1; dx <= 1; dx++) {
+            if (dx == 0 && dy == 0) continue;
+            int nx = clamp(int(gid.x) + dx, 0, int(src.get_width())  - 1);
+            int ny = clamp(int(gid.y) + dy, 0, int(src.get_height()) - 1);
+            // Only collect same-color Bayer neighbors.
+            if (((nx + ny) & 1) == ((int(gid.x) + int(gid.y)) & 1)) {
+                neighbors[count++] = src.read(uint2(nx, ny)).r;
+            }
+        }
+    }
+
+    // Simple median of up to 8 same-color neighbors.
+    for (int i = 0; i < count - 1; i++) {
+        for (int j = i + 1; j < count; j++) {
+            if (neighbors[j] < neighbors[i]) {
+                float tmp = neighbors[i]; neighbors[i] = neighbors[j]; neighbors[j] = tmp;
+            }
+        }
+    }
+    float median = neighbors[count / 2];
+
+    float signalNorm = saturate(center / params.whiteLevel);
+    float sigmaRaw = sqrt(noise.shotCoeff * signalNorm + noise.readCoeff) * params.whiteLevel;
+    // sigmaRaw is in normalized [0,1] space (whiteLevel scales it). The old floor of
+    // 1.0 assumed raw 16-bit units — it was way too high for normalized data.
+    float threshold = 5.0 * max(sigmaRaw, 1e-3);
+
+    float out = (abs(center - median) > threshold) ? median : center;
+    dst.write(float4(out, 0.0, 0.0, 1.0), gid);
 }
 
 // CFA-preserving half-res bin: out(x,y) = in(2x+(x&1), 2y+(y&1))
@@ -52,94 +102,7 @@ kernel void binBayerCFA(
     dst.write(float4(v, 0.0, 0.0, 1.0), gid);
 }
 
-kernel void debayerBilinear(
-    texture2d<float, access::read> rawTexture [[texture(0)]],
-    texture2d<float, access::write> outTexture [[texture(1)]],
-    constant DebayerParams &params [[buffer(0)]],
-    uint2 gid [[thread_position_in_grid]])
-{
-    if (gid.x >= outTexture.get_width() || gid.y >= outTexture.get_height()) return;
 
-    int x = int(gid.x);
-    int y = int(gid.y);
-
-    bool xEven = (x % 2 == 0);
-    bool yEven = (y % 2 == 0);
-
-    int pattern = params.bayerPattern;
-    if (pattern == 1) { xEven = !xEven; }
-    else if (pattern == 2) { yEven = !yEven; }
-    else if (pattern == 3) { xEven = !xEven; yEven = !yEven; }
-
-    float black = params.blackLevel;
-    float white = params.whiteLevel;
-
-    // ── Directional Demosaic (Malvar-He-Cutler) ──
-    float c00 = sampleBayerClamp(rawTexture, x, y, 0, 0, black, white);
-    float cN1 = sampleBayerClamp(rawTexture, x, y, 0, -1, black, white);
-    float cS1 = sampleBayerClamp(rawTexture, x, y, 0, 1, black, white);
-    float cE1 = sampleBayerClamp(rawTexture, x, y, 1, 0, black, white);
-    float cW1 = sampleBayerClamp(rawTexture, x, y, -1, 0, black, white);
-    
-    float cN2 = sampleBayerClamp(rawTexture, x, y, 0, -2, black, white);
-    float cS2 = sampleBayerClamp(rawTexture, x, y, 0, 2, black, white);
-    float cE2 = sampleBayerClamp(rawTexture, x, y, 2, 0, black, white);
-    float cW2 = sampleBayerClamp(rawTexture, x, y, -2, 0, black, white);
-    
-    float cNE = sampleBayerClamp(rawTexture, x, y, 1, -1, black, white);
-    float cNW = sampleBayerClamp(rawTexture, x, y, -1, -1, black, white);
-    float cSE = sampleBayerClamp(rawTexture, x, y, 1, 1, black, white);
-    float cSW = sampleBayerClamp(rawTexture, x, y, -1, 1, black, white);
-
-    float G_at_RB = (2*(cN1 + cS1 + cE1 + cW1) + 4*c00 - (cN2 + cS2 + cE2 + cW2)) / 8.0;
-    float Color_at_G_H = (4*(cE1 + cW1) + 5*c00 - (cE2 + cW2) - 0.5*(cN2 + cS2) - (cNE + cNW + cSE + cSW)) / 8.0;
-    float Color_at_G_V = (4*(cN1 + cS1) + 5*c00 - (cN2 + cS2) - 0.5*(cE2 + cW2) - (cNE + cNW + cSE + cSW)) / 8.0;
-    float Color_at_Diag = (2*(cNE + cNW + cSE + cSW) + 6*c00 - 1.5*(cN2 + cS2 + cE2 + cW2)) / 8.0;
-
-    float r, g, b;
-    if (yEven && xEven) {
-        r = c00; g = G_at_RB; b = Color_at_Diag;
-    } else if (yEven && !xEven) {
-        r = Color_at_G_H; g = c00; b = Color_at_G_V;
-    } else if (!yEven && xEven) {
-        b = Color_at_G_H; g = c00; r = Color_at_G_V;
-    } else {
-        b = c00; g = G_at_RB; r = Color_at_Diag;
-    }
-    r = max(r, 0.0);
-    g = max(g, 0.0);
-    b = max(b, 0.0);
-
-    // Per-channel Lens Shading Correction (LSC)
-    float2 uv = float2(float(x) + 0.5, float(y) + 0.5) / float2(float(outTexture.get_width()), float(outTexture.get_height()));
-    float2 d = uv - float2(0.5, 0.5);
-    float r2 = dot(d, d);
-    float gainR = 1.0 + params.lscCoefficients[0] * r2;
-    float gainG = 1.0 + ((params.lscCoefficients[1] + params.lscCoefficients[2]) * 0.5) * r2;
-    float gainB = 1.0 + params.lscCoefficients[3] * r2;
-    float3 rgb = float3(r * gainR, g * gainG, b * gainB);
-    rgb = min(rgb, float3(8.0)); // allow headroom pre-log
-
-    outTexture.write(float4(rgb, 1.0), gid);
-}
-
-kernel void applyWhiteBalanceAndColorMatrix(
-    texture2d<float, access::read> inTexture [[texture(0)]],
-    texture2d<float, access::write> outTexture [[texture(1)]],
-    constant WhiteBalanceParams &params [[buffer(0)]],
-    uint2 gid [[thread_position_in_grid]])
-{
-    if (gid.x >= outTexture.get_width() || gid.y >= outTexture.get_height()) return;
-
-    float4 pixel = inTexture.read(gid);
-    float3 rgb = float3(pixel.r, pixel.g, pixel.b);
-
-    rgb *= params.gains;
-    rgb = params.colorMatrix * rgb;
-    rgb = max(rgb, float3(0.0));
-
-    outTexture.write(float4(rgb, 1.0), gid);
-}
 
 static inline float3 encodeLogCurve(float3 rgb, int curveType) {
     if (curveType == 0) {
@@ -159,19 +122,6 @@ static inline float3 encodeLogCurve(float3 rgb, int curveType) {
         }
     }
     return saturate(result);
-}
-
-kernel void applyLogCurve(
-    texture2d<float, access::read> inTexture [[texture(0)]],
-    texture2d<float, access::write> outTexture [[texture(1)]],
-    constant int &curveType [[buffer(0)]],
-    uint2 gid [[thread_position_in_grid]])
-{
-    if (gid.x >= outTexture.get_width() || gid.y >= outTexture.get_height()) return;
-
-    float4 pixel = inTexture.read(gid);
-    float3 result = encodeLogCurve(float3(pixel.r, pixel.g, pixel.b), curveType);
-    outTexture.write(float4(result, pixel.a), gid);
 }
 
 kernel void applyLogOnly(
@@ -199,105 +149,21 @@ struct FusedParams {
     int   curveType;
     float3 wbGains;
     float4 lscCoefficients;
+    float greenBalance;
 };
 
-kernel void debayerWBLog(
-    texture2d<float, access::read>  rawTexture [[texture(0)]],
-    texture2d<float, access::write> outTexture [[texture(1)]],
-    constant FusedParams &params   [[buffer(0)]],
-    uint2 gid [[thread_position_in_grid]])
-{
-    if (gid.x >= outTexture.get_width() || gid.y >= outTexture.get_height()) return;
+struct LSCParams {
+    float radialR;
+    float radialG;
+    float radialB;
+    float radial4R;
+    float radial4G;
+    float radial4B;
+    float azimuthR;
+    float azimuthG;
+    float azimuthB;
+};
 
-    int x = int(gid.x);
-    int y = int(gid.y);
-
-    bool xEven = (x % 2 == 0);
-    bool yEven = (y % 2 == 0);
-
-    int pattern = params.bayerPattern;
-    if (pattern == 1) { xEven = !xEven; }
-    else if (pattern == 2) { yEven = !yEven; }
-    else if (pattern == 3) { xEven = !xEven; yEven = !yEven; }
-
-    float black = params.blackLevel;
-    float white = params.whiteLevel;
-
-    // ── Directional Demosaic (Malvar-He-Cutler) ──
-    float c00 = sampleBayerClamp(rawTexture, x, y, 0, 0, black, white);
-    float cN1 = sampleBayerClamp(rawTexture, x, y, 0, -1, black, white);
-    float cS1 = sampleBayerClamp(rawTexture, x, y, 0, 1, black, white);
-    float cE1 = sampleBayerClamp(rawTexture, x, y, 1, 0, black, white);
-    float cW1 = sampleBayerClamp(rawTexture, x, y, -1, 0, black, white);
-    
-    float cN2 = sampleBayerClamp(rawTexture, x, y, 0, -2, black, white);
-    float cS2 = sampleBayerClamp(rawTexture, x, y, 0, 2, black, white);
-    float cE2 = sampleBayerClamp(rawTexture, x, y, 2, 0, black, white);
-    float cW2 = sampleBayerClamp(rawTexture, x, y, -2, 0, black, white);
-    
-    float cNE = sampleBayerClamp(rawTexture, x, y, 1, -1, black, white);
-    float cNW = sampleBayerClamp(rawTexture, x, y, -1, -1, black, white);
-    float cSE = sampleBayerClamp(rawTexture, x, y, 1, 1, black, white);
-    float cSW = sampleBayerClamp(rawTexture, x, y, -1, 1, black, white);
-
-    float G_at_RB = (2*(cN1 + cS1 + cE1 + cW1) + 4*c00 - (cN2 + cS2 + cE2 + cW2)) / 8.0;
-    float Color_at_G_H = (4*(cE1 + cW1) + 5*c00 - (cE2 + cW2) - 0.5*(cN2 + cS2) - (cNE + cNW + cSE + cSW)) / 8.0;
-    float Color_at_G_V = (4*(cN1 + cS1) + 5*c00 - (cN2 + cS2) - 0.5*(cE2 + cW2) - (cNE + cNW + cSE + cSW)) / 8.0;
-    float Color_at_Diag = (2*(cNE + cNW + cSE + cSW) + 6*c00 - 1.5*(cN2 + cS2 + cE2 + cW2)) / 8.0;
-
-    float r, g, b;
-    if (yEven && xEven) {
-        r = c00; g = G_at_RB; b = Color_at_Diag;
-    } else if (yEven && !xEven) {
-        r = Color_at_G_H; g = c00; b = Color_at_G_V;
-    } else if (!yEven && xEven) {
-        b = Color_at_G_H; g = c00; r = Color_at_G_V;
-    } else {
-        b = c00; g = G_at_RB; r = Color_at_Diag;
-    }
-    
-    r = max(r, 0.0);
-    g = max(g, 0.0);
-    b = max(b, 0.0);
-
-    // Per-channel Lens Shading Correction (LSC)
-    float2 uv = float2(float(x) + 0.5, float(y) + 0.5) / float2(float(outTexture.get_width()), float(outTexture.get_height()));
-    float2 d = uv - float2(0.5, 0.5);
-    float r2 = dot(d, d);
-    float gainR = 1.0 + params.lscCoefficients[0] * r2;
-    float gainG = 1.0 + ((params.lscCoefficients[1] + params.lscCoefficients[2]) * 0.5) * r2;
-    float gainB = 1.0 + params.lscCoefficients[3] * r2;
-    float3 rgb = float3(r * gainR, g * gainG, b * gainB);
-    rgb = min(rgb, float3(8.0));
-
-    // ── White Balance ──
-    rgb *= params.wbGains;
-    rgb = max(rgb, float3(0.0));
-
-    // ── Log curve ──
-    float3 result;
-    int curveType = params.curveType;
-
-    if (curveType == 0) {
-        result = saturate(rgb);
-    } else {
-        // Sony S-Log3
-        float3 clamped = max(rgb, float3(0.0));
-        for (int i = 0; i < 3; i++) {
-            float lin = clamped[i];
-            if (lin >= 0.01125) {
-                result[i] = (420.0 + log10((lin + 0.01) / (0.18 + 0.01)) * 261.5) / 1023.0;
-            } else {
-                result[i] = (lin * (171.2102946929 - 95.0) / 0.01125 + 95.0) / 1023.0;
-            }
-        }
-        result = saturate(result);
-    }
-
-    bool isClipped = (r >= 0.99 || g >= 0.99 || b >= 0.99);
-    float alpha = isClipped ? 0.0 : 1.0;
-    outTexture.write(float4(result, alpha), gid);
-}
 
 // ──────────────────────────────────────────────────────────────────────
 // LINEAR OUTPUT: demosaic + LSC + WB — NO log curve.
@@ -308,6 +174,7 @@ kernel void debayerWBLinear(
     texture2d<float, access::read>  rawTexture [[texture(0)]],
     texture2d<float, access::write> outTexture [[texture(1)]],
     constant FusedParams &params   [[buffer(0)]],
+    constant LSCParams &lsc       [[buffer(1)]],
     uint2 gid [[thread_position_in_grid]])
 {
     if (gid.x >= outTexture.get_width() || gid.y >= outTexture.get_height()) return;
@@ -362,13 +229,20 @@ kernel void debayerWBLinear(
     g = max(g, 0.0);
     b = max(b, 0.0);
 
-    // Per-channel Lens Shading Correction (LSC)
-    float2 uv = float2(float(x) + 0.5, float(y) + 0.5) / float2(float(outTexture.get_width()), float(outTexture.get_height()));
-    float2 d = uv - float2(0.5, 0.5);
-    float r2 = dot(d, d);
-    float gainR = 1.0 + params.lscCoefficients[0] * r2;
-    float gainG = 1.0 + ((params.lscCoefficients[1] + params.lscCoefficients[2]) * 0.5) * r2;
-    float gainB = 1.0 + params.lscCoefficients[3] * r2;
+    // Gr/Gb green balance before LSC/WB.
+    g *= params.greenBalance;
+
+    // Per-channel Lens Shading Correction (LSC): 4-term radial + azimuth model.
+    float outW = float(outTexture.get_width());
+    float outH = float(outTexture.get_height());
+    float2 uv = (float2(float(x) + 0.5, float(y) + 0.5) / float2(outW, outH)) - 0.5;
+    float r2 = dot(uv, uv);
+    float r4 = r2 * r2;
+    float theta = atan2(uv.y, uv.x);
+
+    float gainR = 1.0 + lsc.radialR * r2 + lsc.radial4R * r4 + lsc.azimuthR * cos(2.0 * theta);
+    float gainG = 1.0 + lsc.radialG * r2 + lsc.radial4G * r4 + lsc.azimuthG * cos(2.0 * theta);
+    float gainB = 1.0 + lsc.radialB * r2 + lsc.radial4B * r4 + lsc.azimuthB * cos(2.0 * theta);
     float3 rgb = float3(r * gainR, g * gainG, b * gainB);
     rgb = min(rgb, float3(8.0));
 
@@ -384,19 +258,6 @@ kernel void debayerWBLinear(
     outTexture.write(float4(rgb, alpha), gid);
 }
 
-kernel void applyClippingOverlay(
-    texture2d<float, access::read_write> tex [[texture(0)]],
-    constant int &showClipping [[buffer(0)]],
-    uint2 gid [[thread_position_in_grid]])
-{
-    if (gid.x >= tex.get_width() || gid.y >= tex.get_height()) return;
-    if (showClipping == 0) return;
-    
-    float4 color = tex.read(gid);
-    float isClipped = step(color.a, 0.5);
-    float3 finalColor = mix(color.rgb, float3(1.0, 0.0, 0.0), isClipped);
-    tex.write(float4(finalColor, 1.0), gid);
-}
 
 struct VertexOut {
     float4 position [[position]];
@@ -465,19 +326,19 @@ fragment float4 displayFragment(
 // ──────────────────────────────────────────────────────────────────────
 
 static inline float3 rgb2yuv(float3 rgb) {
-    float y = dot(rgb, float3(0.299, 0.587, 0.114));
-    float u = dot(rgb, float3(-0.1687, -0.3313, 0.5)) + 0.5;
-    float v = dot(rgb, float3(0.5, -0.4187, -0.0813)) + 0.5;
+    float y  = dot(rgb, float3(0.2126, 0.7152, 0.0722));
+    float u  = dot(rgb, float3(-0.1146, -0.3854, 0.5)) + 0.5;
+    float v  = dot(rgb, float3(0.5, -0.4542, -0.0458)) + 0.5;
     return float3(y, u, v);
 }
 
 static inline float3 yuv2rgb(float3 yuv) {
-    float y = yuv.x;
-    float u = yuv.y - 0.5;
-    float v = yuv.z - 0.5;
-    float r = y + 1.402 * v;
-    float g = y - 0.3441 * u - 0.7141 * v;
-    float b = y + 1.772 * u;
+    float y  = yuv.x;
+    float u  = yuv.y - 0.5;
+    float v  = yuv.z - 0.5;
+    float r  = y + 1.5748 * v;
+    float g  = y - 0.1873 * u - 0.4681 * v;
+    float b  = y + 1.8556 * u;
     return float3(r, g, b);
 }
 
@@ -485,72 +346,6 @@ struct BilateralParams {
     float iso;
 };
 
-kernel void chromaBilateral(
-    texture2d<float, access::read> inTexture [[texture(0)]],
-    texture2d<float, access::write> outTexture [[texture(1)]],
-    constant BilateralParams &params [[buffer(0)]],
-    uint2 gid [[thread_position_in_grid]])
-{
-    if (gid.x >= outTexture.get_width() || gid.y >= outTexture.get_height()) return;
-    
-    float3 centerRGB = inTexture.read(gid).rgb;
-    float3 centerYUV = rgb2yuv(centerRGB);
-    
-    float sumLuma = 0.0;
-    float sumLumaWeights = 0.0;
-    float sumChromaWeights = 0.0;
-    float2 sumUV = float2(0.0);
-    
-    // Dynamic ISO-scaled Luma edge threshold
-    float iso = max(params.iso, 33.0);
-    float isoScale = sqrt(iso / 33.0);
-    float chromaRangeSigma = 0.02 * isoScale;
-    float chromaRangeSigma2 = chromaRangeSigma * chromaRangeSigma;
-    float lumaRangeSigma = chromaRangeSigma * 0.45; // tighter than chroma to preserve detail
-    float lumaRangeSigma2 = lumaRangeSigma * lumaRangeSigma;
-    
-    int radius = (iso > 200.0) ? 3 : 2;
-    float maxDist2 = float(radius * radius);
-    float spatialSigma2 = float(radius * radius) * 0.5;
-    
-    int w = inTexture.get_width();
-    int h = inTexture.get_height();
-    int cx = int(gid.x);
-    int cy = int(gid.y);
-    
-    for (int dy = -radius; dy <= radius; dy++) {
-        for (int dx = -radius; dx <= radius; dx++) {
-            float dist2 = dx*dx + dy*dy;
-            if (dist2 > maxDist2) continue; // Skip corners -> makes it a diamond
-            
-            uint2 pid = uint2(clamp(cx + dx, 0, w - 1), clamp(cy + dy, 0, h - 1));
-            float3 yuv = rgb2yuv(inTexture.read(pid).rgb);
-            
-            float spatialWeight = exp(-dist2 / (2.0 * spatialSigma2));
-            
-            float lumaDiff = yuv.x - centerYUV.x;
-            
-            // CROSS-BILATERAL: Use ONLY Luma difference as the edge-stopping function.
-            // If we include chroma difference, the filter refuses to blur massive color noise!
-            float lumaWeight = spatialWeight * exp(-(lumaDiff * lumaDiff) / (2.0 * lumaRangeSigma2));
-            float chromaWeight = spatialWeight * exp(-(lumaDiff * lumaDiff) / (2.0 * chromaRangeSigma2));
-            
-            sumLumaWeights += lumaWeight;
-            sumLuma += yuv.x * lumaWeight;
-            sumChromaWeights += chromaWeight;
-            sumUV += yuv.yz * chromaWeight;
-        }
-    }
-    
-    float finalY = (sumLumaWeights > 0.0001) ? (sumLuma / sumLumaWeights) : centerYUV.x;
-    float2 finalUV = (sumChromaWeights > 0.0001) ? (sumUV / sumChromaWeights) : centerYUV.yz;
-    float3 finalYUV = float3(finalY, finalUV.x, finalUV.y);
-    float3 finalRGB = yuv2rgb(finalYUV); // Spatially denoised current frame
-    
-    
-    float alpha = inTexture.read(gid).a;
-    outTexture.write(float4(finalRGB, alpha), gid);
-}
 
 // ──────────────────────────────────────────────────────────────────────
 // SPATIAL DENOISING (Linear Space)
@@ -568,11 +363,27 @@ struct DenoiseParams {
 struct TemporalParams {
     float iso;
     float maxBlend;
+    float shotCoeff;
+    float readCoeff;
+};
+
+struct RingTemporalParams {
+    float iso;
+    float maxBlend;
+    int   slotCount;
+    int   validSlots;
+    int   chromaW;
+    int   chromaH;
+    int   cursor;
+    float lambda;
+    float shotCoeff;
+    float readCoeff;
 };
 
 kernel void spatialDenoise(
     texture2d<float, access::read>  inTexture [[texture(0)]],
     texture2d<float, access::write> outTexture [[texture(1)]],
+    texture2d<float, access::read>  statsTexture [[texture(2)]],
     constant DenoiseParams &params [[buffer(0)]],
     uint2 gid [[thread_position_in_grid]])
 {
@@ -587,13 +398,30 @@ kernel void spatialDenoise(
     float maxDist2 = float(radius * radius);
     
     // ISO-adaptive sigma values (tuned for linear-space data)
+    // Calibrated path: use measured shot/read coefficients when available.
+    // Fallback: sqrt(iso/33) heuristic.
     float isoScale = sqrt(iso / 33.0);
+    float sigmaRef;  // noise std-dev at mid-gray reference signal (0.5)
+    if (params.shotCoeff > 0.0) {
+        sigmaRef = sqrt(params.shotCoeff * 0.5 + params.readCoeff);
+    } else {
+        sigmaRef = 0.012 * isoScale;  // legacy hardcoded proxy
+    }
     float luma01 = saturate(centerYUV.x);
-    // Shot-noise-aware proxy: push stronger denoise in shadows, lighter in highlights.
-    float shadowBoost = mix(1.45, 0.8, luma01);
-    
-    // Luma: tight sigma — smooth flat-area grain, preserve edges
-    float lumaRS = 0.012 * isoScale * shadowBoost;
+    // Per-pixel local-sigma guide: stronger denoise where local variance is low,
+    // lighter denoise on edges/high-variance regions. Falls back to signal-based
+    // shadowBoost at 4K where the stats pass is skipped.
+    float shadowBoost;
+    if (statsTexture.get_width() > 1) {
+        float localSigma = max(statsTexture.read(gid).y, 1e-4);
+        shadowBoost = clamp(localSigma / sigmaRef, 0.5, 2.0);
+    } else {
+        shadowBoost = mix(1.45, 0.8, luma01);
+    }
+
+    // Luma: tight sigma — smooth flat-area grain, preserve edges.
+    // Boost sigma by 1.3x to remove more residual grain without losing edges.
+    float lumaRS = sigmaRef * shadowBoost * 1.3;
     float lumaRS2 = lumaRS * lumaRS;
     
     // Spatial sigma adapts to kernel radius
@@ -622,11 +450,15 @@ kernel void spatialDenoise(
             float lumaW = spatialW * exp(-(lumaDiff * lumaDiff) / (2.0 * lumaRS2));
             sumLumaW += lumaW;
             sumLuma += sYUV.x * lumaW;
+            // NOTE: Chroma is NOT smoothed here. The dedicated half-res chroma
+            // pipeline (extractHalfResChroma -> denoiseHalfResChroma -> recombine)
+            // handles all chroma denoising. Any chroma work in this pass would
+            // be discarded by the recombine kernel which reads UV exclusively
+            // from chromaDenoisedOut.
         }
     }
     
     float finalY = (sumLumaW > 1e-4) ? (sumLuma / sumLumaW) : centerYUV.x;
-    
     float3 finalRGB = max(yuv2rgb(float3(finalY, centerYUV.y, centerYUV.z)), float3(0.0));
     outTexture.write(float4(finalRGB, centerPx.a), gid);
 }
@@ -663,6 +495,7 @@ kernel void denoiseHalfResChroma(
     texture2d<float, access::read>  chromaTexture [[texture(0)]],
     texture2d<float, access::read>  lumaGuideTexture [[texture(1)]],
     texture2d<float, access::write> outTexture [[texture(2)]],
+    texture2d<float, access::read>  statsTexture [[texture(3)]],
     constant DenoiseParams &params [[buffer(0)]],
     uint2 gid [[thread_position_in_grid]])
 {
@@ -670,7 +503,8 @@ kernel void denoiseHalfResChroma(
 
     float iso = max(params.iso, 33.0);
     float isoScale = sqrt(iso / 33.0);
-    int radius = params.radius;
+    // Use a slightly wider chroma radius because chroma noise is coarser than luma.
+    int radius = params.radius + 1;
     float maxDist2 = float(radius * radius);
     float spatialS2 = float(radius) * float(radius) * 0.5;
 
@@ -685,8 +519,25 @@ kernel void denoiseHalfResChroma(
     int centerGuideY = clamp(cy * 2 + 1, 0, guideH - 1);
     float centerY = rgb2yuv(lumaGuideTexture.read(uint2(centerGuideX, centerGuideY)).rgb).x;
     float luma01 = saturate(centerY);
-    float shadowBoost = mix(1.55, 0.9, luma01);
-    float chromaRS = 0.045 * isoScale * shadowBoost;
+    // Calibrated chroma sigma: use measured coefficients when available.
+    float chromaSigmaRef;
+    if (params.shotCoeff > 0.0) {
+        chromaSigmaRef = sqrt(params.shotCoeff * 0.5 + params.readCoeff);
+    } else {
+        chromaSigmaRef = 0.045 * isoScale;
+    }
+    // Per-pixel local-sigma guide, sampled at the corresponding full-res luma location.
+    float shadowBoost;
+    if (statsTexture.get_width() > 1) {
+        uint2 statsCoord = uint2(
+            min(uint(centerGuideX), uint(statsTexture.get_width())  - 1),
+            min(uint(centerGuideY), uint(statsTexture.get_height()) - 1));
+        float localSigma = max(statsTexture.read(statsCoord).y, 1e-4);
+        shadowBoost = clamp(localSigma / chromaSigmaRef, 0.5, 2.0);
+    } else {
+        shadowBoost = mix(1.55, 0.9, luma01);
+    }
+    float chromaRS = chromaSigmaRef * shadowBoost;
     float chromaRS2 = chromaRS * chromaRS;
 
     float2 sumUV = float2(0.0);
@@ -713,6 +564,30 @@ kernel void denoiseHalfResChroma(
     float2 centerUV = chromaTexture.read(gid).rg;
     float2 finalUV = (sumW > 1e-4) ? (sumUV / sumW) : centerUV;
     outTexture.write(float4(finalUV.x, finalUV.y, 0.0, 1.0), gid);
+}
+
+kernel void estimateLumaVariance(
+    texture2d<float, access::read>  lumaIn   [[texture(0)]],
+    texture2d<float, access::write> statsOut [[texture(1)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    if (gid.x >= statsOut.get_width() || gid.y >= statsOut.get_height()) return;
+
+    float sum = 0.0, sum2 = 0.0, count = 0.0;
+    for (int dy = -1; dy <= 1; dy++) {
+        for (int dx = -1; dx <= 1; dx++) {
+            int sx = clamp(int(gid.x) + dx, 0, int(lumaIn.get_width())  - 1);
+            int sy = clamp(int(gid.y) + dy, 0, int(lumaIn.get_height()) - 1);
+            float y = rgb2yuv(lumaIn.read(uint2(sx, sy)).rgb).x;
+            sum  += y;
+            sum2 += y * y;
+            count += 1.0;
+        }
+    }
+    float mean = sum / count;
+    float variance = max(sum2 / count - mean * mean, 0.0);
+    float sigma = sqrt(variance);
+    statsOut.write(float4(mean, sigma, 0.0, 1.0), gid);
 }
 
 static inline float2 readChromaClamped(texture2d<float, access::read> chromaTexture, int x, int y) {
@@ -749,36 +624,207 @@ kernel void recombineLumaWithHalfResChroma(
     outTexture.write(float4(rgb, lumaPx.a), gid);
 }
 
-kernel void temporalDenoise(
+
+// ──────────────────────────────────────────────────────────────────────
+// TEMPORAL DENOISE — RING BUFFER (N-slot weighted average)
+// texture(0) = current (full-res RGBA)
+// texture(1) = output   (full-res RGBA)
+// texture(2) = lumaHistory   (full-res 2D-array RGBA)
+// texture(3) = chromaHistory  (half-res 2D-array RG16Float)
+// buffer(0) = RingTemporalParams
+// Dispatched at full luma resolution; chroma history is read at half-res coordinates.
+// ──────────────────────────────────────────────────────────────────────
+
+kernel void temporalDenoiseRing(
     texture2d<float, access::read>  currentTexture [[texture(0)]],
-    texture2d<float, access::read>  historyTexture [[texture(1)]],
-    texture2d<float, access::write> outTexture [[texture(2)]],
-    constant TemporalParams &params [[buffer(0)]],
+    texture2d<float, access::write> outTexture     [[texture(1)]],
+    texture2d_array<float, access::read> lumaHistory   [[texture(2)]],
+    texture2d_array<float, access::read> chromaHistory  [[texture(3)]],
+    constant RingTemporalParams &params [[buffer(0)]],
+    device const float* globalMotionMetric [[buffer(1)]],
     uint2 gid [[thread_position_in_grid]])
 {
     if (gid.x >= outTexture.get_width() || gid.y >= outTexture.get_height()) return;
 
     float4 currentPx = currentTexture.read(gid);
-    float4 historyPx = historyTexture.read(gid);
+
+    // If global motion is high, skip temporal blending entirely for this frame.
+    // Threshold 0.02 catches moderate camera pans and partial-frame motion.
+    if (globalMotionMetric != nullptr && *globalMotionMetric > 0.02) {
+        outTexture.write(currentPx, gid);
+        return;
+    }
     float3 currentYUV = rgb2yuv(currentPx.rgb);
-    float3 historyYUV = rgb2yuv(historyPx.rgb);
 
     float iso = max(params.iso, 33.0);
     float isoScale = sqrt(iso / 33.0);
-
     float luma01 = saturate(currentYUV.x);
-    float shadowBoost = mix(1.4, 0.85, luma01);
-    float lumaThreshold = max(0.006 * isoScale * shadowBoost, 1e-5);
-    float chromaThreshold = max(0.010 * isoScale * shadowBoost, 1e-5);
+    // Tighten the shadow/highlight boost so the motion threshold is smaller; small
+    // frame-to-frame differences then register as motion and do not get averaged.
+    float shadowBoost = mix(1.0, 0.65, luma01);
 
-    float lumaDiff = abs(currentYUV.x - historyYUV.x);
-    float chromaDiff = length(currentYUV.yz - historyYUV.yz);
+    float sigmaRef = (params.shotCoeff > 0.0)
+        ? sqrt(params.shotCoeff * 0.5 + params.readCoeff)
+        : 0.01 * isoScale;
+    // Tighten motion thresholds so small frame-to-frame differences register as motion
+    // and do not get averaged into ghost trails.
+    float lumaThreshold   = max(sigmaRef * shadowBoost, 1e-5);
+    float chromaThreshold = max(sigmaRef * 1.5 * shadowBoost, 1e-5);
 
-    float lumaMotion = saturate(lumaDiff / lumaThreshold);
-    float chromaMotion = saturate(chromaDiff / chromaThreshold);
-    float motion = max(lumaMotion, chromaMotion);
+    float totalWeight = 1.0;
+    float3 weightedRGB = currentPx.rgb;
 
-    float historyBlend = clamp(params.maxBlend * (1.0 - motion), 0.0, 0.95);
-    float3 mixedRGB = mix(currentPx.rgb, historyPx.rgb, historyBlend);
-    outTexture.write(float4(max(mixedRGB, float3(0.0)), currentPx.a), gid);
+    int lumaW = int(lumaHistory.get_width());
+    int lumaH = int(lumaHistory.get_height());
+
+    for (int i = 0; i < params.slotCount; i++) {
+        if (i >= params.validSlots) break;
+
+        // Newest slot is (cursor - 1) mod slotCount; oldest is cursor.
+        int slot = (int(params.cursor) - 1 - i + params.slotCount) % params.slotCount;
+
+        // Luma history at full resolution
+        uint2 lumaCoord = uint2(
+            clamp(int(gid.x), 0, lumaW - 1),
+            clamp(int(gid.y), 0, lumaH - 1));
+        float histY = lumaHistory.read(lumaCoord, slot).r;
+
+        // Chroma history at half resolution — map full-res thread coords to half-res.
+        // The chroma ring stores half-resolution UV produced by averaging 2x2 full-res blocks.
+        uint2 chromaCoord = uint2(
+            min(uint(gid.x) / 2u, uint(params.chromaW - 1)),
+            min(uint(gid.y) / 2u, uint(params.chromaH - 1)));
+        float2 chromaUV = chromaHistory.read(chromaCoord, slot).rg;
+        float3 histYUV = float3(histY, chromaUV.x, chromaUV.y);
+
+        float lumaDiff   = abs(currentYUV.x - histYUV.x);
+        float chromaDiff = length(currentYUV.yz - histYUV.yz);
+
+        float lumaMotion   = saturate(lumaDiff / lumaThreshold);
+        float chromaMotion = saturate(chromaDiff / chromaThreshold);
+        float motion = max(lumaMotion, chromaMotion);
+
+        // i=0 newest gets λ^0 = 1; older slots decay.
+        float recency = pow(params.lambda, float(i));
+        float slotWeight = params.maxBlend * (1.0 - motion) * recency;
+        // Hard motion gate: stop blending history when per-pixel motion is moderate.
+        // Lower threshold (0.3 vs old 0.5) prevents ghost trails from moving edges.
+        if (motion > 0.25) {
+            slotWeight = 0.0;
+        }
+        slotWeight = clamp(slotWeight, 0.0, 0.95);
+
+        // Reconstruct RGB from luma history Y and chroma history UV
+        float3 histRGB = max(yuv2rgb(histYUV), float3(0.0));
+        weightedRGB += histRGB * slotWeight;
+        totalWeight += slotWeight;
+    }
+
+    float3 result = weightedRGB / max(totalWeight, 1e-6);
+    outTexture.write(float4(max(result, float3(0.0)), currentPx.a), gid);
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// GLOBAL MOTION ESTIMATE — coarse frame-to-frame luma difference metric.
+// texture(0) = current pre-temporal RGB
+// texture(1) = luma history array (newest slot is (cursor-1) mod slotCount)
+// buffer(0) = device float* where the metric is written
+// buffer(1) = cursor int
+// buffer(2) = slotCount int
+// Single-threaded 16x12 grid sampling to avoid atomics; metric is ~O(200) reads.
+// ──────────────────────────────────────────────────────────────────────
+
+kernel void estimateGlobalMotion(
+    texture2d<float, access::read> currentRGB [[texture(0)]],
+    texture2d_array<float, access::read> lumaHistory [[texture(1)]],
+    device float* motionMetric [[buffer(0)]],
+    constant int &cursor [[buffer(1)]],
+    constant int &slotCount [[buffer(2)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    // Single thread computes the metric to avoid atomics.
+    if (gid.x != 0 || gid.y != 0) return;
+
+    int w = int(currentRGB.get_width());
+    int h = int(currentRGB.get_height());
+    if (w <= 0 || h <= 0 || slotCount <= 0) {
+        *motionMetric = 0.0;
+        return;
+    }
+
+    int newestSlot = (cursor - 1 + slotCount) % slotCount;
+
+    const int gridW = 32;
+    const int gridH = 24;
+    float sumDiff = 0.0;
+    int count = 0;
+
+    for (int gy = 0; gy < gridH; gy++) {
+        for (int gx = 0; gx < gridW; gx++) {
+            int x = (w * gx) / gridW;
+            int y = (h * gy) / gridH;
+            uint2 coord = uint2(clamp(x, 0, w - 1), clamp(y, 0, h - 1));
+            float curY = rgb2yuv(currentRGB.read(coord).rgb).x;
+            float histY = rgb2yuv(lumaHistory.read(coord, newestSlot).rgb).x;
+            sumDiff += abs(curY - histY);
+            count++;
+        }
+    }
+
+    // Mean across all tiles. With a properly tuned threshold this catches
+    // both full-frame and partial motion adequately without expensive sorting.
+    *motionMetric = (count > 0) ? (sumDiff / float(count)) : 0.0;
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// STORE CHROMA HISTORY — Extract half-res UV from full-res denoised RGB
+// for the temporal chroma ring buffer.
+// texture(0) = full-res denoised RGB input
+// texture(1) = half-res 2D-array UV output (chroma ring slot)
+// buffer(0) = StoreChromaParams { int slice; }
+// ──────────────────────────────────────────────────────────────────────
+
+struct StoreChromaParams {
+    int slice;
+};
+
+kernel void storeChromaHistory(
+    texture2d<float, access::read>  fullResRGB [[texture(0)]],
+    texture2d_array<float, access::write> halfResUVArray [[texture(1)]],
+    constant StoreChromaParams &params [[buffer(0)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    if (gid.x >= halfResUVArray.get_width() || gid.y >= halfResUVArray.get_height()) return;
+
+    int w = int(fullResRGB.get_width());
+    int h = int(fullResRGB.get_height());
+    int baseX = int(gid.x) * 2;
+    int baseY = int(gid.y) * 2;
+
+    float2 sumUV = float2(0.0);
+    float count = 0.0;
+    for (int dy = 0; dy < 2; dy++) {
+        for (int dx = 0; dx < 2; dx++) {
+            int sx = baseX + dx;
+            int sy = baseY + dy;
+            if (sx >= w || sy >= h) continue;
+            sumUV += rgb2yuv(fullResRGB.read(uint2(sx, sy)).rgb).yz;
+            count += 1.0;
+        }
+    }
+
+    float2 uv = (count > 0.0) ? (sumUV / count) : float2(0.5);
+    halfResUVArray.write(float4(uv.x, uv.y, 0.0, 1.0), gid, params.slice);
+}
+
+kernel void storeLumaHistory(
+    texture2d<float, access::read>  fullResRGB [[texture(0)]],
+    texture2d_array<float, access::write> lumaArray [[texture(1)]],
+    constant StoreChromaParams &params [[buffer(0)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    if (gid.x >= lumaArray.get_width() || gid.y >= lumaArray.get_height()) return;
+    float4 px = fullResRGB.read(gid);
+    float y = dot(px.rgb, float3(0.2126, 0.7152, 0.0722));
+    lumaArray.write(float4(y, 0.0, 0.0, 1.0), gid, params.slice);
 }

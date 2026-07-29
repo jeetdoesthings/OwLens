@@ -14,6 +14,10 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
     // MARK: - Published State
 
     @Published var currentTexture: MTLTexture?
+    /// Incremented with every new texture frame. UInt64 is Equatable so SwiftUI can
+    /// reliably detect the change and call updateUIView on CameraPreviewView, even
+    /// though MTLTexture itself is not Equatable.
+    @Published var textureChangeCount: UInt64 = 0
     @Published var isRecording = false
     @Published var controlsLocked = false
     @Published var thermalState: ProcessInfo.ThermalState = .nominal
@@ -148,6 +152,9 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
     }
     @Published var focusPointLocation: CGPoint? = nil
 
+    
+    // Calibration UI state (kept for future use)
+
     /// Discrete stop lists (snap slider).
     @Published private(set) var isoStops: [Float] = ExposureStops.isoStops(in: 50...2000)
     @Published private(set) var wbStops: [Float] = ExposureStops.wbStops()
@@ -229,11 +236,16 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
     nonisolated(unsafe) private var lastScopeUpdateTime: CFTimeInterval = 0
     nonisolated(unsafe) var isAppActive = true
     /// Measured LSC override from device calibration (set once at setup).
-    nonisolated(unsafe) private var lscOverride: SIMD4<Float>?
+    nonisolated(unsafe) private var lscOverride: LSCCoefficients?
+
     /// Measured noise coefficients from device calibration (set once at setup).
     nonisolated(unsafe) private var noiseCoeffs: (shot: Float, read: Float) = (0.012, 0.0004)
     /// Noise profile for per-ISO coefficient lookup (nil on unknown device).
     nonisolated(unsafe) private var noiseProfileForISO: NoiseProfile?
+    /// Last ISO seen by processFrame; used to detect scene-cut ISO jumps.
+    nonisolated(unsafe) private var lastProcessedISO: Float = 0
+
+
 
     enum ControlPanel: String, Identifiable {
         case exposure, iso, shutter, wb, focus, fps, format, log, bitrate, mic, lens, save
@@ -245,6 +257,13 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
     override init() {
         metalPipeline = MetalPipeline()
         super.init()
+#if DEBUG
+        if let pipeline = metalPipeline {
+            Task { @MainActor in
+                _ = pipeline.runSyntheticHotPixelTest()
+            }
+        }
+#endif
         loadFilesFolderBookmark()
         metalPipeline?.curveType = selectedCurve
         activeEncodeWidth = selectedFormat.width
@@ -315,6 +334,7 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
         // Stop stills + drain queue so no Metal submits after background
         captureController.stopSession()
         frameBuffer.flush()
+        metalPipeline?.clearTemporalHistory()
         if isRecording {
             stopRecording()
         }
@@ -327,6 +347,7 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
         if captureController.activeDevice != nil {
             captureController.setCaptureFPS(selectedFPS.rawValue)
             captureController.startSession()
+            metalPipeline?.clearTemporalHistory()
             if !controlsLocked {
                 applyManualExposureAndWB()
             }
@@ -376,7 +397,7 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
         activeFPS = selectedFPS.rawValue
 
 // LSC and noise profile overrides from device calibration
-        lscOverride = caps.lscOverride?.asSIMD
+        lscOverride = caps.lscOverride
         noiseProfileForISO = caps.noiseProfile
         if let prof = caps.noiseProfile {
             let c = prof.coefficients(at: 33.0)  // base ISO; updated per-frame in processFrame
@@ -563,6 +584,8 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
                 } else {
                     // ISO/shutter ranges can change per lens
                     self.seedControlRanges()
+
+                    self.metalPipeline?.clearTemporalHistory()
                     if !self.controlsLocked {
                         self.applyManualExposureAndWB()
                     }
@@ -571,6 +594,7 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
             }
         }
     }
+
 
     private func refreshStatusLine() {
         if isRecording { return }
@@ -747,9 +771,11 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
 
         lockAutoModesForRecording()
         metalPipeline?.curveType = selectedCurve
+        metalPipeline?.clearTemporalHistory()
         activeEncodeWidth = selectedFormat.width
         activeEncodeHeight = selectedFormat.height
         activeFPS = selectedFPS.rawValue
+        captureController.setRecordingMode(true)
 
         let fileName = "OwLens_\(selectedFormat.shortLabel)_\(selectedFPS.label)fps_HEVC_\(Int(Date().timeIntervalSince1970)).mov"
         let outputURL = FileManager.default.temporaryDirectory.appendingPathComponent(fileName)
@@ -820,6 +846,7 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
         recordingTimer?.invalidate()
         recordingTimer = nil
         statusText = "Saving…"
+        captureController.setRecordingMode(false)
 
         videoWriter.finish { [weak self] url in
             guard let url else {
@@ -833,6 +860,7 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
                 self?.saveFinishedRecording(at: url)
             }
         }
+        metalPipeline?.clearTemporalHistory()
 
         let realNote = "frames=\(frameCount) drops=\(droppedFrames) fps=\(selectedFPS.label) fmt=\(selectedFormat.shortLabel)"
         print("[CameraViewModel] Recording stopped \(realNote)")
@@ -881,26 +909,15 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
         }
     }
 
-    /// Check the output .mov is playable before handing it to Photos.
+    /// Verify the output file exists and has reasonable size before handing to Photos.
     private func validateVideoFile(at url: URL) -> Bool {
-        let asset = AVAsset(url: url)
-        let semaphore = DispatchSemaphore(value: 0)
-        var isValid = false
-        asset.loadValuesAsynchronously(forKeys: ["tracks", "playable"]) {
-            var error: NSError?
-            let trackStatus = asset.statusOfValue(forKey: "tracks", error: &error)
-            let playableStatus = asset.statusOfValue(forKey: "playable", error: &error)
-            if trackStatus == .loaded, playableStatus == .loaded,
-               !asset.tracks(withMediaType: .video).isEmpty,
-               asset.isPlayable, asset.duration.seconds > 0 {
-                isValid = true
-            } else {
-                print("[CameraViewModel] AVAsset invalid: tracks=\(trackStatus.rawValue) playable=\(playableStatus.rawValue) duration=\(asset.duration.seconds)")
-            }
-            semaphore.signal()
+        guard let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
+              let size = attrs[.size] as? Int64 else {
+            print("[CameraViewModel] Cannot stat output file")
+            return false
         }
-        _ = semaphore.wait(timeout: .now() + 5)
-        return isValid
+        // Must have at least 100KB to be a valid video
+        return size > 100_000
     }
 
     private func presentFilesFolderPicker() {
@@ -1042,6 +1059,7 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
     nonisolated private func handleIncomingFrame(_ frameData: RawFrameData) {
         // Never enqueue GPU work while backgrounded (IOGPUMetalError 00000006)
         guard isAppActive else { return }
+
         frameBuffer.enqueue(frameData)
         scheduleProcess()
     }
@@ -1062,15 +1080,21 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
 
     nonisolated private func drainBuffer() {
         // Only the newest frame — never process a backlog (that made preview laggy/choppy)
-        if let frame = frameBuffer.dequeueLatest() {
-            processFrame(frame)
+        guard let frame = frameBuffer.dequeueLatest() else {
+            processLock.lock()
+            isProcessing = false
+            processLock.unlock()
+            return
         }
-        processLock.lock()
-        isProcessing = false
-        let remaining = frameBuffer.currentCount
-        processLock.unlock()
-        if remaining > 0 {
-            scheduleProcess()
+        processFrame(frame) { [weak self] in
+            guard let self else { return }
+            processLock.lock()
+            isProcessing = false
+            let remaining = frameBuffer.currentCount
+            processLock.unlock()
+            if remaining > 0 {
+                scheduleProcess()
+            }
         }
     }
 
@@ -1078,22 +1102,32 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
         let buffer: CVPixelBuffer
     }
 
-    nonisolated private func processFrame(_ frameData: RawFrameData) {
-        guard isAppActive else { return }
-        guard let pipeline = metalPipeline else { return }
+    nonisolated private func processFrame(_ frameData: RawFrameData, completion: @escaping () -> Void) {
+        guard isAppActive else { completion(); return }
+        guard let pipeline = metalPipeline else { completion(); return }
 
         pipeline.bayerPattern = frameData.cfaPattern
         pipeline.blackLevel = frameData.blackLevel
         pipeline.whiteLevel = frameData.whiteLevel
-        pipeline.lscCoefficients = lscOverride ?? frameData.lscCoefficients
+
+        // LSC: calibration > device table > frame default (live DNG).
+        pipeline.lscParams = Self.simd4ToLSCParams(frameData.lscCoefficients)
+        pipeline.greenBalance = 1.0
         pipeline.iso = frameData.iso
 
-        // Recompute noise coefficients from measured profile (ISO-dependent)
+        // Recompute noise coefficients from ISO-dependent profile
         if let prof = noiseProfileForISO {
             noiseCoeffs = prof.coefficients(at: frameData.iso)
         }
         pipeline.noiseShotCoeff = noiseCoeffs.shot
         pipeline.noiseReadCoeff = noiseCoeffs.read
+
+        // Scene-cut detection: >2 stop ISO jump is a secondary trigger; primary motion
+        // detection now happens inside the temporal kernel via a global frame metric.
+        if lastProcessedISO > 0, abs(frameData.iso - lastProcessedISO) > 2.0 * lastProcessedISO {
+            pipeline.clearTemporalHistory()
+        }
+        lastProcessedISO = frameData.iso
 
         if pipeline.isAutoWBEnabled, let gains = frameData.whiteBalanceGains {
             let g = max(gains.greenGain, 0.001)
@@ -1109,57 +1143,72 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
 
         let w = activeEncodeWidth
         let h = activeEncodeHeight
+        // Set quality mode: full quality when recording, preview otherwise.
+        pipeline.processingQuality = isRecordingUnsafe ? .recordQuality : .previewFast
         // Demosaic + WB + luma/chroma denoise + log + crop/scale to encode size.
-        guard let framed = pipeline.process(frameData.pixelBuffer, encodeWidth: w, encodeHeight: h) else { return }
+        pipeline.process(frameData.pixelBuffer, encodeWidth: w, encodeHeight: h, encodeAsBGRA: isRecordingUnsafe) { [weak self] framed, bgraPB in
+            defer { completion() }
+            guard let self, let framed else { return }
 
-        let cfaName: String
-        switch frameData.cfaPattern {
-        case 0: cfaName = "RGGB"
-        case 1: cfaName = "GRBG"
-        case 2: cfaName = "GBRG"
-        case 3: cfaName = "BGGR"
-        default: cfaName = "?\(frameData.cfaPattern)"
-        }
-        let drops = frameBuffer.droppedCount
-        let newScopeData: ScopeData?
-        let scopeNow = CACurrentMediaTime()
-        if showScopesUnsafe && scopeNow - lastScopeUpdateTime >= 0.1 {
-            lastScopeUpdateTime = scopeNow
-            newScopeData = pipeline.makeScopeData(from: framed)
-        } else {
-            newScopeData = nil
-        }
-
-        // BGRA conversion + video encoding is fully asynchronous (zero CPU blocking)
-        if isRecordingUnsafe {
-            pipeline.textureToPixelBufferBGRA(framed) { [weak self] pb in
-                guard let self = self, let pb = pb else { return }
-                let sendablePB = SendablePixelBuffer(buffer: pb)
-                self.processQueue.async {
+            let cfaName: String
+            switch frameData.cfaPattern {
+            case 0: cfaName = "RGGB"
+            case 1: cfaName = "GRBG"
+            case 2: cfaName = "GBRG"
+            case 3: cfaName = "BGGR"
+            default: cfaName = "?\(frameData.cfaPattern)"
+            }
+            let drops = frameBuffer.droppedCount
+            let scopeNow = CACurrentMediaTime()
+            if showScopesUnsafe && !isRecordingUnsafe && scopeNow - lastScopeUpdateTime >= 0.1 {
+                lastScopeUpdateTime = scopeNow
+                pipeline.makeScopeData(from: framed) { [weak self] scope in
+                    guard let self, let scope else { return }
                     Task { @MainActor [weak self] in
-                        guard let self = self else { return }
+                        guard let self else { return }
+                        self.scopeData = scope
+                    }
+                }
+            }
+
+            // BGRA pixel buffer is now produced inside the main command buffer (encodeAsBGRA flag).
+            // Just append directly without extra GPU submission.
+            if isRecordingUnsafe, let bgraPB {
+                let sendablePB = SendablePixelBuffer(buffer: bgraPB)
+                processQueue.async {
+                    Task { @MainActor [weak self] in
+                        guard let self else { return }
                         if self.videoWriter.appendFrame(pixelBuffer: sendablePB.buffer) {
                             self.frameIndex += 1
                         }
                     }
                 }
             }
-        }
 
-        // Only preview texture + UI counters go to MainActor
-        Task { @MainActor [weak self] in
-            guard let self else { return }
-            self.syncLiveAutoValues(from: frameData)
-            self.currentTexture = framed
-            self.cfaLabel = cfaName
-            self.droppedFrames = drops
-            if let newScopeData {
-                self.scopeData = newScopeData
-            }
-            if self.isRecording {
-                self.frameCount = Int(self.frameIndex)
+            // Only preview texture + UI counters go to MainActor
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.syncLiveAutoValues(from: frameData)
+                self.currentTexture = framed
+                self.textureChangeCount &+= 1
+                self.cfaLabel = cfaName
+                self.droppedFrames = drops
+                if self.isRecording {
+                    self.frameCount = Int(self.frameIndex)
+                }
             }
         }
+    }
+
+    /// Convert legacy SIMD4 LSC coefficients (R, Gr, Gb, B) to the expanded LSCParams.
+    nonisolated private static func simd4ToLSCParams(_ coeffs: SIMD4<Float>) -> LSCParams {
+        LSCParams(
+            radialR: coeffs[0],
+            radialG: (coeffs[1] + coeffs[2]) * 0.5,
+            radialB: coeffs[3],
+            radial4R: 0, radial4G: 0, radial4B: 0,
+            azimuthR: 0, azimuthG: 0, azimuthB: 0
+        )
     }
 
     private func syncLiveAutoValues(from frameData: RawFrameData) {
@@ -1179,7 +1228,8 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
 
         if isAutoWhiteBalanceEnabled {
             if let gains = frameData.whiteBalanceGains {
-                let temperatureAndTint = device.temperatureAndTintValues(for: gains)
+                let clamped = clampWhiteBalanceGains(gains, for: device)
+                let temperatureAndTint = device.temperatureAndTintValues(for: clamped)
                 wbKelvin = max(2000, min(10000, temperatureAndTint.temperature))
             }
             isAutoWhiteBalanceAdjusting = device.isAdjustingWhiteBalance
@@ -1188,3 +1238,4 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
         }
     }
 }
+

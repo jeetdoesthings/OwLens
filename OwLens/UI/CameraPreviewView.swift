@@ -8,6 +8,9 @@ import QuartzCore
 struct CameraPreviewView: UIViewRepresentable {
     let metalPipeline: MetalPipeline
     @Binding var currentTexture: MTLTexture?
+    /// Equatable counter that forces updateUIView on every new texture, because
+    /// MTLTexture is not Equatable and SwiftUI otherwise can't detect changes.
+    @Binding var textureChangeCount: UInt64
     @Binding var showClipping: Bool
     @Binding var showFocusPeaking: Bool
     var overlayOnly: Bool = false
@@ -17,9 +20,12 @@ struct CameraPreviewView: UIViewRepresentable {
         mtkView.delegate = context.coordinator
         mtkView.framebufferOnly = true
         mtkView.colorPixelFormat = .bgra8Unorm
-        mtkView.preferredFramesPerSecond = 60
+        // Run the display link at a fixed rate so draw(in:) is called ~30 times per
+        // second. The coordinator's currentTexture is updated via updateUIView which is
+        // reliably called because textureChangeCount (UInt64, Equatable) changes every frame.
         mtkView.enableSetNeedsDisplay = false
         mtkView.isPaused = false
+        mtkView.preferredFramesPerSecond = 30
         mtkView.autoResizeDrawable = true
         mtkView.clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: overlayOnly ? 0 : 1)
         mtkView.backgroundColor = overlayOnly ? .clear : .black
@@ -33,6 +39,8 @@ struct CameraPreviewView: UIViewRepresentable {
     }
  
     func updateUIView(_ uiView: MTKView, context: Context) {
+        // Propagate latest texture to the coordinator — the display link ticks at 30 Hz
+        // so draw(in:) picks it up naturally within ~33 ms of the change.
         context.coordinator.currentTexture = currentTexture
         context.coordinator.showClipping = showClipping
         context.coordinator.showFocusPeaking = showFocusPeaking
@@ -42,6 +50,8 @@ struct CameraPreviewView: UIViewRepresentable {
         uiView.isOpaque = !overlayOnly
         uiView.layer.isOpaque = !overlayOnly
         (uiView.layer as? CAMetalLayer)?.isOpaque = !overlayOnly
+        // The display link runs continuously so draw(in:) picks up new textures
+        // within ~33 ms of the coordinator receiving them via updateUIView.
     }
  
     func makeCoordinator() -> Coordinator {
@@ -54,6 +64,8 @@ struct CameraPreviewView: UIViewRepresentable {
         var showClipping: Bool = false
         var showFocusPeaking: Bool = false
         var overlayOnly: Bool = false
+        /// No redundant-draw guard needed: the display link runs at 30 fps and frames
+        /// arrive at ~24 fps. The ~6 extra fullscreen blits per second are negligible.
         private let renderCommandQueue: MTLCommandQueue?
         private let renderPipeline: MTLRenderPipelineState?
  

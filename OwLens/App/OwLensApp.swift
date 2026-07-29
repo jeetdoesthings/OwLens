@@ -43,6 +43,7 @@ struct RootView: View {
                         CameraPreviewView(
                             metalPipeline: pipeline,
                             currentTexture: $viewModel.currentTexture,
+                            textureChangeCount: $viewModel.textureChangeCount,
                             showClipping: $viewModel.showClipping,
                             showFocusPeaking: $viewModel.showFocusPeaking,
                             overlayOnly: viewModel.previewDisplayMode == .normalVideo
@@ -50,10 +51,6 @@ struct RootView: View {
                             .opacity(viewModel.previewDisplayMode == .log || viewModel.showClipping || viewModel.showFocusPeaking ? 1 : 0)
                             .allowsHitTesting(viewModel.previewDisplayMode == .log)
                             .ignoresSafeArea()
-                            .onTapGesture { location in
-                                let normalized = CGPoint(x: location.x / geo.size.width, y: location.y / geo.size.height)
-                                viewModel.triggerTapToFocus(at: location, normalized: normalized)
-                            }
                         
                         if let focusPt = viewModel.focusPointLocation {
                             Rectangle()
@@ -73,9 +70,9 @@ struct RootView: View {
 
                         if viewModel.showScopes {
                             ScopesOverlay(data: viewModel.scopeData)
-                                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
-                                .padding(.leading, 12)
-                                .padding(.bottom, 12)
+                                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomTrailing)
+                                .padding(.trailing, 16)
+                                .padding(.bottom, 4)
                                 .allowsHitTesting(false)
                         }
 

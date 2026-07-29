@@ -51,13 +51,56 @@ enum VideoCodecOption: String, CaseIterable, Identifiable {
 
 /// Per-device lens shading correction coefficients from DNG / calibration.
 struct LSCCoefficients: Sendable {
-    let r: Float
-    let g: Float
-    let b: Float
-    let avg: Float
+    let radialR: Float
+    let radialG: Float
+    let radialB: Float
+    let radial4R: Float
+    let radial4G: Float
+    let radial4B: Float
+    let azimuthR: Float
+    let azimuthG: Float
+    let azimuthB: Float
 
-    var asSIMD: SIMD4<Float> { SIMD4<Float>(r, g, b, avg) }
+    /// Legacy initializer: radial-only coefficients, higher-order terms default to zero.
+    init(r: Float, g: Float, b: Float, avg: Float = 1.0) {
+        self.radialR = r - 1.0
+        self.radialG = g - 1.0
+        self.radialB = b - 1.0
+        self.radial4R = 0
+        self.radial4G = 0
+        self.radial4B = 0
+        self.azimuthR = 0
+        self.azimuthG = 0
+        self.azimuthB = 0
+    }
+
+    /// Full 4-term initializer.
+    init(
+        radialR: Float, radialG: Float, radialB: Float,
+        radial4R: Float = 0, radial4G: Float = 0, radial4B: Float = 0,
+        azimuthR: Float = 0, azimuthG: Float = 0, azimuthB: Float = 0
+    ) {
+        self.radialR = radialR
+        self.radialG = radialG
+        self.radialB = radialB
+        self.radial4R = radial4R
+        self.radial4G = radial4G
+        self.radial4B = radial4B
+        self.azimuthR = azimuthR
+        self.azimuthG = azimuthG
+        self.azimuthB = azimuthB
+    }
+
+    var asLSCParams: LSCParams {
+        LSCParams(
+            radialR: radialR, radialG: radialG, radialB: radialB,
+            radial4R: radial4R, radial4G: radial4G, radial4B: radial4B,
+            azimuthR: azimuthR, azimuthG: azimuthG, azimuthB: azimuthB
+        )
+    }
 }
+
+extension LSCCoefficients: Codable {}
 
 // MARK: - NoiseProfile
 
@@ -350,6 +393,7 @@ struct DeviceCapabilities: Sendable {
             return (false, [])
         }
         print("[DeviceCapabilities] RAW probe camera type=\(camera.deviceType.rawValue) virtual=\(camera.isVirtualDevice)")
+        print("[DeviceCapabilities] RAW probe sensor resolution=\(camera.activeFormat.formatDescription) dimensions=\(CMVideoFormatDescriptionGetDimensions(camera.activeFormat.formatDescription))")
         session.addInput(input)
 
         let photoOutput = AVCapturePhotoOutput()
@@ -364,6 +408,15 @@ struct DeviceCapabilities: Sendable {
         let all = photoOutput.availableRawPhotoPixelFormatTypes
         let bayer = all.filter { AVCapturePhotoOutput.isBayerRAWPixelFormat($0) }
         print("[DeviceCapabilities] RAW probe all=\(all.map { fourCCString($0) }) bayer=\(bayer.map { fourCCString($0) })")
+
+        // Log sensor resolution from active format — RAW is always full sensor res on iOS
+        let dims = CMVideoFormatDescriptionGetDimensions(camera.activeFormat.formatDescription)
+        print("[DeviceCapabilities] RAW probe sensor native resolution = \(dims.width)×\(dims.height) (all bayer formats use this resolution)")
+
+        // On iOS, AVCapturePhotoOutput exposes RAW at the sensor's native resolution only.
+        // There is no multi-resolution RAW option — binning must be done in post (Metal binBayerCFA).
+        print("[DeviceCapabilities] RAW probe: \(bayer.count) bayer format(s), single resolution only (sensor native)")
+
         return (!bayer.isEmpty, bayer)
     }
 

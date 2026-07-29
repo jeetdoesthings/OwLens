@@ -95,15 +95,14 @@ struct ControlsView: View {
     }
 
     private var recordingState: some View {
-        HStack(spacing: 7) {
+        HStack(spacing: 5) {
             Circle()
                 .fill(Color.red)
                 .frame(width: 8, height: 8)
-            Image(systemName: "record.circle.fill")
-                .font(.system(size: 12, weight: .bold))
         }
         .foregroundColor(.white.opacity(0.9))
-        .frame(width: 46, height: 32)
+        .padding(.horizontal, 8)
+        .frame(height: 32)
         .background(Color.black.opacity(0.54))
         .clipShape(RoundedRectangle(cornerRadius: chromeRadius, style: .continuous))
         .accessibilityLabel(viewModel.isRecording ? "Recording" : "Camera readiness")
@@ -385,7 +384,8 @@ struct ControlsView: View {
     }
 
     private var focusModeControl: some View {
-        Button {
+        let panelActive = viewModel.activePanel == .focus
+        return Button {
             guard !exposureControlsDisabled else { return }
             viewModel.togglePanel(.focus)
         } label: {
@@ -395,9 +395,9 @@ struct ControlsView: View {
                 Text(viewModel.isAutoFocus ? "AF" : "MF")
                     .font(.system(size: 11, weight: .bold, design: .rounded))
             }
-            .foregroundColor(viewModel.isAutoFocus ? .black : .white.opacity(exposureControlsDisabled ? 0.35 : 0.88))
+            .foregroundColor(panelActive ? .black : .white.opacity(exposureControlsDisabled ? 0.35 : 0.88))
             .frame(width: 48, height: 40)
-            .background(viewModel.isAutoFocus ? Color.white : Color.black.opacity(exposureControlsDisabled ? 0.22 : 0.52))
+            .background(panelActive ? Color.white : Color.black.opacity(exposureControlsDisabled ? 0.22 : 0.52))
             .clipShape(RoundedRectangle(cornerRadius: chromeRadius, style: .continuous))
         }
         .buttonStyle(.plain)

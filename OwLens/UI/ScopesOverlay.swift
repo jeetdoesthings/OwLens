@@ -5,15 +5,15 @@ struct ScopesOverlay: View {
 
     var body: some View {
         VStack(spacing: 8) {
-            scopeBlock(title: "RGB", height: 34) {
+            scopeBlock(title: "RGB", height: 26) {
                 histogramCanvas
             }
-            scopeBlock(title: "WFM", height: 46) {
+            scopeBlock(title: "WFM", height: 36) {
                 waveformCanvas
             }
         }
-        .frame(width: 136)
-        .padding(6)
+        .frame(width: 110)
+        .padding(4)
         .background(Color.black.opacity(0.5))
         .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
         .overlay(

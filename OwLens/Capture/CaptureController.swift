@@ -50,6 +50,8 @@ final class CaptureController: NSObject, ObservableObject {
     private var lastCaptureStart: CFTimeInterval = 0
     private var selectedAudioPortUID: String?
     private var isReconfiguringAudio = false
+    /// Whether the capture timer runs in recording mode (tighter settings).
+    private var isRecordingMode = false
 
     private var cachedBlackLevel: Float?
     private var cachedWhiteLevel: Float?
@@ -827,23 +829,44 @@ final class CaptureController: NSObject, ObservableObject {
 
     func setCaptureFPS(_ fps: Double) {
         let clamped = max(1, min(30, fps))
+        // Stop the timer on the capture queue first to prevent firing mid-change.
         captureQueue.async { [weak self] in
             guard let self else { return }
+            self.captureTimer?.cancel()
+            self.captureTimer = nil
             self.targetFPS = clamped
             self.minFrameInterval = 1.0 / clamped
+            // Only start the new timer if the session is running and enough time
+            // has passed since the last capture start (avoids firing during config).
             guard self.session.isRunning else { return }
-            self.startFrameTimer(fps: clamped)
+            // Restart timer immediately; session.isRunning guard prevents firing during teardown.
+            let deadline = DispatchTime.now()
+            self.captureQueue.asyncAfter(deadline: deadline) { [weak self] in
+                guard let self, self.session.isRunning else { return }
+                self.startFrameTimer(fps: clamped)
+            }
         }
+    }
+
+    /// Adjust capture pipeline behavior for recording.
+    /// Recording mode reduces in-flight captures to minimize per-frame latency.
+    /// Must be called from the main thread.
+    func setRecordingMode(_ recording: Bool) {
+        isRecordingMode = recording
+        maxInFlight = recording ? 1 : 3
     }
 
     // MARK: - Continuous RAW Capture Loop
 
     private func startFrameTimer(fps: Double) {
+        // Don't start if session isn't running (can happen during configuration changes)
+        guard session.isRunning else { return }
         captureTimer?.cancel()
         captureTimer = nil
         minFrameInterval = 1.0 / max(1, fps)
         // Aggressive poll so we never sit idle after a free slot
-        let poll = min(1.0 / 120.0, minFrameInterval / 2)
+        // In recording mode poll at minFrameInterval to reduce CPU load.
+        let poll = isRecordingMode ? minFrameInterval : min(1.0 / 120.0, minFrameInterval / 2)
         let timer = DispatchSource.makeTimerSource(queue: captureQueue)
         timer.schedule(deadline: .now(), repeating: poll)
         timer.setEventHandler { [weak self] in
