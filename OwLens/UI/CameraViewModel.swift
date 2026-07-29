@@ -1143,60 +1143,106 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
 
         let w = activeEncodeWidth
         let h = activeEncodeHeight
-        // Set quality mode: full quality when recording, preview otherwise.
-        pipeline.processingQuality = isRecordingUnsafe ? .recordQuality : .previewFast
-        // Demosaic + WB + luma/chroma denoise + log + crop/scale to encode size.
-        pipeline.process(frameData.pixelBuffer, encodeWidth: w, encodeHeight: h, encodeAsBGRA: isRecordingUnsafe) { [weak self] framed, bgraPB in
-            defer { completion() }
-            guard let self, let framed else { return }
 
-            let cfaName: String
-            switch frameData.cfaPattern {
-            case 0: cfaName = "RGGB"
-            case 1: cfaName = "GRBG"
-            case 2: cfaName = "GBRG"
-            case 3: cfaName = "BGGR"
-            default: cfaName = "?\(frameData.cfaPattern)"
-            }
-            let drops = frameBuffer.droppedCount
-            let scopeNow = CACurrentMediaTime()
-            if showScopesUnsafe && !isRecordingUnsafe && scopeNow - lastScopeUpdateTime >= 0.1 {
-                lastScopeUpdateTime = scopeNow
-                pipeline.makeScopeData(from: framed) { [weak self] scope in
-                    guard let self, let scope else { return }
-                    Task { @MainActor [weak self] in
-                        guard let self else { return }
-                        self.scopeData = scope
-                    }
+        if isRecordingUnsafe {
+            // ── Recording ──
+            // 4K: sensor is 4032×3024 and cannot be binned (half=2016 < 3840).
+            //     Use preview-only path since the full pipeline > 100ms on A14.
+            // Lower res (OpenGate, 1080p): binning drops to ~2016×1512, fits ~30-50ms.
+            let is4K = w >= 3840
+            if is4K {
+                pipeline.processingQuality = .previewFast
+                pipeline.processPreviewOnly(frameData.pixelBuffer, encodeWidth: w, encodeHeight: h, encodeAsBGRA: true) { [weak self] framed, bgraPB in
+                    guard let self else { completion(); return }
+                    handleRecordedFrame(framed, bgraPB: bgraPB, frameData: frameData, completion: completion)
+                }
+            } else {
+                pipeline.processingQuality = .recordQuality
+                pipeline.process(frameData.pixelBuffer, encodeWidth: w, encodeHeight: h, encodeAsBGRA: true) { [weak self] framed, bgraPB in
+                    guard let self else { completion(); return }
+                    handleRecordedFrame(framed, bgraPB: bgraPB, frameData: frameData, completion: completion)
                 }
             }
+        } else {
+            // ── Preview (non-recording): lightweight path, no denoise ──
+            pipeline.processingQuality = .previewFast
+            pipeline.processPreviewOnly(frameData.pixelBuffer, encodeWidth: w, encodeHeight: h, encodeAsBGRA: false) { [weak self] framed, _ in
+                defer { completion() }
+                guard let self, let framed else { return }
 
-            // BGRA pixel buffer is now produced inside the main command buffer (encodeAsBGRA flag).
-            // Just append directly without extra GPU submission.
-            if isRecordingUnsafe, let bgraPB {
-                let sendablePB = SendablePixelBuffer(buffer: bgraPB)
-                processQueue.async {
-                    Task { @MainActor [weak self] in
-                        guard let self else { return }
-                        if self.videoWriter.appendFrame(pixelBuffer: sendablePB.buffer) {
-                            self.frameIndex += 1
+                let cfaName: String
+                switch frameData.cfaPattern {
+                case 0: cfaName = "RGGB"
+                case 1: cfaName = "GRBG"
+                case 2: cfaName = "GBRG"
+                case 3: cfaName = "BGGR"
+                default: cfaName = "?\(frameData.cfaPattern)"
+                }
+                let drops = frameBuffer.droppedCount
+                let scopeNow = CACurrentMediaTime()
+                if showScopesUnsafe && !isRecordingUnsafe && scopeNow - lastScopeUpdateTime >= 0.1 {
+                    lastScopeUpdateTime = scopeNow
+                    pipeline.makeScopeData(from: framed) { [weak self] scope in
+                        guard let self, let scope else { return }
+                        Task { @MainActor [weak self] in
+                            guard let self else { return }
+                            self.scopeData = scope
                         }
                     }
                 }
-            }
 
-            // Only preview texture + UI counters go to MainActor
-            Task { @MainActor [weak self] in
-                guard let self else { return }
-                self.syncLiveAutoValues(from: frameData)
-                self.currentTexture = framed
-                self.textureChangeCount &+= 1
-                self.cfaLabel = cfaName
-                self.droppedFrames = drops
-                if self.isRecording {
-                    self.frameCount = Int(self.frameIndex)
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    self.syncLiveAutoValues(from: frameData)
+                    self.currentTexture = framed
+                    self.textureChangeCount &+= 1
+                    self.cfaLabel = cfaName
+                    self.droppedFrames = drops
                 }
             }
+        }
+    }
+
+    /// Shared completion for both preview-only and full-quality recording paths.
+    nonisolated private func handleRecordedFrame(
+        _ framed: MTLTexture?,
+        bgraPB: CVPixelBuffer?,
+        frameData: RawFrameData,
+        completion: @escaping () -> Void
+    ) {
+        defer { completion() }
+        guard let framed else { return }
+
+        let cfaName: String
+        switch frameData.cfaPattern {
+        case 0: cfaName = "RGGB"
+        case 1: cfaName = "GRBG"
+        case 2: cfaName = "GBRG"
+        case 3: cfaName = "BGGR"
+        default: cfaName = "?\(frameData.cfaPattern)"
+        }
+        let drops = frameBuffer.droppedCount
+
+        if let bgraPB {
+            let sendablePB = SendablePixelBuffer(buffer: bgraPB)
+            processQueue.async {
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    if self.videoWriter.appendFrame(pixelBuffer: sendablePB.buffer) {
+                        self.frameIndex += 1
+                    }
+                }
+            }
+        }
+
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            self.syncLiveAutoValues(from: frameData)
+            self.currentTexture = framed
+            self.textureChangeCount &+= 1
+            self.cfaLabel = cfaName
+            self.droppedFrames = drops
+            self.frameCount = Int(self.frameIndex)
         }
     }
 

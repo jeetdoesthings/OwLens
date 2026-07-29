@@ -209,7 +209,6 @@ struct ControlsView: View {
             }
         }
         .padding(6)
-        .background(Color.black.opacity(0.32))
         .clipShape(RoundedRectangle(cornerRadius: chromeRadius, style: .continuous))
         .padding(.leading, 12)
     }
@@ -285,13 +284,6 @@ struct ControlsView: View {
             compactExposureStrip
         }
         .padding(.vertical, 7)
-        .background(
-            LinearGradient(
-                colors: [.clear, .black.opacity(0.55), .black.opacity(0.88)],
-                startPoint: .top,
-                endPoint: .bottom
-            )
-        )
     }
 
     private var fullExposureStrip: some View {
