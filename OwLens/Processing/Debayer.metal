@@ -408,13 +408,6 @@ kernel void spatialDenoise(
         sigmaRef = 0.012 * isoScale;  // legacy hardcoded proxy
     }
     float luma01 = saturate(centerYUV.x);
-    // At base ISO (~33-50) the read noise is below 14-bit quantization.
-    // Skipping the bilateral filter entirely preserves edge detail while
-    // adding no visible noise — the sensor is already clean enough.
-    if (sigmaRef < 0.005) {
-        outTexture.write(float4(centerRGB, centerPx.a), gid);
-        return;
-    }
 
     // Per-pixel local-sigma guide: stronger denoise where local variance is low,
     // lighter denoise on edges/high-variance regions. Falls back to signal-based
@@ -535,12 +528,6 @@ kernel void denoiseHalfResChroma(
     } else {
         chromaSigmaRef = 0.045 * isoScale;
     }
-    // Skip chroma denoise at base ISO where chroma noise is invisible.
-    if (chromaSigmaRef < 0.005) {
-        outTexture.write(chromaTexture.read(gid), gid);
-        return;
-    }
-    // Per-pixel local-sigma guide, sampled at the corresponding full-res luma location.
     float shadowBoost;
     if (statsTexture.get_width() > 1) {
         uint2 statsCoord = uint2(
