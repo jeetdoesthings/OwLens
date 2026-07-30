@@ -24,8 +24,6 @@ final class VideoWriter {
 
     var isRecording = false
     private(set) var droppedFrames: Int = 0
-    /// The output URL of the current recording (set during start).
-    private(set) var outputURL: URL?
 
     /// Whether the writer is ready to accept a new frame without backpressure dropping.
     /// Check before queuing BGRA conversion + append.
@@ -51,7 +49,6 @@ final class VideoWriter {
         let fps = (abs(targetFPS - 30) < 0.5) ? 30.0 : 24.0
 
         let writer = try AVAssetWriter(outputURL: outputURL, fileType: .mov)
-        self.outputURL = outputURL
         self.width = width
         self.height = height
         self.targetFPS = fps

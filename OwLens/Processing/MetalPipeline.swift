@@ -892,59 +892,6 @@ final class MetalPipeline: @unchecked Sendable {
         commandBuffer.commit()
     }
 
-    // MARK: - Binned readback (for offline processing persistence)
-
-    /// Bin the raw Bayer pixel buffer to half resolution and read back to CPU.
-    /// Returns the binned raw pixel data in the completion handler (~0.5ms GPU time).
-    func binBayerAndReadback(_ pixelBuffer: CVPixelBuffer,
-                             completion: @escaping (Data?) -> Void) {
-        let fullW = CVPixelBufferGetWidth(pixelBuffer)
-        let fullH = CVPixelBufferGetHeight(pixelBuffer)
-        guard fullW > 0, fullH > 0 else { completion(nil); return }
-
-        let halfW = (fullW / 2) & ~1
-        let halfH = (fullH / 2) & ~1
-        guard halfW > 0, halfH > 0 else { completion(nil); return }
-
-        guard let fullBayer = makeRawTexture(from: pixelBuffer),
-              let commandBuffer = commandQueue.makeCommandBuffer() else { completion(nil); return }
-
-        // Bin via existing binBayerCFA pipeline
-        guard let halfTex = getOrCreateBinTexture(width: halfW, height: halfH),
-              let enc = commandBuffer.makeComputeCommandEncoder() else { completion(nil); return }
-        enc.setComputePipelineState(binPipeline)
-        enc.setTexture(fullBayer, index: 0)
-        enc.setTexture(halfTex, index: 1)
-        dispatch(enc, width: halfW, height: halfH, state: binPipeline)
-        enc.endEncoding()
-
-        // Shared staging texture for CPU readback
-        let stagingDesc = MTLTextureDescriptor.texture2DDescriptor(
-            pixelFormat: .r16Unorm, width: halfW, height: halfH, mipmapped: false)
-        stagingDesc.usage = [.shaderRead]
-        stagingDesc.storageMode = .shared
-        guard let staging = device.makeTexture(descriptor: stagingDesc) else { completion(nil); return }
-
-        guard let blit = commandBuffer.makeBlitCommandEncoder() else { completion(nil); return }
-        blit.copy(from: halfTex, sourceSlice: 0, sourceLevel: 0,
-                  sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
-                  sourceSize: MTLSize(width: halfW, height: halfH, depth: 1),
-                  to: staging, destinationSlice: 0, destinationLevel: 0,
-                  destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0))
-        blit.endEncoding()
-
-        let rowBytes = halfW * MemoryLayout<UInt16>.stride
-        commandBuffer.addCompletedHandler { _ in
-            var pixels = [UInt16](repeating: 0, count: halfW * halfH)
-            staging.getBytes(&pixels, bytesPerRow: rowBytes,
-                            from: MTLRegionMake2D(0, 0, halfW, halfH),
-                            mipmapLevel: 0)
-            let data = Data(bytes: pixels, count: rowBytes * halfH)
-            completion(data)
-        }
-        commandBuffer.commit()
-    }
-
     func scale(_ texture: MTLTexture, width: Int, height: Int, cb: MTLCommandBuffer) -> MTLTexture? {
         guard width > 0, height > 0 else { return nil }
         if texture.width == width && texture.height == height { return texture }

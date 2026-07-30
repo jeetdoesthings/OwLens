@@ -105,12 +105,6 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
     @Published var droppedFrames: Int = 0
     @Published var cfaLabel: String = "—"
 
-    // MARK: - Offline processing state
-
-    @Published var isProcessing: Bool = false
-    @Published var processingProgress: Double = 0
-    @Published var processingStatusText: String = ""
-
     /// Runtime device probe (set once at setup).
     @Published private(set) var capabilities: DeviceCapabilities?
     /// No Bayer RAW — hard gate, record disabled.
@@ -232,7 +226,7 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
 
     private let processQueue = DispatchQueue(label: "raw.process.queue", qos: .userInitiated)
     nonisolated private let processLock = NSLock()
-    nonisolated(unsafe) private var isProcessBusy = false
+    nonisolated(unsafe) private var isProcessing = false
 
     nonisolated(unsafe) private var activeEncodeWidth = 1920
     nonisolated(unsafe) private var activeEncodeHeight = 1440
@@ -250,16 +244,6 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
     nonisolated(unsafe) private var noiseProfileForISO: NoiseProfile?
     /// Last ISO seen by processFrame; used to detect scene-cut ISO jumps.
     nonisolated(unsafe) private var lastProcessedISO: Float = 0
-
-    /// Raw frame log writer (binned Bayer persistence for offline processing).
-    nonisolated(unsafe) private var frameLogWriter: FrameLogWriter?
-    nonisolated(unsafe) private var rawLogURL: URL?
-
-    /// Offline processor for post-recording full-quality batch processing.
-    nonisolated(unsafe) private var offlineProcessor: OfflineProcessor?
-
-    /// Serial queue for binned frame I/O writes.
-    private let ioQueue = DispatchQueue(label: "raw.io.queue", qos: .default)
 
 
 
@@ -793,41 +777,8 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
         activeFPS = selectedFPS.rawValue
         captureController.setRecordingMode(true)
 
-        // ── Dynamic storage check (per-recording, reads current free space) ──
-        // Binned Bayer at ~2016×1512 = 5.8 MB/frame → 140 MB/s @ 24fps.
-        // Estimate max safe recording duration based on current free space.
-        if let device = captureController.activeDevice {
-            let dims = CMVideoFormatDescriptionGetDimensions(device.activeFormat.formatDescription)
-            let sensorW = Int(dims.width)
-            let sensorH = Int(dims.height)
-            let binW = (sensorW / 2) & ~1
-            let binH = (sensorH / 2) & ~1
-            let bpf = binW * binH * 2  // bytes per binned frame
-            let fps = selectedFPS.rawValue
-            do {
-                let attrs = try FileManager.default.attributesOfFileSystem(forPath: NSHomeDirectory())
-                if let freeBytes = attrs[.systemFreeSize] as? Int64 {
-                    let maxFrames = freeBytes / Int64(bpf)
-                    let maxSec = Int(maxFrames) / Int(fps)
-                    let sec30 = min(maxSec, 30)
-                    if maxSec < 10 {
-                        errorMessage = "Only ~\(maxSec)s of recording storage available (free: \(freeBytes / 1_000_000_000)GB)"
-                        print("[CameraViewModel] Storage too low: ~\(maxSec)s max at \(fps)fps")
-                        return
-                    }
-                    if maxSec < 60 {
-                        print("[CameraViewModel] Storage: ~\(maxSec)s clip max (\(freeBytes/1_000_000_000)GB free)")
-                    }
-                }
-            } catch {
-                print("[CameraViewModel] Storage check error (non-fatal): \(error)")
-            }
-        }
-
         let fileName = "OwLens_\(selectedFormat.shortLabel)_\(selectedFPS.label)fps_HEVC_\(Int(Date().timeIntervalSince1970)).mov"
         let outputURL = FileManager.default.temporaryDirectory.appendingPathComponent(fileName)
-        let rawFileName = "OwLens_\(Int(Date().timeIntervalSince1970)).rawlite"
-        let rawURL = FileManager.default.temporaryDirectory.appendingPathComponent(rawFileName)
 
         let includeAudio = selectedAudioSource.portUID != nil
 
@@ -845,24 +796,6 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
                 targetFPS: selectedFPS.rawValue,
                 includeAudio: includeAudio
             )
-
-            // Open FrameLogWriter for binned Bayer persistence
-            if let device = captureController.activeDevice {
-                let dims = CMVideoFormatDescriptionGetDimensions(device.activeFormat.formatDescription)
-                let binW = (Int(dims.width) / 2) & ~1
-                let binH = (Int(dims.height) / 2) & ~1
-                let bpr = binW * 2
-                let writer = FrameLogWriter(url: rawURL, width: binW, height: binH,
-                                            bytesPerRow: bpr, pixelFormat: captureController.rawPixelFormat)
-                if writer == nil {
-                    print("[CameraViewModel] Failed to create FrameLogWriter")
-                }
-                frameLogWriter = writer
-                rawLogURL = rawURL
-            } else {
-                frameLogWriter = nil
-                rawLogURL = nil
-            }
             isRecording = true
             isRecordingUnsafe = true
             frameIndex = 0
@@ -912,81 +845,19 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
         isRecordingUnsafe = false
         recordingTimer?.invalidate()
         recordingTimer = nil
+        statusText = "Saving…"
         captureController.setRecordingMode(false)
 
-        // Close raw frame log
-        let rawURL = self.rawLogURL
-        frameLogWriter?.close()
-        frameLogWriter = nil
-
-        // Get preview video (with audio) for OfflineProcessor to reference audio
-        let previewURL = videoWriter.outputURL
-
-        videoWriter.finish { [weak self] previewVideoURL in
-            guard let self else { return }
-            guard let previewVideoURL else {
-                self.statusText = "Save failed"
-                self.errorMessage = "No preview output"
+        videoWriter.finish { [weak self] url in
+            guard let url else {
+                Task { @MainActor in
+                    self?.statusText = "Save failed"
+                    self?.errorMessage = "No output file"
+                }
                 return
             }
-
-            let totalFrames = self.frameCount
-            guard totalFrames > 0 else {
-                // No frames captured — save preview directly (shouldn't happen but safety)
-                self.saveFinishedRecording(at: previewVideoURL)
-                return
-            }
-
-            // Transition to processing state
             Task { @MainActor [weak self] in
-                guard let self else { return }
-                self.isProcessing = true
-                self.processingProgress = 0
-                self.processingStatusText = "Processing 0/\(totalFrames) frames…"
-                self.statusText = "Processing…"
-            }
-
-            // Launch offline processing on process queue
-            self.processQueue.async { [weak self] in
-                guard let self, let pipeline = self.metalPipeline else { return }
-
-                let finalName = "OwLens_\(self.selectedFormat.shortLabel)_\(self.selectedFPS.label)fps_HEVC_FINAL_\(Int(Date().timeIntervalSince1970)).mov"
-                let finalURL = FileManager.default.temporaryDirectory.appendingPathComponent(finalName)
-
-                let processor = OfflineProcessor(metalPipeline: pipeline)
-                processor.onProgress = { current, total in
-                    Task { @MainActor [weak self] in
-                        guard let self else { return }
-                        self.processingProgress = total > 0 ? Double(current) / Double(total) : 0
-                        self.processingStatusText = "Processing \(current)/\(total) frames…"
-                        self.statusText = "Processing \(current)/\(total)"
-                    }
-                }
-                processor.onComplete = { outputURL in
-                    try? FileManager.default.removeItem(at: previewVideoURL)
-                    Task { @MainActor [weak self] in
-                        guard let self else { return }
-                        self.isProcessing = false
-                        self.processingProgress = 1.0
-                        self.saveFinishedRecording(at: outputURL)
-                    }
-                }
-                processor.onError = { errorMsg in
-                    // Fall back to preview-quality video
-                    Task { @MainActor [weak self] in
-                        guard let self else { return }
-                        self.isProcessing = false
-                        self.errorMessage = "Offline processing: \(errorMsg). Using preview."
-                        self.saveFinishedRecording(at: previewVideoURL)
-                    }
-                }
-                processor.process(
-                    rawLogURL: rawURL ?? previewVideoURL,
-                    audioURL: previewVideoURL,
-                    outputURL: finalURL,
-                    encodeWidth: self.activeEncodeWidth,
-                    encodeHeight: self.activeEncodeHeight,
-                    targetFPS: self.activeFPS)
+                self?.saveFinishedRecording(at: url)
             }
         }
         metalPipeline?.clearTemporalHistory()
@@ -1195,11 +1066,11 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
 
     nonisolated private func scheduleProcess() {
         processLock.lock()
-        if isProcessBusy {
+        if isProcessing {
             processLock.unlock()
             return
         }
-        isProcessBusy = true
+        isProcessing = true
         processLock.unlock()
 
         processQueue.async { [weak self] in
@@ -1211,14 +1082,14 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
         // Only the newest frame — never process a backlog (that made preview laggy/choppy)
         guard let frame = frameBuffer.dequeueLatest() else {
             processLock.lock()
-            isProcessBusy = false
+            isProcessing = false
             processLock.unlock()
             return
         }
         processFrame(frame) { [weak self] in
             guard let self else { return }
             processLock.lock()
-            isProcessBusy = false
+            isProcessing = false
             let remaining = frameBuffer.currentCount
             processLock.unlock()
             if remaining > 0 {
@@ -1274,57 +1145,22 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
         let h = activeEncodeHeight
 
         if isRecordingUnsafe {
-            // ── Recording: processPreviewOnly for smooth preview + BGRA video ──
-            pipeline.processingQuality = .previewFast
-            pipeline.processPreviewOnly(frameData.pixelBuffer, encodeWidth: w, encodeHeight: h, encodeAsBGRA: true) { [weak self] framed, bgraPB in
-                defer { completion() }
-                guard let self, let framed else { return }
-
-                let cfaName: String
-                switch frameData.cfaPattern {
-                case 0: cfaName = "RGGB"
-                case 1: cfaName = "GRBG"
-                case 2: cfaName = "GBRG"
-                case 3: cfaName = "BGGR"
-                default: cfaName = "?\(frameData.cfaPattern)"
+            // ── Recording ──
+            // 4K: sensor is 4032×3024 and cannot be binned (half=2016 < 3840).
+            //     Use preview-only path since the full pipeline > 100ms on A14.
+            // Lower res (OpenGate, 1080p): binning drops to ~2016×1512, fits ~30-50ms.
+            let is4K = w >= 3840
+            if is4K {
+                pipeline.processingQuality = .previewFast
+                pipeline.processPreviewOnly(frameData.pixelBuffer, encodeWidth: w, encodeHeight: h, encodeAsBGRA: true) { [weak self] framed, bgraPB in
+                    guard let self else { completion(); return }
+                    handleRecordedFrame(framed, bgraPB: bgraPB, frameData: frameData, completion: completion)
                 }
-                let drops = frameBuffer.droppedCount
-
-                if let bgraPB {
-                    let sendablePB = SendablePixelBuffer(buffer: bgraPB)
-                    processQueue.async {
-                        Task { @MainActor [self] in
-                            if self.videoWriter.appendFrame(pixelBuffer: sendablePB.buffer) {
-                                self.frameIndex += 1
-                            }
-                        }
-                    }
-                }
-
-                Task { @MainActor [self] in
-                    self.syncLiveAutoValues(from: frameData)
-                    self.currentTexture = framed
-                    self.textureChangeCount &+= 1
-                    self.cfaLabel = cfaName
-                    self.droppedFrames = drops
-                    self.frameCount = Int(self.frameIndex)
-                }
-            }
-
-            // ── Write binned Bayer to disk for offline processing ──
-            if let writer = frameLogWriter {
-                let meta = FrameLogWriter.FrameMetadata(
-                    blackLevel: frameData.blackLevel, whiteLevel: frameData.whiteLevel,
-                    iso: frameData.iso, exposureDuration: frameData.exposureDurationSeconds,
-                    cfaPattern: frameData.cfaPattern,
-                    wbGains: pipeline.wbParams.gains,
-                    lscCoefficients: frameData.lscCoefficients,
-                    timestamp: CACurrentMediaTime())
-                // Bin on CPU using same phase-preserving pattern as binBayerCFA kernel.
-                // This avoids a separate GPU submission and runs at ~0.5ms on the IO queue.
-                ioQueue.async { [weak self] in
-                    guard let self, let writer = self.frameLogWriter else { return }
-                    _ = writer.appendBinned(pixelBuffer: frameData.pixelBuffer, metadata: meta)
+            } else {
+                pipeline.processingQuality = .recordQuality
+                pipeline.process(frameData.pixelBuffer, encodeWidth: w, encodeHeight: h, encodeAsBGRA: true) { [weak self] framed, bgraPB in
+                    guard let self else { completion(); return }
+                    handleRecordedFrame(framed, bgraPB: bgraPB, frameData: frameData, completion: completion)
                 }
             }
         } else {
@@ -1364,6 +1200,49 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
                     self.droppedFrames = drops
                 }
             }
+        }
+    }
+
+    /// Shared completion for both preview-only and full-quality recording paths.
+    nonisolated private func handleRecordedFrame(
+        _ framed: MTLTexture?,
+        bgraPB: CVPixelBuffer?,
+        frameData: RawFrameData,
+        completion: @escaping () -> Void
+    ) {
+        defer { completion() }
+        guard let framed else { return }
+
+        let cfaName: String
+        switch frameData.cfaPattern {
+        case 0: cfaName = "RGGB"
+        case 1: cfaName = "GRBG"
+        case 2: cfaName = "GBRG"
+        case 3: cfaName = "BGGR"
+        default: cfaName = "?\(frameData.cfaPattern)"
+        }
+        let drops = frameBuffer.droppedCount
+
+        if let bgraPB {
+            let sendablePB = SendablePixelBuffer(buffer: bgraPB)
+            processQueue.async {
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    if self.videoWriter.appendFrame(pixelBuffer: sendablePB.buffer) {
+                        self.frameIndex += 1
+                    }
+                }
+            }
+        }
+
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            self.syncLiveAutoValues(from: frameData)
+            self.currentTexture = framed
+            self.textureChangeCount &+= 1
+            self.cfaLabel = cfaName
+            self.droppedFrames = drops
+            self.frameCount = Int(self.frameIndex)
         }
     }
 

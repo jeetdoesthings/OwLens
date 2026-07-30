@@ -43,7 +43,7 @@ final class CaptureController: NSObject, ObservableObject {
     var onRawFrameData: ((RawFrameData) -> Void)?
     var onAudioSample: ((CMSampleBuffer) -> Void)?
 
-    private(set) var rawPixelFormat: OSType = 0
+    private var rawPixelFormat: OSType = 0
     private var formatCFAPattern: Int32 = 0
     private var targetFPS: Double = 24
     private var minFrameInterval: Double = 1.0 / 24.0
