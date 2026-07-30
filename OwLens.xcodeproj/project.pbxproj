@@ -11,52 +11,60 @@
 		03C03B70F14692D73BF263BD /* LogCurve.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2DE1BF5BD7BDE0FFB3605E77 /* LogCurve.swift */; };
 		17ED19DCA78B30F1B5C30ACB /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 070DE3C47C71365BC53040EE /* Assets.xcassets */; };
 		26C32D090FAA98D32A6A344E /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1CC0C26A24F5131659B8690 /* ContentView.swift */; };
+		2F0BD544481ED89E62B95DD4 /* Geist-Regular.otf in Resources */ = {isa = PBXBuildFile; fileRef = 44A6CB69E97067EFF7CC0BCE /* Geist-Regular.otf */; };
 		32637B18CCC58D60E803240A /* VideoWriter.swift in Sources */ = {isa = PBXBuildFile; fileRef = F3021592CCD8622440C6506A /* VideoWriter.swift */; };
+		3661D44664F8CF313CD8B89E /* Geist-Bold.otf in Resources */ = {isa = PBXBuildFile; fileRef = 88ACB79376A4ADB2E76D6A84 /* Geist-Bold.otf */; };
 		36FBD3B798C067C2942CB6C4 /* CameraPreviewView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 87AA3A4F048EE256E863F264 /* CameraPreviewView.swift */; };
 		439B34B417D9020481B1B0E8 /* CameraViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6650C752EA6911F1F234F679 /* CameraViewModel.swift */; };
 		6215AB2BFA00B8CBD1724523 /* GridLevelOverlay.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2FC964DA32433A5B8E2B9587 /* GridLevelOverlay.swift */; };
-		6230A060485520C519CE76DE /* MetalPipeline.swift in Sources */ = {isa = PBXBuildFile; fileRef = BE3A5DA21D71DE0620AC086 /* MetalPipeline.swift */; };
+		6230A060485520C519CE76DE /* MetalPipeline.swift in Sources */ = {isa = PBXBuildFile; fileRef = BE3A5DA21D761DE0620AC086 /* MetalPipeline.swift */; };
 		847C433290196B8982F043A3 /* SplashView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 828F7DAB08E95EE1B18A4832 /* SplashView.swift */; };
 		866DC1A24BC584820F94AE7F /* ControlsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = D3D3C76FE38C04980C86CE21 /* ControlsView.swift */; };
 		876ED42C73C516D7F0A216D4 /* ScopeData.swift in Sources */ = {isa = PBXBuildFile; fileRef = CD4D88339EDB4CCE3E689AC1 /* ScopeData.swift */; };
 		8C988410AA04A1AC71E24C50 /* Debayer.metal in Sources */ = {isa = PBXBuildFile; fileRef = DD6827259D4D051C11C1206F /* Debayer.metal */; };
+		9206732F27BDBCE521790125 /* Geist-SemiBold.otf in Resources */ = {isa = PBXBuildFile; fileRef = 350B2DAAF94E5487C687784E /* Geist-SemiBold.otf */; };
+		A6CE544628DFD68B67A42911 /* MetalPipelineSyntheticTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8BE4DD470C3C760B3483647C /* MetalPipelineSyntheticTests.swift */; };
 		AA365B708AF821ED328A9F0E /* CaptureController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 886AF194AE7DBF98FBA3A3B6 /* CaptureController.swift */; };
 		AE4F386058C65A942C92BC8C /* LaunchScreen.storyboard in Resources */ = {isa = PBXBuildFile; fileRef = 79A87D4FD4181D15AF01133A /* LaunchScreen.storyboard */; };
 		C9D5C9B9422D353CBC84F61D /* ExposureStops.swift in Sources */ = {isa = PBXBuildFile; fileRef = B787E965A9BE33E34BB992CA /* ExposureStops.swift */; };
 		CB29FE53AEF7F9FC3782144D /* LevelMonitor.swift in Sources */ = {isa = PBXBuildFile; fileRef = 380C24086C404D00F196D3EF /* LevelMonitor.swift */; };
 		CFC4A66803E3722EA3895818 /* OwLensApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3309FCB4DB267101C6ECE0AB /* OwLensApp.swift */; };
 		D8846897A8299E234D957B07 /* DeviceCapabilities.swift in Sources */ = {isa = PBXBuildFile; fileRef = E26B792621D23C998D868624 /* DeviceCapabilities.swift */; };
+		EFDBADA2AECA3001AC1FF1F5 /* Geist-Medium.otf in Resources */ = {isa = PBXBuildFile; fileRef = 0911490D91F50A92F302E9F1 /* Geist-Medium.otf */; };
 		F8B89CFD32B830286FBEA9F7 /* ScopesOverlay.swift in Sources */ = {isa = PBXBuildFile; fileRef = 07E8AF4E5950154F03CB942E /* ScopesOverlay.swift */; };
 		F8C468F1CB4E9D60832D79A4 /* RawFrameBuffer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0B6995D9D7490CA5AC49154E /* RawFrameBuffer.swift */; };
 		FA99A71A56D13A8905D06872 /* RecordingSettings.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3D83D18912845DAB7164C62D /* RecordingSettings.swift */; };
-		BD010E6023F35520BB61BA85 /* MetalPipelineSyntheticTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 68F2909FCB3A5B25B0ADFF4C /* MetalPipelineSyntheticTests.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
 		070DE3C47C71365BC53040EE /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		07E8AF4E5950154F03CB942E /* ScopesOverlay.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ScopesOverlay.swift; sourceTree = "<group>"; };
+		0911490D91F50A92F302E9F1 /* Geist-Medium.otf */ = {isa = PBXFileReference; lastKnownFileType = file; path = "Geist-Medium.otf"; sourceTree = "<group>"; };
 		0B6995D9D7490CA5AC49154E /* RawFrameBuffer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RawFrameBuffer.swift; sourceTree = "<group>"; };
 		2DE1BF5BD7BDE0FFB3605E77 /* LogCurve.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LogCurve.swift; sourceTree = "<group>"; };
 		2FC964DA32433A5B8E2B9587 /* GridLevelOverlay.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GridLevelOverlay.swift; sourceTree = "<group>"; };
 		3309FCB4DB267101C6ECE0AB /* OwLensApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OwLensApp.swift; sourceTree = "<group>"; };
+		350B2DAAF94E5487C687784E /* Geist-SemiBold.otf */ = {isa = PBXFileReference; lastKnownFileType = file; path = "Geist-SemiBold.otf"; sourceTree = "<group>"; };
 		380C24086C404D00F196D3EF /* LevelMonitor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LevelMonitor.swift; sourceTree = "<group>"; };
 		3D83D18912845DAB7164C62D /* RecordingSettings.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RecordingSettings.swift; sourceTree = "<group>"; };
+		44A6CB69E97067EFF7CC0BCE /* Geist-Regular.otf */ = {isa = PBXFileReference; lastKnownFileType = file; path = "Geist-Regular.otf"; sourceTree = "<group>"; };
 		6650C752EA6911F1F234F679 /* CameraViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CameraViewModel.swift; sourceTree = "<group>"; };
 		6D4E655A54FE1B14EE06FF2E /* NormalVideoPreviewView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NormalVideoPreviewView.swift; sourceTree = "<group>"; };
 		79A87D4FD4181D15AF01133A /* LaunchScreen.storyboard */ = {isa = PBXFileReference; lastKnownFileType = file.storyboard; path = LaunchScreen.storyboard; sourceTree = "<group>"; };
 		828F7DAB08E95EE1B18A4832 /* SplashView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SplashView.swift; sourceTree = "<group>"; };
 		87AA3A4F048EE256E863F264 /* CameraPreviewView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CameraPreviewView.swift; sourceTree = "<group>"; };
 		886AF194AE7DBF98FBA3A3B6 /* CaptureController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CaptureController.swift; sourceTree = "<group>"; };
+		88ACB79376A4ADB2E76D6A84 /* Geist-Bold.otf */ = {isa = PBXFileReference; lastKnownFileType = file; path = "Geist-Bold.otf"; sourceTree = "<group>"; };
+		8BE4DD470C3C760B3483647C /* MetalPipelineSyntheticTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MetalPipelineSyntheticTests.swift; sourceTree = "<group>"; };
 		A1CC0C26A24F5131659B8690 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
-		A554E8A0A0080DCEE9A9F97E /* OwLens.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = OwLens.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		A554E8A0A0080DCEE9A9F97E /* OwLens.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = OwLens.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		B787E965A9BE33E34BB992CA /* ExposureStops.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ExposureStops.swift; sourceTree = "<group>"; };
-		BE3A5DA21D71DE0620AC086 /* MetalPipeline.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MetalPipeline.swift; sourceTree = "<group>"; };
+		BE3A5DA21D761DE0620AC086 /* MetalPipeline.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MetalPipeline.swift; sourceTree = "<group>"; };
 		CD4D88339EDB4CCE3E689AC1 /* ScopeData.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ScopeData.swift; sourceTree = "<group>"; };
 		D3D3C76FE38C04980C86CE21 /* ControlsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ControlsView.swift; sourceTree = "<group>"; };
 		DD6827259D4D051C11C1206F /* Debayer.metal */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.metal; path = Debayer.metal; sourceTree = "<group>"; };
 		E26B792621D23C998D868624 /* DeviceCapabilities.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DeviceCapabilities.swift; sourceTree = "<group>"; };
 		F3021592CCD8622440C6506A /* VideoWriter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VideoWriter.swift; sourceTree = "<group>"; };
-		68F2909FCB3A5B25B0ADFF4C /* MetalPipelineSyntheticTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MetalPipelineSyntheticTests.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXGroup section */
@@ -66,7 +74,7 @@
 				886AF194AE7DBF98FBA3A3B6 /* CaptureController.swift */,
 				E26B792621D23C998D868624 /* DeviceCapabilities.swift */,
 				0B6995D9D7490CA5AC49154E /* RawFrameBuffer.swift */,
-);
+			);
 			path = Capture;
 			sourceTree = "<group>";
 		};
@@ -92,11 +100,22 @@
 				49A6E0B1F1CB92AB21462980 /* App */,
 				09684D856AD436352C4DABA2 /* Capture */,
 				4CDD610AB8A7B936DABF84BF /* Encoding */,
-			C1957AEC34B56C8E62CD41D3 /* Processing */,
+				C1957AEC34B56C8E62CD41D3 /* Processing */,
 				B0232E7AB35DCBE5DFD0FB12 /* Resources */,
 				FBDFB6F563B99DF7FB106D68 /* UI */,
 			);
 			path = OwLens;
+			sourceTree = "<group>";
+		};
+		AD7974E0F81C8ACF4F4C43E7 /* Fonts */ = {
+			isa = PBXGroup;
+			children = (
+				88ACB79376A4ADB2E76D6A84 /* Geist-Bold.otf */,
+				0911490D91F50A92F302E9F1 /* Geist-Medium.otf */,
+				44A6CB69E97067EFF7CC0BCE /* Geist-Regular.otf */,
+				350B2DAAF94E5487C687784E /* Geist-SemiBold.otf */,
+			);
+			path = Fonts;
 			sourceTree = "<group>";
 		};
 		B0232E7AB35DCBE5DFD0FB12 /* Resources */ = {
@@ -104,6 +123,7 @@
 			children = (
 				070DE3C47C71365BC53040EE /* Assets.xcassets */,
 				79A87D4FD4181D15AF01133A /* LaunchScreen.storyboard */,
+				AD7974E0F81C8ACF4F4C43E7 /* Fonts */,
 			);
 			path = Resources;
 			sourceTree = "<group>";
@@ -121,10 +141,10 @@
 			children = (
 				DD6827259D4D051C11C1206F /* Debayer.metal */,
 				2DE1BF5BD7BDE0FFB3605E77 /* LogCurve.swift */,
-				BE3A5DA21D71DE0620AC086 /* MetalPipeline.swift */,
-			68F2909FCB3A5B25B0ADFF4C /* MetalPipelineSyntheticTests.swift */,
+				BE3A5DA21D761DE0620AC086 /* MetalPipeline.swift */,
+				8BE4DD470C3C760B3483647C /* MetalPipelineSyntheticTests.swift */,
 				CD4D88339EDB4CCE3E689AC1 /* ScopeData.swift */,
-);
+			);
 			path = Processing;
 			sourceTree = "<group>";
 		};
@@ -185,6 +205,7 @@
 				LastUpgradeCheck = 1600;
 				TargetAttributes = {
 					31260F3EB779569B78DC48B6 = {
+						DevelopmentTeam = "";
 						ProvisioningStyle = Automatic;
 					};
 				};
@@ -214,6 +235,10 @@
 			buildActionMask = 2147483647;
 			files = (
 				17ED19DCA78B30F1B5C30ACB /* Assets.xcassets in Resources */,
+				3661D44664F8CF313CD8B89E /* Geist-Bold.otf in Resources */,
+				EFDBADA2AECA3001AC1FF1F5 /* Geist-Medium.otf in Resources */,
+				2F0BD544481ED89E62B95DD4 /* Geist-Regular.otf in Resources */,
+				9206732F27BDBCE521790125 /* Geist-SemiBold.otf in Resources */,
 				AE4F386058C65A942C92BC8C /* LaunchScreen.storyboard in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -237,7 +262,7 @@
 				CB29FE53AEF7F9FC3782144D /* LevelMonitor.swift in Sources */,
 				03C03B70F14692D73BF263BD /* LogCurve.swift in Sources */,
 				6230A060485520C519CE76DE /* MetalPipeline.swift in Sources */,
-				BD010E6023F35520BB61BA85 /* MetalPipelineSyntheticTests.swift in Sources */,
+				A6CE544628DFD68B67A42911 /* MetalPipelineSyntheticTests.swift in Sources */,
 				0278092DFE170A885C0EC75D /* NormalVideoPreviewView.swift in Sources */,
 				CFC4A66803E3722EA3895818 /* OwLensApp.swift in Sources */,
 				F8C468F1CB4E9D60832D79A4 /* RawFrameBuffer.swift in Sources */,
@@ -246,7 +271,6 @@
 				F8B89CFD32B830286FBEA9F7 /* ScopesOverlay.swift in Sources */,
 				847C433290196B8982F043A3 /* SplashView.swift in Sources */,
 				32637B18CCC58D60E803240A /* VideoWriter.swift in Sources */,
-
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -259,7 +283,7 @@
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CODE_SIGN_IDENTITY = "iPhone Developer";
 				CODE_SIGN_STYLE = Automatic;
-				DEVELOPMENT_TEAM = G2FY7G8XX4;
+				DEVELOPMENT_TEAM = "";
 				INFOPLIST_FILE = OwLens/Resources/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
@@ -344,7 +368,7 @@
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CODE_SIGN_IDENTITY = "iPhone Developer";
 				CODE_SIGN_STYLE = Automatic;
-				DEVELOPMENT_TEAM = G2FY7G8XX4;
+				DEVELOPMENT_TEAM = "";
 				INFOPLIST_FILE = OwLens/Resources/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",

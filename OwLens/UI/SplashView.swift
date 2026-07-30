@@ -6,7 +6,7 @@ struct SplashView: View {
         ZStack {
             Color.black.ignoresSafeArea()
             Text("OwLens")
-                .font(.custom("Helvetica", size: 42))
+                .font(.custom("Geist-SemiBold", size: 42))
                 .fontWeight(.regular)
                 .foregroundColor(.white)
                 .tracking(2)
@@ -21,7 +21,7 @@ struct SplashView: View {
                         .frame(width: 16, height: 16)
                         .foregroundColor(.white.opacity(0.4))
                     Text("jeetdoesthings")
-                        .font(.custom("Helvetica", size: 14))
+                        .font(.custom("Geist-Regular", size: 14))
                         .foregroundColor(.white.opacity(0.4))
                         .tracking(1)
                 }

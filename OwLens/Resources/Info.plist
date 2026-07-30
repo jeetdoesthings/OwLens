@@ -20,14 +20,21 @@
 	<string>1.0</string>
 	<key>CFBundleVersion</key>
 	<string>1</string>
+	<key>LSSupportsOpeningDocumentsInPlace</key>
+	<true/>
 	<key>NSCameraUsageDescription</key>
 	<string>OwLens needs camera access to capture RAW sensor data for log-encoded video recording.</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>OwLens needs microphone access to record audio alongside video.</string>
 	<key>NSPhotoLibraryAddUsageDescription</key>
 	<string>Save recorded log-encoded video to your photo library.</string>
-	<key>LSSupportsOpeningDocumentsInPlace</key>
-	<true/>
+	<key>UIAppFonts</key>
+	<array>
+		<string>Geist-Regular.otf</string>
+		<string>Geist-SemiBold.otf</string>
+		<string>Geist-Bold.otf</string>
+		<string>Geist-Medium.otf</string>
+	</array>
 	<key>UIFileSharingEnabled</key>
 	<true/>
 	<key>UILaunchStoryboardName</key>

@@ -31,6 +31,11 @@ targets:
         LSSupportsOpeningDocumentsInPlace: true
         UIFileSharingEnabled: true
         UILaunchStoryboardName: LaunchScreen
+        UIAppFonts:
+          - Geist-Regular.otf
+          - Geist-SemiBold.otf
+          - Geist-Bold.otf
+          - Geist-Medium.otf
         UIRequiresFullScreen: true
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationLandscapeRight
