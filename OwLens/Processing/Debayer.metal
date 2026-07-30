@@ -358,6 +358,7 @@ struct DenoiseParams {
     int   radius;
     float shotCoeff;
     float readCoeff;
+    float strength;  // 0.0–1.0 adaptive boost from frame-time budget
 };
 
 struct TemporalParams {
@@ -420,10 +421,11 @@ kernel void spatialDenoise(
         shadowBoost = mix(1.45, 0.8, luma01);
     }
 
-    // Luma bilateral radius: sigmaRef * shadowBoost (no fixed boost).
-    // The 1.3x multiplier was removed because it blurred detail at all ISOs
-    // indiscriminately — the shadow boost already handles edge preservation.
-    float lumaRS = sigmaRef * shadowBoost;
+    // Luma bilateral radius: sigmaRef * shadowBoost, scaled by adaptive strength.
+    // strength=0 → normal sigma; strength=1 → 2× sigma (heavier denoise when
+    // frame time is well under budget). Clamped to prevent pathological values.
+    float adaptiveScale = 1.0 + min(max(params.strength, 0.0), 1.0);
+    float lumaRS = sigmaRef * shadowBoost * adaptiveScale;
     float lumaRS2 = lumaRS * lumaRS;
     
     // Spatial sigma adapts to kernel radius
@@ -538,7 +540,7 @@ kernel void denoiseHalfResChroma(
     } else {
         shadowBoost = mix(1.55, 0.9, luma01);
     }
-    float chromaRS = chromaSigmaRef * shadowBoost;
+    float chromaRS = chromaSigmaRef * shadowBoost * (1.0 + min(max(params.strength, 0.0), 1.0));
     float chromaRS2 = chromaRS * chromaRS;
 
     float2 sumUV = float2(0.0);

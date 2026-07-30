@@ -1144,6 +1144,13 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
         let w = activeEncodeWidth
         let h = activeEncodeHeight
 
+        // ── Adaptive denoise: scale strength by frame-time budget ──
+        // 24fps budget = 41.7ms, 30fps budget = 33.3ms.
+        // When rolling average is well under budget, denoise is boosted.
+        // When near or over budget, denoise is throttled or skipped.
+        let budget: Float = activeFPS >= 29 ? 33.3 : 41.7
+        pipeline.denoiseStrength = max(0, min(1, 1.0 - (pipeline.rollingAvgMs / budget)))
+
         if isRecordingUnsafe {
             // ── Recording ──
             // 4K: sensor is 4032×3024 and cannot be binned (half=2016 < 3840).
