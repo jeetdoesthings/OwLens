@@ -1,6 +1,5 @@
 import AVFoundation
 import Foundation
-import UIKit
 
 #if canImport(Darwin)
 import Darwin

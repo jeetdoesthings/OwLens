@@ -1,7 +1,6 @@
 import SwiftUI
 import UIKit
 import MetalKit
-import MetalPerformanceShaders
 import QuartzCore
 
 /// MTKView wrapper — aspect-fits log texture into landscape drawable (no stretch / fake 9:16)
@@ -45,6 +44,7 @@ struct CameraPreviewView: UIViewRepresentable {
         context.coordinator.showClipping = showClipping
         context.coordinator.showFocusPeaking = showFocusPeaking
         context.coordinator.overlayOnly = overlayOnly
+        context.coordinator.isAppActive = UIApplication.shared.applicationState == .active
         uiView.clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: overlayOnly ? 0 : 1)
         uiView.backgroundColor = overlayOnly ? .clear : .black
         uiView.isOpaque = !overlayOnly
@@ -64,6 +64,8 @@ struct CameraPreviewView: UIViewRepresentable {
         var showClipping: Bool = false
         var showFocusPeaking: Bool = false
         var overlayOnly: Bool = false
+        /// Cached app state — updated from MainActor via updateUIView, read on render thread.
+        var isAppActive: Bool = true
         /// No redundant-draw guard needed: the display link runs at 30 fps and frames
         /// arrive at ~24 fps. The ~6 extra fullscreen blits per second are negligible.
         private let renderCommandQueue: MTLCommandQueue?
@@ -92,9 +94,8 @@ struct CameraPreviewView: UIViewRepresentable {
  
         func draw(in view: MTKView) {
             // Skip Metal when app not active (avoids IOGPU background permission error)
-            if UIApplication.shared.applicationState != .active {
-                return
-            }
+            // isAppActive is set on MainActor via updateUIView, read safely here on render thread
+            guard isAppActive else { return }
             guard let drawable = view.currentDrawable,
                   let commandBuffer = renderCommandQueue?.makeCommandBuffer() else {
                 return

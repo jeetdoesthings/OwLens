@@ -51,14 +51,6 @@ struct RootView: View {
                             .opacity(viewModel.previewDisplayMode == .log || viewModel.showClipping || viewModel.showFocusPeaking ? 1 : 0)
                             .allowsHitTesting(viewModel.previewDisplayMode == .log)
                             .ignoresSafeArea()
-                        
-                        if let focusPt = viewModel.focusPointLocation {
-                            Rectangle()
-                                .stroke(Color.yellow, lineWidth: 1.5)
-                                .frame(width: 60, height: 60)
-                                .position(focusPt)
-                                .animation(.spring(), value: viewModel.focusPointLocation)
-                        }
 
                         GridLevelOverlay(
                             showGrid: viewModel.showGrid,

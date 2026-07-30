@@ -70,15 +70,13 @@ enum RecordingFormat: String, CaseIterable, Identifiable {
         switch self {
         case .openGate: return .mbps100
         case .hd169: return .mbps80
-        case .uhd4k: return .mbps150
+        case .uhd4k: return .mbps100
         }
     }
 
     var maxBitratePreset: BitratePreset {
-        switch self {
-        case .uhd4k: return .mbps150
-        default: return .mbps200
-        }
+        // 200Mbps exceeds HEVC realtime encoder limits on iPhone — cap all at 150Mbps.
+        .mbps150
     }
 }
 
@@ -87,7 +85,6 @@ enum BitratePreset: Int, CaseIterable, Identifiable {
     case mbps80 = 80
     case mbps100 = 100
     case mbps150 = 150
-    case mbps200 = 200
 
     var id: Int { rawValue }
     var label: String { "\(rawValue)" }

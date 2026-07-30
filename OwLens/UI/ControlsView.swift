@@ -54,6 +54,7 @@ struct ControlsView: View {
 
             Spacer(minLength: 10)
 
+            denoiseToggleButton
             fpsToggleButton(compact: false)
             statusItem(icon: "waveform.path.ecg", text: shortCurveName(viewModel.selectedCurve))
             statusItem(icon: "camera.filters", text: viewModel.cfaLabel)
@@ -78,6 +79,7 @@ struct ControlsView: View {
             }
             compactLensSelector
             Spacer(minLength: 6)
+            denoiseToggleButton
             fpsToggleButton(compact: true)
             statusItem(icon: "waveform.path.ecg", text: shortCurveName(viewModel.selectedCurve))
             statusIconButton(
@@ -148,6 +150,31 @@ struct ControlsView: View {
         .buttonStyle(.plain)
         .disabled(disabled)
         .accessibilityLabel("Frame rate")
+    }
+
+    private var denoiseToggleButton: some View {
+        let disabled = viewModel.controlsLocked || viewModel.isRecording
+        return Button {
+            viewModel.togglePanel(.denoise)
+        } label: {
+            HStack(spacing: 5) {
+                Image(systemName: "sparkles")
+                    .font(.system(size: 10, weight: .semibold))
+                    .frame(width: 12)
+                Text("DN \(String(format: "%.1f", viewModel.denoiseStrength))")
+                    .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.65)
+            }
+            .foregroundColor(disabled ? .white.opacity(0.35) : viewModel.denoiseStrength > 0.7 ? .orange.opacity(0.9) : .white.opacity(0.9))
+            .padding(.horizontal, 8)
+            .frame(height: 32)
+            .background(Color.black.opacity(disabled ? 0.24 : 0.48))
+            .clipShape(RoundedRectangle(cornerRadius: chromeRadius, style: .continuous))
+        }
+        .buttonStyle(.plain)
+        .disabled(disabled)
+        .accessibilityLabel("Denoise strength")
     }
 
     private var compactLensSelector: some View {
@@ -259,6 +286,14 @@ struct ControlsView: View {
 
             if viewModel.thermalState != .nominal {
                 messagePill(icon: "thermometer.medium", text: thermalMessage, color: thermalColor)
+            }
+
+            if viewModel.activePanel == .denoise, viewModel.denoiseStrength > 0.5 {
+                messagePill(
+                    icon: "exclamationmark.triangle.fill",
+                    text: "Higher denoise may cause laggy footage",
+                    color: .orange
+                )
             }
 
             if let panel = viewModel.activePanel, !viewModel.isRecording {
@@ -653,6 +688,25 @@ struct ControlsView: View {
                             viewModel.chooseSaveDestination(destination)
                         }
                     }
+                }
+            case .denoise:
+                panelHeader("Denoise")
+                VStack(spacing: 10) {
+                    HStack {
+                        Text("Off")
+                            .font(.system(size: 10, weight: .medium))
+                            .foregroundColor(.white.opacity(0.6))
+                        Slider(value: $viewModel.denoiseStrength, in: 0.0...1.0)
+                            .tint(.white)
+                        Text("Max")
+                            .font(.system(size: 10, weight: .medium))
+                            .foregroundColor(.white.opacity(0.6))
+                    }
+                    .padding(.horizontal, 4)
+                    Text("Strength: \(String(format: "%.2f", viewModel.denoiseStrength))")
+                        .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                        .foregroundColor(.white.opacity(0.8))
+                        .frame(maxWidth: .infinity, alignment: .trailing)
                 }
             }
         }

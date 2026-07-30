@@ -2,28 +2,36 @@
 
 <img src="owlens-logo.png" width="128" height="128" alt="OwLens Logo" />
 
-**OwLens** is a professional-grade iOS camera application designed for filmmakers and power users who want maximum control over their video capture. It bypasses Apple's standard image signal processor (ISP) pipeline, capturing uncompressed 12-bit RAW sensor data and encoding it directly into HEVC S-Log3 in real-time using custom Metal shaders.
+**OwLens** is a professional-grade iOS camera application designed for filmmakers and power users who want maximum control over their video capture. It bypasses Apple's standard image signal processor (ISP) pipeline, capturing uncompressed 14-bit RAW sensor data and encoding it directly into HEVC S-Log3 in real-time using custom Metal shaders.
 
 ## Features
 
-- **True RAW to S-Log3 Pipeline:** OwLens captures uncompressed RAW Bayer sensor data (Bayer14) and debayers it on the GPU, applying a true S-Log3 transfer function before saving it as 10-bit HEVC. This produces an unprocessed video straight from the phone sensor, with no artificial sharpening, noise reduction, or local tone mapping from the Apple ISP.
-- **Open Gate 4:3 Capture:** Captures the full aspect ratio of the camera sensor without cropping it to 16:9, providing the maximum vertical resolution and total flexibility for reframing in post-production.
-- **Constant Frame Rate (CFR):** Guarantees locked 24fps or 30fps files by holding the last valid frame if the camera drops a frame, ensuring perfectly synced audio in NLEs like Premiere Pro and DaVinci Resolve.
-- **Manual Controls:** Full manual control over ISO (50–2000), White Balance (Kelvin), and Focus.
-- **Cinematic Shutter Angles:** Control motion blur using standard cinematic shutter angles (from 11.25° to 360°) on a continuous magnetic slider, enforcing a true 180° shutter rule when changing frame rates.
-- **Focus Peaking & Tap-to-Focus:** High-performance Metal-accelerated Focus Peaking (green edge highlight) for zero-overhead manual focus tracking. Includes a tap-to-focus gesture with a visual reticle and single-shot AF to completely eliminate optical image stabilization (OIS) jitter during pans.
-- **Dynamic Lens Switching:** Automatically detects all available single-lens physical cameras on the device (Ultra Wide, Wide, Telephoto) and allows seamless switching.
-- **Audio Control:** Automatically detects external microphones (USB, Headset, Bluetooth) and falls back to the high-quality built-in iPhone mic. Includes a real-time audio level monitor.
-- **Professional Overlays:** Includes a rule-of-thirds grid, a real-time hardware gyroscope level overlay, and clipping indicators (zebras) to ensure perfectly straight and exposed shots.
-- **Metal Accelerated:** Uses a fused Metal compute kernel for simultaneous Debayering, White Balance scaling, and S-Log3 conversion, eliminating CPU bottlenecks and minimizing thermal throttling.
+- **True RAW to S-Log3 Pipeline:** Captures uncompressed RAW Bayer sensor data (Bayer14) and debayers it on the GPU, applying a true S-Log3 transfer function before saving as 10-bit HEVC. Unprocessed video straight from the sensor — no artificial sharpening, noise reduction, or local tone mapping from the Apple ISP.
+- **Real-Time GPU Denoising:** Spatial bilateral denoise on luma + cross-bilateral half-res chroma denoise + 3-frame ring-buffer temporal averaging with per-frame motion gating. Strength is user-adjustable from 0.0–1.0 via the Denoise panel controls.
+- **Open Gate 4:3 Capture:** Captures the full sensor aspect ratio without cropping to 16:9, providing maximum vertical resolution and reframing flexibility in post.
+- **Constant Frame Rate (CFR):** Locked 24fps or 30fps files — holds the last valid frame if one drops, ensuring perfectly synced audio in Premiere Pro and DaVinci Resolve.
+- **Manual Controls:** Full manual control over ISO (device min–max), shutter angle (continuous magnetic slider with cinematic snap targets), and White Balance (Kelvin).
+- **Focus Control:** Continuous auto-focus when unlocked. Tap-to-focus locks at the tapped point during recording. Focus peaking (green edge highlight) for zero-overhead manual focus tracking.
+- **User-Adjustable Denoise:** Slider-controlled denoise strength (0.0–1.0) in the status strip. Higher values provide stronger noise reduction at increased GPU cost. Warning indicator shows when strength exceeds 0.5.
+- **Dynamic Lens Switching:** Automatically detects all available single-lens physical cameras (Ultra Wide, Wide, Telephoto) and allows seamless switching.
+- **Audio Control:** Supports external microphones (USB, Headset, Bluetooth) and built-in mic. Real-time audio level monitoring.
+- **Professional Overlays:** Rule-of-thirds grid, real-time hardware gyroscope level overlay, clipping indicators (zebras), and RGB histogram + waveform scope.
 
 ## How it Works
 
 OwLens bypasses standard iOS image processing using a three-stage custom pipeline:
 
-1. **Direct Sensor Access:** The app queries the camera hardware directly to capture uncompressed 12-bit RAW Bayer sensor data, bypassing Apple's built-in noise reduction, sharpening, and tone-mapping.
-2. **Metal-Accelerated GPU Pipeline:** A custom Metal compute shader runs directly on the GPU to perform real-time bilinear debayering, apply white balance gains in the linear color space, and apply the Sony S-Log3 transfer function.
-3. **Hardware Encoding:** The resulting log-encoded texture is fed directly to the iPhone's H.265 (HEVC) hardware encoder at bitrates up to 200 Mbps, maintaining a constant frame rate (CFR) to ensure audio sync.
+1. **Direct Sensor Access:** Captures uncompressed 14-bit RAW Bayer sensor data via AVCapturePhotoOutput, bypassing Apple's built-in noise reduction, sharpening, and tone-mapping.
+2. **Metal-Accelerated GPU Pipeline:** A suite of Metal compute shaders runs on the GPU: defect pixel correction → Malvar-He-Cutler directional demosaic with LSC and WB → bilateral spatial/temporal denoise → Sony S-Log3 transfer function.
+3. **Hardware Encoding:** The log-encoded texture is written to a CVPixelBuffer and fed to the iPhone's HEVC hardware encoder at up to 150 Mbps, maintaining a constant frame rate (CFR) to ensure audio sync.
+
+### Recording Quality by Resolution
+
+| Format | Resolution | Denoise | Bitrate |
+|--------|-----------|---------|---------|
+| Open Gate 4:3 | 1920×1440 | Full (spatial + chroma + temporal) | Up to 150 Mbps |
+| 1080p 16:9 | 1920×1080 | Full (spatial + chroma + temporal) | Up to 150 Mbps |
+| 4K 16:9 | 3840×2160 | Light (previewFast quality, radius=2) | Up to 150 Mbps |
 
 ## Color Grading in DaVinci Resolve
 
@@ -47,24 +55,16 @@ You'll need:
    git clone https://github.com/[your-username]/owlens.git
    cd owlens
    ```
-2. Install XcodeGen, if you don't already have it (used to generate the Xcode project file):
-   ```bash
-   brew install xcodegen
-   ```
-3. Generate the project:
-   ```bash
-   xcodegen generate
-   ```
-4. Open the project:
+2. Open the project:
    ```bash
    open OwLens.xcodeproj
    ```
-5. Sign the app with your Apple ID:
+3. Sign the app with your Apple ID:
    * In Xcode, click the **OwLens** project in the left sidebar.
    * Under **Signing & Capabilities**, select your name under **Team**. (If you don't see your Apple ID listed, go to **Xcode** → **Settings** → **Accounts** and add it there first.)
-6. Connect your iPhone to your Mac, and select it as the run destination from the device dropdown at the top of the Xcode window.
-7. Run it: press **Cmd + R**, or click the ▶️ button.
-8. Trust the developer certificate on your iPhone (first run only):
+4. Connect your iPhone to your Mac, and select it as the run destination from the device dropdown at the top of the Xcode window.
+5. Run it: press **Cmd + R**, or click the ▶️ button.
+6. Trust the developer certificate on your iPhone (first run only):
    * Go to **Settings** → **General** → **VPN & Device Management** on your iPhone.
    * Tap your Apple ID under "Developer App," then tap **Trust**.
 

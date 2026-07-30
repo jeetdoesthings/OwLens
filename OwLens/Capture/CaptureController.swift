@@ -1,6 +1,4 @@
 import AVFoundation
-import AudioToolbox
-import Combine
 import CoreVideo
 import QuartzCore
 
@@ -84,7 +82,7 @@ final class CaptureController: NSObject, ObservableObject {
         guard let firstLens = ordered.first,
               let camera = Self.requireSingleLensDevice(uniqueID: firstLens.uniqueID) else {
             session.commitConfiguration()
-            throw NSError(domain: "RawLogCam", code: 1, userInfo: [NSLocalizedDescriptionKey: "No single-lens back camera found"])
+            throw NSError(domain: "OwLens", code: 1, userInfo: [NSLocalizedDescriptionKey: "No single-lens back camera found"])
         }
         self.device = camera
         Self.logSelectedCamera(camera, context: "configureSession")
@@ -92,14 +90,14 @@ final class CaptureController: NSObject, ObservableObject {
         let input = try AVCaptureDeviceInput(device: camera)
         guard session.canAddInput(input) else {
             session.commitConfiguration()
-            throw NSError(domain: "RawLogCam", code: 2, userInfo: [NSLocalizedDescriptionKey: "Cannot add camera input"])
+            throw NSError(domain: "OwLens", code: 2, userInfo: [NSLocalizedDescriptionKey: "Cannot add camera input"])
         }
         session.addInput(input)
         self.videoInput = input
 
         guard session.canAddOutput(photoOutput) else {
             session.commitConfiguration()
-            throw NSError(domain: "RawLogCam", code: 3, userInfo: [NSLocalizedDescriptionKey: "Cannot add photo output"])
+            throw NSError(domain: "OwLens", code: 3, userInfo: [NSLocalizedDescriptionKey: "Cannot add photo output"])
         }
         session.addOutput(photoOutput)
 
@@ -138,7 +136,7 @@ final class CaptureController: NSObject, ObservableObject {
             try? AVAudioSession.sharedInstance().setPreferredInput(builtIn)
         }
 
-        print("[RawLogCam] Ready. singleLensTypes=\(lenses.map { Self.deviceTypeLabel($0.deviceType) }.joined(separator: ", ")) Bayer=\(fourCC(rawPixelFormat)) inFlight=\(maxInFlight)")
+        print("[CaptureController] Ready. singleLensTypes=\(lenses.map { Self.deviceTypeLabel($0.deviceType) }.joined(separator: ", ")) Bayer=\(fourCC(rawPixelFormat)) inFlight=\(maxInFlight)")
     }
 
     /// Lock sensor cadence without changing activeFormat (keeps photo/RAW path).
@@ -149,16 +147,16 @@ final class CaptureController: NSObject, ObservableObject {
             defer { camera.unlockForConfiguration() }
             let ranges = camera.activeFormat.videoSupportedFrameRateRanges
             guard ranges.contains(where: { $0.minFrameRate <= rate && rate <= $0.maxFrameRate }) else {
-                print("[RawLogCam] Sensor FPS \(rate) not in range; leaving default")
+                print("[CaptureController] Sensor FPS \(rate) not in range; leaving default")
                 return
             }
             let duration = CMTime(value: 1, timescale: CMTimeScale(rate))
             camera.activeVideoMinFrameDuration = duration
             camera.activeVideoMaxFrameDuration = duration
             let dims = CMVideoFormatDescriptionGetDimensions(camera.activeFormat.formatDescription)
-            print("[RawLogCam] Sensor \(dims.width)x\(dims.height) locked @ \(rate)fps (preset .photo)")
+            print("[CaptureController] Sensor \(dims.width)x\(dims.height) locked @ \(rate)fps (preset .photo)")
         } catch {
-            print("[RawLogCam] lockSensorToTargetFPS: \(error)")
+            print("[CaptureController] lockSensorToTargetFPS: \(error)")
         }
     }
 
@@ -170,7 +168,7 @@ final class CaptureController: NSObject, ObservableObject {
             photoOutput.isZeroShutterLagEnabled = true
             if bayerFormatsAvailable().isEmpty {
                 photoOutput.isZeroShutterLagEnabled = false
-                print("[RawLogCam] ZSL disabled — would remove Bayer RAW")
+                print("[CaptureController] ZSL disabled — would remove Bayer RAW")
             }
         }
         if photoOutput.isResponsiveCaptureSupported {
@@ -178,7 +176,7 @@ final class CaptureController: NSObject, ObservableObject {
             if bayerFormatsAvailable().isEmpty {
                 photoOutput.isResponsiveCaptureEnabled = false
                 maxInFlight = 1
-                print("[RawLogCam] Responsive capture disabled — would remove Bayer RAW")
+                print("[CaptureController] Responsive capture disabled — would remove Bayer RAW")
             } else {
                 maxInFlight = 2
             }
@@ -187,7 +185,7 @@ final class CaptureController: NSObject, ObservableObject {
             photoOutput.isFastCapturePrioritizationEnabled = true
             if bayerFormatsAvailable().isEmpty {
                 photoOutput.isFastCapturePrioritizationEnabled = false
-                print("[RawLogCam] Fast capture prioritization disabled — Bayer safety")
+                print("[CaptureController] Fast capture prioritization disabled — Bayer safety")
             }
         }
     }
@@ -201,13 +199,13 @@ final class CaptureController: NSObject, ObservableObject {
     /// Must run **after** `session.commitConfiguration()` with photo input+output attached.
     private func resolveBayerRAWOrThrow() throws {
         var allRaw = photoOutput.availableRawPhotoPixelFormatTypes
-        print("[RawLogCam] Available RAW formats: \(allRaw.map { fourCC($0) })")
+        print("[CaptureController] Available RAW formats: \(allRaw.map { fourCC($0) })")
 
         var bayer = bayerFormatsAvailable()
-        print("[RawLogCam] Bayer formats: \(bayer.map { fourCC($0) })")
+        print("[CaptureController] Bayer formats: \(bayer.map { fourCC($0) })")
 
         if bayer.isEmpty {
-            print("[RawLogCam] Bayer empty — soft reset (.photo, no burst opts)")
+            print("[CaptureController] Bayer empty — soft reset (.photo, no burst opts)")
             session.beginConfiguration()
             session.sessionPreset = .photo
             photoOutput.maxPhotoQualityPrioritization = .speed
@@ -221,7 +219,7 @@ final class CaptureController: NSObject, ObservableObject {
 
             allRaw = photoOutput.availableRawPhotoPixelFormatTypes
             bayer = bayerFormatsAvailable()
-            print("[RawLogCam] Bayer after soft reset: \(bayer.map { fourCC($0) }) all=\(allRaw.map { fourCC($0) })")
+            print("[CaptureController] Bayer after soft reset: \(bayer.map { fourCC($0) }) all=\(allRaw.map { fourCC($0) })")
         }
 
         // Try other back lenses if needed
@@ -229,11 +227,11 @@ final class CaptureController: NSObject, ObservableObject {
             for lens in Self.discoverBackLenses() {
                 guard lens.uniqueID != device?.uniqueID,
                       let cam = AVCaptureDevice(uniqueID: lens.uniqueID) else { continue }
-                print("[RawLogCam] Trying lens for Bayer: \(lens.shortLabel)")
+                print("[CaptureController] Trying lens for Bayer: \(lens.shortLabel)")
                 if switchVideoDeviceSync(to: cam) {
                     bayer = bayerFormatsAvailable()
                     if !bayer.isEmpty {
-                        print("[RawLogCam] Bayer found on \(lens.shortLabel)")
+                        print("[CaptureController] Bayer found on \(lens.shortLabel)")
                         break
                     }
                 }
@@ -243,25 +241,25 @@ final class CaptureController: NSObject, ObservableObject {
         // Last resort: if *any* RAW exists and Bayer filter fails, still reject ProRAW-only
         // but log everything for debugging
         if bayer.isEmpty && !allRaw.isEmpty {
-            print("[RawLogCam] WARNING: RAW present but none classified as Bayer — \(allRaw.map { fourCC($0) })")
+            print("[CaptureController] WARNING: RAW present but none classified as Bayer — \(allRaw.map { fourCC($0) })")
         }
 
         guard let rawFormat = Self.preferredBayerFormat(from: bayer) else {
             throw NSError(
-                domain: "RawLogCam",
+                domain: "OwLens",
                 code: 4,
                 userInfo: [NSLocalizedDescriptionKey: "No Bayer RAW available. Use Photo preset + Wide camera. Reboot if stuck."]
             )
         }
         self.rawPixelFormat = rawFormat
         self.formatCFAPattern = Self.cfaPattern(forBayerFormat: rawFormat)
-        print("[RawLogCam] Selected Bayer RAW: \(fourCC(rawFormat)) CFA=\(formatCFAPattern)")
+        print("[CaptureController] Selected Bayer RAW: \(fourCC(rawFormat)) CFA=\(formatCFAPattern)")
     }
 
     /// Synchronous lens swap for setup recovery (capture queue not required).
     private func switchVideoDeviceSync(to camera: AVCaptureDevice) -> Bool {
         guard Self.isAllowedSingleLens(camera.deviceType), !camera.isVirtualDevice else {
-            print("[RawLogCam] switchVideoDeviceSync rejected multi-cam/virtual \(Self.deviceTypeLabel(camera.deviceType))")
+            print("[CaptureController] switchVideoDeviceSync rejected multi-cam/virtual \(Self.deviceTypeLabel(camera.deviceType))")
             return false
         }
         Self.logSelectedCamera(camera, context: "switchVideoDeviceSync")
@@ -294,9 +292,9 @@ final class CaptureController: NSObject, ObservableObject {
         let prepared = (0..<3).map { _ in makeRAWPhotoSettings() }
         photoOutput.setPreparedPhotoSettingsArray(prepared) { preparedOK, error in
             if let error {
-                print("[RawLogCam] prepare RAW settings failed: \(error)")
+                print("[CaptureController] prepare RAW settings failed: \(error)")
             } else {
-                print("[RawLogCam] RAW photo resources prepared=\(preparedOK)")
+                print("[CaptureController] RAW photo resources prepared=\(preparedOK)")
             }
         }
     }
@@ -387,7 +385,7 @@ final class CaptureController: NSObject, ObservableObject {
         let ok = isAllowedSingleLens(type)
         let dims = CMVideoFormatDescriptionGetDimensions(device.activeFormat.formatDescription)
         print("""
-        [RawLogCam] CAMERA SELECT context=\(context)
+        [OwLens] CAMERA SELECT context=\(context)
           deviceType=\(deviceTypeLabel(type))
           singleLensOK=\(ok)
           localizedName=\(device.localizedName)
@@ -397,7 +395,7 @@ final class CaptureController: NSObject, ObservableObject {
           isVirtualDevice=\(device.isVirtualDevice)
         """)
         if !ok || device.isVirtualDevice {
-            print("[RawLogCam] ERROR: multi-cam / virtual device selected — Bayer RAW path will fail")
+            print("[CaptureController] ERROR: multi-cam / virtual device selected — Bayer RAW path will fail")
         }
     }
 
@@ -405,7 +403,7 @@ final class CaptureController: NSObject, ObservableObject {
     static func requireSingleLensDevice(uniqueID: String) -> AVCaptureDevice? {
         guard let device = AVCaptureDevice(uniqueID: uniqueID) else { return nil }
         guard isAllowedSingleLens(device.deviceType), !device.isVirtualDevice else {
-            print("[RawLogCam] Rejected camera uniqueID=\(uniqueID) type=\(deviceTypeLabel(device.deviceType)) virtual=\(device.isVirtualDevice)")
+            print("[CaptureController] Rejected camera uniqueID=\(uniqueID) type=\(deviceTypeLabel(device.deviceType)) virtual=\(device.isVirtualDevice)")
             return nil
         }
         return device
@@ -430,11 +428,11 @@ final class CaptureController: NSObject, ObservableObject {
 
         for device in discovery.devices {
             guard isAllowedSingleLens(device.deviceType) else {
-                print("[RawLogCam] discover: skip forbidden type \(deviceTypeLabel(device.deviceType))")
+                print("[CaptureController] discover: skip forbidden type \(deviceTypeLabel(device.deviceType))")
                 continue
             }
             guard !device.isVirtualDevice else {
-                print("[RawLogCam] discover: skip virtual \(device.localizedName)")
+                print("[CaptureController] discover: skip virtual \(device.localizedName)")
                 continue
             }
             guard !seen.contains(device.uniqueID) else { continue }
@@ -452,7 +450,7 @@ final class CaptureController: NSObject, ObservableObject {
                 )
                 name = "Telephoto"; short = "\(multiplier)×"
             default:
-                print("[RawLogCam] discover: unexpected type \(deviceTypeLabel(device.deviceType)) — skipped")
+                print("[CaptureController] discover: unexpected type \(deviceTypeLabel(device.deviceType)) — skipped")
                 continue
             }
 
@@ -463,12 +461,12 @@ final class CaptureController: NSObject, ObservableObject {
                 deviceType: device.deviceType,
                 uniqueID: device.uniqueID
             ))
-            print("[RawLogCam] discover: + \(short) \(deviceTypeLabel(device.deviceType)) id=\(device.uniqueID)")
+            print("[CaptureController] discover: + \(short) \(deviceTypeLabel(device.deviceType)) id=\(device.uniqueID)")
         }
 
         // Fallback if DiscoverySession empty: explicit defaults per type (still single-lens only)
         if options.isEmpty {
-            print("[RawLogCam] discover: DiscoverySession empty — trying defaultDevice per single-lens type")
+            print("[CaptureController] discover: DiscoverySession empty — trying defaultDevice per single-lens type")
             for type in allowedSingleLensTypes {
                 guard let device = AVCaptureDevice.default(type, for: .video, position: .back),
                       !device.isVirtualDevice else { continue }
@@ -494,7 +492,7 @@ final class CaptureController: NSObject, ObservableObject {
                     deviceType: type,
                     uniqueID: device.uniqueID
                 ))
-                print("[RawLogCam] discover fallback: + \(short) \(deviceTypeLabel(type))")
+                print("[CaptureController] discover fallback: + \(short) \(deviceTypeLabel(type))")
             }
         }
 
@@ -506,7 +504,7 @@ final class CaptureController: NSObject, ObservableObject {
         ]
         options.sort { (sortOrder[$0.deviceType] ?? 9) < (sortOrder[$1.deviceType] ?? 9) }
 
-        print("[RawLogCam] discoverBackLenses count=\(options.count) types=[\(options.map { "\($0.shortLabel) \(deviceTypeLabel($0.deviceType))" }.joined(separator: ", "))]")
+        print("[CaptureController] discoverBackLenses count=\(options.count) types=[\(options.map { "\($0.shortLabel) \(deviceTypeLabel($0.deviceType))" }.joined(separator: ", "))]")
         return options
     }
 
@@ -544,7 +542,7 @@ final class CaptureController: NSObject, ObservableObject {
             do {
                 guard let camera = Self.requireSingleLensDevice(uniqueID: uniqueID) else {
                     throw NSError(
-                        domain: "RawLogCam",
+                        domain: "OwLens",
                         code: 7,
                         userInfo: [NSLocalizedDescriptionKey: "Lens not found or is multi-cam virtual (Bayer RAW requires single-lens device)"]
                     )
@@ -563,7 +561,7 @@ final class CaptureController: NSObject, ObservableObject {
                         self.device = previousDevice
                     }
                     self.session.commitConfiguration()
-                    throw NSError(domain: "RawLogCam", code: 8, userInfo: [NSLocalizedDescriptionKey: "Cannot switch to this lens"])
+                    throw NSError(domain: "OwLens", code: 8, userInfo: [NSLocalizedDescriptionKey: "Cannot switch to this lens"])
                 }
                 self.session.addInput(newInput)
                 self.videoInput = newInput
@@ -603,11 +601,11 @@ final class CaptureController: NSObject, ObservableObject {
                 if wasRunning {
                     self.startFrameTimer(fps: self.targetFPS)
                 }
-                print("[RawLogCam] Lens → \(camera.localizedName)")
+                print("[CaptureController] Lens → \(camera.localizedName)")
                 DispatchQueue.main.async { completion?(nil) }
             } catch {
                 if wasRunning { self.startFrameTimer(fps: self.targetFPS) }
-                print("[RawLogCam] Lens switch failed: \(error)")
+                print("[CaptureController] Lens switch failed: \(error)")
                 DispatchQueue.main.async { completion?(error) }
             }
         }
@@ -673,13 +671,13 @@ final class CaptureController: NSObject, ObservableObject {
                     guard let port = audioSession.availableInputs?.first(where: { $0.uid == portUID }) else {
                         self.isReconfiguringAudio = false
                         if wasRunning { self.startFrameTimer(fps: self.targetFPS) }
-                        let err = NSError(domain: "RawLogCam", code: 5, userInfo: [NSLocalizedDescriptionKey: "Mic port not found — reconnect"])
+                        let err = NSError(domain: "OwLens", code: 5, userInfo: [NSLocalizedDescriptionKey: "Mic port not found — reconnect"])
                         DispatchQueue.main.async { completion?(err) }
                         return
                     }
                     try audioSession.setPreferredInput(port)
                     self.selectedAudioPortUID = portUID
-                    print("[RawLogCam] Audio port → \(port.portName)")
+                    print("[CaptureController] Audio port → \(port.portName)")
                 } else {
                     if self.audioInput != nil {
                         self.session.beginConfiguration()
@@ -690,7 +688,7 @@ final class CaptureController: NSObject, ObservableObject {
                         self.session.commitConfiguration()
                     }
                     self.selectedAudioPortUID = nil
-                    print("[RawLogCam] Audio: Off")
+                    print("[CaptureController] Audio: Off")
                 }
 
                 self.isReconfiguringAudio = false
@@ -699,7 +697,7 @@ final class CaptureController: NSObject, ObservableObject {
             } catch {
                 self.isReconfiguringAudio = false
                 if wasRunning { self.startFrameTimer(fps: self.targetFPS) }
-                print("[RawLogCam] Audio switch failed: \(error)")
+                print("[CaptureController] Audio switch failed: \(error)")
                 DispatchQueue.main.async { completion?(error) }
             }
         }
@@ -708,7 +706,7 @@ final class CaptureController: NSObject, ObservableObject {
     private func attachAudioDevice(_ mic: AVCaptureDevice) throws {
         let input = try AVCaptureDeviceInput(device: mic)
         guard session.canAddInput(input) else {
-            throw NSError(domain: "RawLogCam", code: 6, userInfo: [NSLocalizedDescriptionKey: "Cannot add mic input"])
+            throw NSError(domain: "OwLens", code: 6, userInfo: [NSLocalizedDescriptionKey: "Cannot add mic input"])
         }
         session.addInput(input)
         self.audioInput = input
@@ -774,8 +772,8 @@ final class CaptureController: NSObject, ObservableObject {
         guard let device = device else { return }
         do {
             try device.lockForConfiguration()
-            if device.isFocusModeSupported(.autoFocus) {
-                device.focusMode = .autoFocus
+            if device.isFocusModeSupported(.continuousAutoFocus) {
+                device.focusMode = .continuousAutoFocus
             } else if device.isFocusModeSupported(.autoFocus) {
                 device.focusMode = .autoFocus
             }
@@ -797,10 +795,8 @@ final class CaptureController: NSObject, ObservableObject {
                     device.focusMode = .autoFocus
                 }
             } else {
-                if device.isFocusModeSupported(.autoFocus) {
-                    device.focusMode = .autoFocus
-                } else if device.isFocusModeSupported(.autoFocus) {
-                    device.focusMode = .autoFocus
+                if device.isFocusModeSupported(.continuousAutoFocus) {
+                    device.focusMode = .continuousAutoFocus
                 }
             }
             device.unlockForConfiguration()
@@ -874,7 +870,7 @@ final class CaptureController: NSObject, ObservableObject {
         }
         timer.resume()
         captureTimer = timer
-        print("[RawLogCam] Capture burst → \(fps) fps (interval \(String(format: "%.3f", minFrameInterval))s)")
+        print("[CaptureController] Capture burst → \(fps) fps (interval \(String(format: "%.3f", minFrameInterval))s)")
     }
 
     private func captureOneRawFrame() {
@@ -997,31 +993,27 @@ final class CaptureController: NSObject, ObservableObject {
 // MARK: - Photo delegate
 
 extension CaptureController: AVCapturePhotoCaptureDelegate {
-    func photoOutput(_ output: AVCapturePhotoOutput, willCapturePhotoFor resolvedSettings: AVCaptureResolvedPhotoSettings) {
-        AudioServicesDisposeSystemSoundID(1108)
-    }
-
-    func photoOutput(_ output: AVCapturePhotoOutput, didCapturePhotoFor resolvedSettings: AVCaptureResolvedPhotoSettings) {
-        AudioServicesDisposeSystemSoundID(1108)
-    }
+    // Shutter sound is suppressed by the .playAndRecord audio session category
+    // set during configureSession, plus the isShutterSoundSuppressionEnabled flag
+    // on iOS 18+. No per-frame AudioServices calls needed.
 
     func photoOutput(_ output: AVCapturePhotoOutput, didFinishProcessingPhoto photo: AVCapturePhoto, error: Error?) {
         // Always free the capture slot ASAP after we copy the buffer.
         defer { endInFlight() }
 
         if let error {
-            print("[RawLogCam] Capture error: \(error.localizedDescription)")
+            print("[CaptureController] Capture error: \(error.localizedDescription)")
             return
         }
 
         guard let systemBuffer = photo.pixelBuffer else {
-            print("[RawLogCam] No pixel buffer on RAW photo")
+            print("[CaptureController] No pixel buffer on RAW photo")
             return
         }
 
         // CRITICAL: copy then drop system buffer reference so next RAW can start.
         guard let owned = Self.copyBayerPixelBuffer(systemBuffer) else {
-            print("[RawLogCam] Failed to copy Bayer buffer")
+            print("[CaptureController] Failed to copy Bayer buffer")
             return
         }
 

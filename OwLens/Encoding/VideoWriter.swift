@@ -18,6 +18,7 @@ final class VideoWriter {
     private var height: Int = 0
     private var targetFPS: Double = 24
     private var startHostTime: CFTimeInterval = 0
+    private var audioReferenceTime: CMTime = .invalid
     private var hasStartedSession = false
     private var lastPixelBuffer: CVPixelBuffer?
     private let lock = NSLock()
@@ -65,12 +66,7 @@ final class VideoWriter {
             AVVideoCodecKey: AVVideoCodecType.hevc,
             AVVideoWidthKey: width,
             AVVideoHeightKey: height,
-            AVVideoCompressionPropertiesKey: compression,
-            AVVideoColorPropertiesKey: [
-                AVVideoColorPrimariesKey: AVVideoColorPrimaries_ITU_R_709_2,
-                AVVideoTransferFunctionKey: AVVideoTransferFunction_ITU_R_709_2,
-                AVVideoYCbCrMatrixKey: AVVideoYCbCrMatrix_ITU_R_709_2
-            ]
+            AVVideoCompressionPropertiesKey: compression
         ]
 
         let vInput = AVAssetWriterInput(mediaType: .video, outputSettings: videoSettings)
@@ -226,8 +222,7 @@ final class VideoWriter {
 
         guard isRecording,
               let input = audioInput,
-              hasStartedSession,
-              startHostTime > 0 else {
+              hasStartedSession else {
             return false
         }
         guard input.isReadyForMoreMediaData else { return false }
@@ -244,10 +239,16 @@ final class VideoWriter {
         ), count: timingCount)
         CMSampleBufferGetOutputSampleTimingInfoArray(sampleBuffer, entryCount: timingCount, arrayToFill: &timings, entriesNeededOut: &timingCount)
 
-        let startCMTime = CMTime(seconds: startHostTime, preferredTimescale: 48_000)
+        // Use the first audio sample's PTS as reference to keep all retiming
+        // in the audio clock domain (not host time / CACurrentMediaTime).
+        // This prevents drift from mismatched clock domains.
+        let firstPTS = timings[0].presentationTimeStamp
+        if CMTimeCompare(audioReferenceTime, .invalid) == 0 {
+            audioReferenceTime = firstPTS
+        }
         
         for i in 0..<timings.count {
-            timings[i].presentationTimeStamp = CMTimeSubtract(timings[i].presentationTimeStamp, startCMTime)
+            timings[i].presentationTimeStamp = CMTimeSubtract(timings[i].presentationTimeStamp, audioReferenceTime)
             if timings[i].decodeTimeStamp.isValid {
                 timings[i].decodeTimeStamp = timings[i].presentationTimeStamp
             }

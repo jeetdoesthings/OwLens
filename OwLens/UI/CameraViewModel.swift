@@ -132,8 +132,28 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
     @Published private(set) var isAutoExposureAdjusting: Bool = false
     @Published private(set) var isAutoWhiteBalanceAdjusting: Bool = false
 
+    /// User-adjustable denoise strength (0.0–1.0). Written to MetalPipeline on change.
+    @Published var denoiseStrength: Float = 1.0 {
+        didSet {
+            metalPipeline?.denoiseStrength = denoiseStrength
+        }
+    }
+
     // Focus properties
-    @Published var isFocusLocked: Bool = false
+    /// Tracks work item to cancel if focus is re-locked before 2s auto-dismiss fires.
+    private var focusLockDismissWork: DispatchWorkItem?
+    @Published var isFocusLocked: Bool = false {
+        didSet {
+            focusLockDismissWork?.cancel()
+            if isFocusLocked {
+                let work = DispatchWorkItem { [weak self] in
+                    self?.isFocusLocked = false
+                }
+                focusLockDismissWork = work
+                DispatchQueue.main.asyncAfter(deadline: .now() + 2.0, execute: work)
+            }
+        }
+    }
     @Published var isAutoFocus: Bool = true {
         didSet {
             if isAutoFocus {
@@ -150,10 +170,8 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
             captureController.setManualFocus(lensPosition: focusLensPosition)
         }
     }
-    @Published var focusPointLocation: CGPoint? = nil
 
-    
-    // Calibration UI state (kept for future use)
+    // Exposure / WB control values
 
     /// Discrete stop lists (snap slider).
     @Published private(set) var isoStops: [Float] = ExposureStops.isoStops(in: 50...2000)
@@ -168,7 +186,7 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
             guard v != isoValue else { return }
             isoValue = v
             guard !controlsLocked, !isAutoExposureEnabled else { return }
-            applyManualExposureAndWB()
+            scheduleExposureUpdate()
         }
     }
     func setShutterAngleWithSnapping(_ rawValue: Float) {
@@ -188,7 +206,7 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
         
         if finalValue != shutterValue {
             shutterValue = finalValue
-            if isCameraReady { applyManualExposureAndWB() }
+            if isCameraReady { scheduleExposureUpdate() }
         }
     }
     @Published var wbStopIndex: Int = 0 {
@@ -200,7 +218,7 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
             guard v != wbKelvin else { return }
             wbKelvin = v
             guard !controlsLocked, !isAutoWhiteBalanceEnabled else { return }
-            applyManualExposureAndWB()
+            scheduleExposureUpdate()
         }
     }
 
@@ -218,6 +236,8 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
     nonisolated(unsafe) private let frameBuffer = RawFrameBuffer(capacity: 5)
 
     private var cancellables = Set<AnyCancellable>()
+    /// Debounce rapid slider changes to avoid blocking the main thread on lockForConfiguration().
+    private var exposureDebounceWork: DispatchWorkItem?
     private var recordingStartTime: Date?
     private var recordingTimer: Timer?
     nonisolated(unsafe) private var frameIndex: Int64 = 0
@@ -248,7 +268,7 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
 
 
     enum ControlPanel: String, Identifiable {
-        case exposure, iso, shutter, wb, focus, fps, format, log, bitrate, mic, lens, save
+        case exposure, iso, shutter, wb, focus, fps, format, log, bitrate, denoise, mic, lens, save
         var id: String { rawValue }
     }
 
@@ -266,6 +286,7 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
 #endif
         loadFilesFolderBookmark()
         metalPipeline?.curveType = selectedCurve
+        metalPipeline?.denoiseStrength = denoiseStrength
         activeEncodeWidth = selectedFormat.width
         activeEncodeHeight = selectedFormat.height
         activeFPS = selectedFPS.rawValue
@@ -468,7 +489,7 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
     func togglePanel(_ panel: ControlPanel) {
         if controlsLocked {
             switch panel {
-            case .exposure, .iso, .shutter, .wb, .focus, .fps, .bitrate, .mic, .lens:
+            case .exposure, .iso, .shutter, .wb, .focus, .fps, .bitrate, .mic, .lens, .denoise:
                 return
             case .format, .log, .save:
                 break
@@ -650,6 +671,27 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
 
     // MARK: - Manual Controls (live when unlocked)
 
+    /// Push the user's denoiseStrength to the Metal pipeline.
+    /// Called when recording starts or controls lock state changes.
+    private func updateDenoiseStrength() {
+        guard let pipeline = metalPipeline else { return }
+        pipeline.denoiseStrength = denoiseStrength
+        print("[CameraViewModel] denoiseStrength=\(pipeline.denoiseStrength) mode=\(controlsLocked ? "record" : "preview")")
+    }
+
+    /// Debounced exposure/WB push — coalesces rapid slider changes into one hardware call.
+    /// Cancels any pending update and schedules a new one 100ms out.
+    /// This prevents blocking the main thread on AVCaptureDevice.lockForConfiguration()
+    /// during slider drag, which was causing the app to freeze.
+    private func scheduleExposureUpdate() {
+        exposureDebounceWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            self?.applyManualExposureAndWB()
+        }
+        exposureDebounceWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1, execute: work)
+    }
+
     /// Push ISO / shutter / WB to hardware. Call only when unlocked (or once on lock).
     func applyManualExposureAndWB() {
         guard let device = captureController.activeDevice ??
@@ -708,6 +750,7 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
         }
 
         controlsLocked = true
+        updateDenoiseStrength()
         activePanel = nil
         refreshStatusLine()
         print("[CameraViewModel] Controls locked")
@@ -715,25 +758,23 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
 
     func unlockControls() {
         controlsLocked = false
+        isFocusLocked = false
+        updateDenoiseStrength()
         refreshStatusLine()
         print("[CameraViewModel] Controls unlocked")
     }
 
     func setFocusPoint(_ point: CGPoint, lock: Bool = false) {
-        isAutoFocus = true
-        isFocusLocked = lock
-        captureController.setFocusPointOfInterest(point, lock: lock)
-    }
-    
-    func triggerTapToFocus(at screenPoint: CGPoint, normalized: CGPoint) {
-        setFocusPoint(normalized, lock: false)
-        focusPointLocation = screenPoint
-        
-        // Hide indicator after 1.5 seconds
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
-            if self.focusPointLocation == screenPoint {
-                self.focusPointLocation = nil
-            }
+        if isRecording || controlsLocked {
+            // During recording: tap always locks focus (no continuous AF).
+            // Set the focus point and lock at that position.
+            isAutoFocus = false
+            isFocusLocked = true
+            captureController.setFocusPointOfInterest(point, lock: true)
+        } else {
+            isAutoFocus = true
+            isFocusLocked = lock
+            captureController.setFocusPointOfInterest(point, lock: lock)
         }
     }
 
@@ -770,6 +811,7 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
         guard controlsLocked, !isRecording else { return }
 
         lockAutoModesForRecording()
+        updateDenoiseStrength()
         metalPipeline?.curveType = selectedCurve
         metalPipeline?.clearTemporalHistory()
         activeEncodeWidth = selectedFormat.width
@@ -819,22 +861,40 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
     }
 
     private func lockAutoModesForRecording() {
-        guard isAutoExposureEnabled || isAutoWhiteBalanceEnabled else { return }
         guard let device = captureController.activeDevice else { return }
 
-        isoValue = device.iso
-        let angle = Float(device.exposureDuration.seconds * activeFPS * 360.0)
-        if angle.isFinite && angle > 0 {
-            shutterValue = max(shutterRange.lowerBound, min(shutterRange.upperBound, angle))
+        // Lock exposure if auto
+        if isAutoExposureEnabled {
+            isoValue = device.iso
+            let angle = Float(device.exposureDuration.seconds * activeFPS * 360.0)
+            if angle.isFinite && angle > 0 {
+                shutterValue = max(shutterRange.lowerBound, min(shutterRange.upperBound, angle))
+            }
+            isAutoExposureEnabled = false
+            isAutoExposureAdjusting = false
         }
-        let gains = device.deviceWhiteBalanceGains
-        let temperatureAndTint = device.temperatureAndTintValues(for: gains)
-        wbKelvin = max(2000, min(10000, temperatureAndTint.temperature))
 
-        isAutoExposureEnabled = false
-        isAutoWhiteBalanceEnabled = false
-        isAutoExposureAdjusting = false
-        isAutoWhiteBalanceAdjusting = false
+        // Lock white balance if auto
+        if isAutoWhiteBalanceEnabled {
+            let gains = device.deviceWhiteBalanceGains
+            let temperatureAndTint = device.temperatureAndTintValues(for: gains)
+            wbKelvin = max(2000, min(10000, temperatureAndTint.temperature))
+            isAutoWhiteBalanceEnabled = false
+            isAutoWhiteBalanceAdjusting = false
+        }
+
+        // Lock focus at current position — no continuous AF during recording.
+        // Tap to focus still works (locks to tapped point), but the camera
+        // won't re-autofocus on its own.
+        if isAutoFocus {
+            let pos = device.lensPosition
+            // Set focusLensPosition BEFORE disabling auto focus so the didSet
+            // uses the current position instead of the default 0.5 (macro).
+            focusLensPosition = pos
+            isAutoFocus = false
+            isFocusLocked = true
+        }
+
         applyManualExposureAndWB()
     }
 
@@ -921,22 +981,28 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
     }
 
     private func presentFilesFolderPicker() {
-        guard let scene = UIApplication.shared.connectedScenes.first as? UIWindowScene,
-              let rootVC = scene.windows.first(where: { $0.isKeyWindow })?.rootViewController else {
-            errorMessage = "Files picker unavailable"
-            refreshStatusLine()
-            return
-        }
+        // Build and present the picker asynchronously — the UIDocumentPickerViewController
+        // creation involves security-scoped resource coordination that can stall the
+        // main thread if done synchronously during an active capture loop.
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            guard let scene = UIApplication.shared.connectedScenes.first as? UIWindowScene,
+                  let rootVC = scene.windows.first(where: { $0.isKeyWindow })?.rootViewController else {
+                self.errorMessage = "Files picker unavailable"
+                self.refreshStatusLine()
+                return
+            }
 
-        let picker = UIDocumentPickerViewController(forOpeningContentTypes: [.folder], asCopy: false)
-        picker.delegate = self
-        picker.allowsMultipleSelection = false
-        if let pop = picker.popoverPresentationController {
-            pop.sourceView = rootVC.view
-            pop.sourceRect = CGRect(x: rootVC.view.bounds.midX, y: rootVC.view.bounds.midY, width: 0, height: 0)
-            pop.permittedArrowDirections = []
+            let picker = UIDocumentPickerViewController(forOpeningContentTypes: [.folder], asCopy: false)
+            picker.delegate = self
+            picker.allowsMultipleSelection = false
+            if let pop = picker.popoverPresentationController {
+                pop.sourceView = rootVC.view
+                pop.sourceRect = CGRect(x: rootVC.view.bounds.midX, y: rootVC.view.bounds.midY, width: 0, height: 0)
+                pop.permittedArrowDirections = []
+            }
+            rootVC.present(picker, animated: true)
         }
-        rootVC.present(picker, animated: true)
     }
 
     func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
@@ -1144,31 +1210,17 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
         let w = activeEncodeWidth
         let h = activeEncodeHeight
 
-        // ── Adaptive denoise: scale strength by frame-time budget ──
-        // 24fps budget = 41.7ms, 30fps budget = 33.3ms.
-        // When rolling average is well under budget, denoise is boosted.
-        // When near or over budget, denoise is throttled or skipped.
-        let budget: Float = activeFPS >= 29 ? 33.3 : 41.7
-        pipeline.denoiseStrength = max(0, min(1, 1.0 - (pipeline.rollingAvgMs / budget)))
-
         if isRecordingUnsafe {
             // ── Recording ──
-            // 4K: sensor is 4032×3024 and cannot be binned (half=2016 < 3840).
-            //     Use preview-only path since the full pipeline > 100ms on A14.
-            // Lower res (OpenGate, 1080p): binning drops to ~2016×1512, fits ~30-50ms.
+            // 4K: full pipeline at recordQuality can saturate the GPU and cause preview lag.
+            //     Use previewFast (radius=2, no local-sigma stats, no chroma history store)
+            //     to keep GPU responsive for the display link.
+            // Lower res (OpenGate, 1080p): full denoise pipeline fits well within budget.
             let is4K = w >= 3840
-            if is4K {
-                pipeline.processingQuality = .previewFast
-                pipeline.processPreviewOnly(frameData.pixelBuffer, encodeWidth: w, encodeHeight: h, encodeAsBGRA: true) { [weak self] framed, bgraPB in
-                    guard let self else { completion(); return }
-                    handleRecordedFrame(framed, bgraPB: bgraPB, frameData: frameData, completion: completion)
-                }
-            } else {
-                pipeline.processingQuality = .recordQuality
-                pipeline.process(frameData.pixelBuffer, encodeWidth: w, encodeHeight: h, encodeAsBGRA: true) { [weak self] framed, bgraPB in
-                    guard let self else { completion(); return }
-                    handleRecordedFrame(framed, bgraPB: bgraPB, frameData: frameData, completion: completion)
-                }
+            pipeline.processingQuality = is4K ? .previewFast : .recordQuality
+            pipeline.process(frameData.pixelBuffer, encodeWidth: w, encodeHeight: h, encodeAsBGRA: true) { [weak self] framed, bgraPB in
+                guard let self else { completion(); return }
+                handleRecordedFrame(framed, bgraPB: bgraPB, frameData: frameData, completion: completion)
             }
         } else {
             // ── Preview (non-recording): lightweight path, no denoise ──

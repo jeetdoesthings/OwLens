@@ -191,12 +191,10 @@ final class MetalPipeline: @unchecked Sendable {
     /// Quality mode for the next process() call. Set before calling process().
     var processingQuality: ProcessingQuality = .previewFast
 
-    /// Adaptive denoise strength 0.0-1.0. Computed from rolling average frame time vs budget.
-    /// When strength is low (near budget), denoise is skipped. When high (under budget),
-    /// sigma is boosted to remove more noise. Set per-frame by CameraViewModel.
+    /// Static denoise strength 0.0-1.0, set once per recording session by CameraViewModel
+    /// based on resolution, chip tier, and recording format. 0 = no spatial/chroma denoise,
+    /// 1 = maximum (2× sigma radius). Multiplies sigmaRef in bilateral kernels.
     var denoiseStrength: Float = 0.5
-    /// Rolling average frame time in ms, updated by process() completion handler.
-    var rollingAvgMs: Float = 20
 
     init?() {
         guard let device = MTLCreateSystemDefaultDevice(),
@@ -432,7 +430,7 @@ final class MetalPipeline: @unchecked Sendable {
                 kCVPixelBufferIOSurfacePropertiesKey as String: [:] as [String: Any]
             ]
             let poolAttrs: [String: Any] = [
-                kCVPixelBufferPoolMinimumBufferCountKey as String: 6
+                kCVPixelBufferPoolMinimumBufferCountKey as String: 12
             ]
             var pool: CVPixelBufferPool?
             let status = CVPixelBufferPoolCreate(
@@ -473,7 +471,9 @@ final class MetalPipeline: @unchecked Sendable {
                  encodeHeight: Int = 1440,
                  encodeAsBGRA: Bool = false,
                  completion: @escaping (MTLTexture?, CVPixelBuffer?) -> Void) {
+#if DEBUG
         let t0 = CACurrentMediaTime()
+#endif
         let fullW = CVPixelBufferGetWidth(pixelBuffer)
         let fullH = CVPixelBufferGetHeight(pixelBuffer)
         guard fullW > 0, fullH > 0 else { completion(nil, nil); return }
@@ -485,14 +485,15 @@ final class MetalPipeline: @unchecked Sendable {
 
         guard let commandBuffer = commandQueue.makeCommandBuffer() else { completion(nil, nil); return }
 
-        // Optional CFA-safe half reduction. This is phase-preserving, not true averaged sensor binning,
-        // so only use it when it leaves a real downscale/crop buffer instead of causing output upscale.
+        // Optional CFA-safe half reduction. This is phase-preserving, not true averaged sensor binning.
+        // Always bin when the sensor is large (>3000px wide) to keep the denoise pipeline
+        // operating at a manageable resolution — the final scaler handles upscaling to encode size.
         var bayerIn: MTLTexture
         let bayerW: Int
         let bayerH: Int
         let halfW = (fullW / 2) & ~1
         let halfH = (fullH / 2) & ~1
-        let canReduceRaw = halfW >= encodeWidth && halfH >= encodeHeight
+        let canReduceRaw = (halfW >= encodeWidth && halfH >= encodeHeight) || fullW > 3000
         if canReduceRaw {
             guard let halfTex = getOrCreateBinTexture(width: halfW, height: halfH),
                   let enc = commandBuffer.makeComputeCommandEncoder() else { completion(nil, nil); return }
@@ -776,12 +777,10 @@ final class MetalPipeline: @unchecked Sendable {
             }
         }
 
-        commandBuffer.addCompletedHandler { [self] _ in
-            let ms = Float(CACurrentMediaTime() - t0) * 1000.0
-            // EMA with α=0.2 — smooths frame time without lagging behind spikes.
-            rollingAvgMs = rollingAvgMs * 0.8 + ms * 0.2
+        commandBuffer.addCompletedHandler { _ in
 #if DEBUG
-            print("[MetalPipeline] frame time: \(String(format: "%.2f", ms)) ms avg=\(String(format: "%.1f", rollingAvgMs))")
+            let ms = (CACurrentMediaTime() - t0) * 1000.0
+            print("[MetalPipeline] frame time: \(String(format: "%.2f", ms)) ms")
 #endif
             completion(finalTex, bgraOut)
         }
@@ -798,9 +797,7 @@ final class MetalPipeline: @unchecked Sendable {
                             encodeHeight: Int = 1440,
                             encodeAsBGRA: Bool = false,
                             completion: @escaping (MTLTexture?, CVPixelBuffer?) -> Void) {
-#if DEBUG
         let t0 = CACurrentMediaTime()
-#endif
         let fullW = CVPixelBufferGetWidth(pixelBuffer)
         let fullH = CVPixelBufferGetHeight(pixelBuffer)
         guard fullW > 0, fullH > 0 else { completion(nil, nil); return }
@@ -818,7 +815,7 @@ final class MetalPipeline: @unchecked Sendable {
         let bayerH: Int
         let halfW = (fullW / 2) & ~1
         let halfH = (fullH / 2) & ~1
-        let canReduceRaw = halfW >= encodeWidth && halfH >= encodeHeight
+        let canReduceRaw = (halfW >= encodeWidth && halfH >= encodeHeight) || fullW > 3000
         if canReduceRaw {
             guard let halfTex = getOrCreateBinTexture(width: halfW, height: halfH),
                   let enc = commandBuffer.makeComputeCommandEncoder() else { completion(nil, nil); return }
