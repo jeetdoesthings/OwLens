@@ -68,7 +68,7 @@ You'll need:
    * Go to **Settings** → **General** → **VPN & Device Management** on your iPhone.
    * Tap your Apple ID under "Developer App," then tap **Trust**.
 
-That's it, OwLens will launch on your phone.
+That's it, OwLens will launch on your phone. 🦉   
 
 ## License
 
