@@ -2,7 +2,7 @@
 
 <img src="owlens-logo.png" width="128" height="128" alt="OwLens Logo" />
 
-**OwLens** is a professional-grade iOS camera application designed for filmmakers and power users who want maximum control over their video capture. It bypasses Apple's standard image signal processor (ISP) pipeline, capturing uncompressed 14-bit RAW sensor data and encoding it directly into HEVC S-Log3 in real-time using custom Metal shaders.
+🦉**OwLens** is a professional-grade iOS camera application designed for filmmakers and power users who want maximum control over their video capture. It bypasses Apple's standard image signal processor (ISP) pipeline, capturing uncompressed 14-bit RAW sensor data and encoding it directly into HEVC S-Log3 in real-time using custom Metal shaders.
 
 ## Features
 
