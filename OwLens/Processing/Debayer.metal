@@ -104,9 +104,32 @@ kernel void binBayerCFA(
 
 
 
-static inline float3 encodeLogCurve(float3 rgb, int curveType) {
+static inline float3 applyHighlightShoulder(float3 r, float rKnee, float rMax) {
+    float delta = max(rMax - rKnee, 1e-4f);
+    float p = (1.0f - rKnee) / delta;
+    float3 out;
+    for (int i = 0; i < 3; i++) {
+        float val = r[i];
+        if (val <= rKnee) {
+            out[i] = val;
+        } else {
+            float t = saturate((val - rKnee) / max(1.0f - rKnee, 1e-4f));
+            out[i] = rKnee + delta * (1.0f - pow(max(1.0f - t, 0.0f), p));
+        }
+    }
+    return out;
+}
+
+static inline float3 encodeLogCurve(float3 rgb, int curveType, float headroomScale = 1.0f) {
     if (curveType == 0) {
         return saturate(rgb);
+    }
+
+    // Apply filmic highlight shoulder when headroom expansion is active (e.g. headroomScale = 10.0–12.0)
+    // Preserves 100% linear calibration for midtones & shadows (r <= 0.36, 18% gray at 0.18)
+    // while smoothly rolling off highlights up to the container ceiling.
+    if (headroomScale > 1.0f) {
+        rgb = applyHighlightShoulder(rgb, 0.36f, headroomScale);
     }
 
     if (curveType == 3) {
@@ -149,16 +172,21 @@ static inline float3 encodeLogCurve(float3 rgb, int curveType) {
     return saturate(result);
 }
 
+struct LogOnlyParams {
+    int   curveType;
+    float headroomScale;
+};
+
 kernel void applyLogOnly(
     texture2d<float, access::read> inTexture [[texture(0)]],
     texture2d<float, access::write> outTexture [[texture(1)]],
-    constant int &curveType [[buffer(0)]],
+    constant LogOnlyParams &params [[buffer(0)]],
     uint2 gid [[thread_position_in_grid]])
 {
     if (gid.x >= outTexture.get_width() || gid.y >= outTexture.get_height()) return;
 
     float4 pixel = inTexture.read(gid);
-    float3 result = encodeLogCurve(float3(pixel.r, pixel.g, pixel.b), curveType);
+    float3 result = encodeLogCurve(float3(pixel.r, pixel.g, pixel.b), params.curveType, params.headroomScale);
     outTexture.write(float4(result, pixel.a), gid);
 }
 
@@ -175,6 +203,7 @@ struct FusedParams {
     float3 wbGains;
     float4 lscCoefficients;
     float greenBalance;
+    float headroomScale;  // Scene reflectance multiplier: sensor [0,1] → R [0, headroomScale]
 };
 
 struct LSCParams {
@@ -383,8 +412,8 @@ kernel void debayerFusedLog(
     bool isClipped = (r >= 0.99 || g >= 0.99 || b >= 0.99);
     float alpha = isClipped ? 0.0 : 1.0;
 
-    // ── Direct Log OETF Encoding ──
-    float3 logRGB = encodeLogCurve(rgb, params.curveType);
+    // ── Direct Log OETF Encoding with Filmic Highlight Shoulder ──
+    float3 logRGB = encodeLogCurve(rgb, params.curveType, params.headroomScale);
 
     outTexture.write(float4(logRGB, alpha), gid);
 }
@@ -476,7 +505,8 @@ fragment float4 displayFragment(
     constant int2 &destSize [[buffer(1)]],
     constant int &showClipping [[buffer(2)]],
     constant int &showFocusPeaking [[buffer(3)]],
-    constant int &overlayOnly [[buffer(4)]]
+    constant int &overlayOnly [[buffer(4)]],
+    constant int &showDisplayLUT [[buffer(5)]]
 ) {
     float2 uv = float2(in.position.x - destOffset.x, in.position.y - destOffset.y) / float2(destSize);
     if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) {
@@ -489,7 +519,52 @@ fragment float4 displayFragment(
     float isClipped = step(color.a, 0.5);
     float applyRed = (showClipping > 0) ? isClipped : 0.0;
     
-    float3 finalColor = mix(color.rgb, float3(1.0, 0.0, 0.0), applyRed);
+    float3 finalColor = color.rgb;
+
+    // ── Viewfinder Rec.709 Display LUT ──
+    // Decodes log-encoded texture back to scene-linear, applies BT.2020 → BT.709
+    // gamut mapping, filmic tone mapping, and sRGB gamma for natural on-screen monitoring.
+    // The recorded file is NOT affected — this is display-only.
+    if (showDisplayLUT > 0 && applyRed < 0.5) {
+        // Inverse Apple Log 2 decode (log code value → scene-linear reflectance)
+        constexpr float r0 = -0.05641088f;
+        constexpr float rt = 0.01f;
+        constexpr float c_al = 47.28711236f;
+        constexpr float beta = 0.00964052f;
+        constexpr float gam = 0.08550479f;
+        constexpr float del = 0.69336945f;
+        float pt = c_al * (rt - r0) * (rt - r0);
+
+        float3 lin;
+        for (int i = 0; i < 3; i++) {
+            float p = finalColor[i];
+            if (p < 0.0) {
+                lin[i] = r0;
+            } else if (p < pt) {
+                lin[i] = sqrt(p / c_al) + r0;
+            } else {
+                lin[i] = pow(2.0f, (p - del) / gam) - beta;
+            }
+        }
+        lin = max(lin, float3(0.0));
+
+        // BT.2020 → BT.709 color gamut mapping (standard ITU matrix)
+        const float3x3 m2020to709 = float3x3(
+            float3( 1.6605f, -0.1246f, -0.0182f),
+            float3(-0.5876f,  1.1329f, -0.1006f),
+            float3(-0.0728f, -0.0083f,  1.1187f)
+        );
+        float3 rgb709 = m2020to709 * lin;
+        rgb709 = max(rgb709, float3(0.0));
+
+        // Filmic tone mapping (Reinhard with highlight shoulder)
+        rgb709 = rgb709 / (rgb709 + 1.0f) * 1.15f;
+
+        // sRGB gamma approximation for display
+        finalColor = pow(saturate(rgb709), float3(1.0f / 2.2f));
+    }
+
+    finalColor = mix(finalColor, float3(1.0, 0.0, 0.0), applyRed);
     float overlayAlpha = (overlayOnly > 0 && applyRed > 0.0) ? 0.75 : 0.0;
     
     if (showFocusPeaking > 0) {

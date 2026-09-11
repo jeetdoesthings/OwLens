@@ -66,9 +66,17 @@ final class VideoWriter: @unchecked Sendable {
         self.height = height
         self.targetFPS = fps
 
+        let profileLevel: String
+        switch curveType {
+        case .linear:
+            profileLevel = kVTProfileLevel_HEVC_Main_AutoLevel as String
+        case .appleLog2, .sLog3Approx:
+            profileLevel = kVTProfileLevel_HEVC_Main10_AutoLevel as String
+        }
+
         let compression: [String: Any] = [
             AVVideoAverageBitRateKey: bitrate,
-            kVTCompressionPropertyKey_ProfileLevel as String: kVTProfileLevel_HEVC_Main_AutoLevel,
+            kVTCompressionPropertyKey_ProfileLevel as String: profileLevel,
             AVVideoExpectedSourceFrameRateKey: Int(fps),
             AVVideoAverageNonDroppableFrameRateKey: Int(fps),
             AVVideoMaxKeyFrameIntervalKey: Int(fps),
@@ -163,6 +171,18 @@ final class VideoWriter: @unchecked Sendable {
         }
     }
 
+    private func hasSufficientDiskSpace() -> Bool {
+        guard let outputURL = assetWriter?.outputURL else { return true }
+        do {
+            let values = try outputURL.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
+            if let available = values.volumeAvailableCapacityForImportantUsage {
+                // If less than 500 MB left, refuse frames to allow safe finalization
+                return available > 500 * 1024 * 1024
+            }
+        } catch {}
+        return true
+    }
+
     /// Append a real camera frame. Fills any missing CFR slots by holding last frame.
     @discardableResult
     func appendFrame(pixelBuffer: CVPixelBuffer) -> Bool {
@@ -171,7 +191,9 @@ final class VideoWriter: @unchecked Sendable {
 
         guard isRecording,
               let adaptor = pixelBufferAdaptor,
-              let input = videoInput else {
+              let input = videoInput,
+              hasSufficientDiskSpace() else {
+            droppedFrames += 1
             return false
         }
 

@@ -91,6 +91,8 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
     @Published var showScopes = false
     @Published var scopeData: ScopeData = .empty
     @Published var previewDisplayMode: PreviewDisplayMode = .log
+    /// When true, renders a natural Rec.709 display transform on screen in Log mode without affecting recorded log data.
+    @Published var showDisplayLUT: Bool = true
     @Published var showLevel = false {
         didSet {
             if showLevel {
@@ -305,6 +307,7 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
                 _ = pipeline.runSyntheticHotPixelTest()
                 _ = MetalPipeline.runAppleLog2AccuracyTest()
                 _ = MetalPipeline.runColorMatrixValidationTest()
+                _ = MetalPipeline.runHighlightShoulderTest()
                 _ = pipeline.runPipelineThroughputBenchmark()
                 _ = CameraViewModel.runFileNameGenerationTest()
             }
@@ -358,6 +361,13 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
             .store(in: &cancellables)
 
         NotificationCenter.default.publisher(for: UIApplication.willResignActiveNotification)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                self?.handleAppInactive()
+            }
+            .store(in: &cancellables)
+
+        NotificationCenter.default.publisher(for: NSNotification.Name.AVCaptureSessionWasInterrupted)
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in
                 self?.handleAppInactive()
@@ -577,6 +587,10 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
 
     func togglePreviewDisplayMode() {
         previewDisplayMode = previewDisplayMode == .log ? .normalVideo : .log
+    }
+
+    func toggleDisplayLUT() {
+        showDisplayLUT.toggle()
     }
 
     func refreshAudioSources() {
@@ -1337,10 +1351,13 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
         switch pipeline.curveType {
         case .linear:
             cMatrix = matrix_identity_float3x3
+            pipeline.headroomScale = 1.0
         case .appleLog2:
             cMatrix = latestColorMatrix ?? WhiteBalanceParams.defaultSensorToBT2020
+            pipeline.headroomScale = 10.0
         case .sLog3Approx:
             cMatrix = latestSGamutMatrix ?? WhiteBalanceParams.defaultSensorToSGamut3Cine
+            pipeline.headroomScale = 10.0
         }
 
         if pipeline.isAutoWBEnabled, let gains = frameData.whiteBalanceGains {

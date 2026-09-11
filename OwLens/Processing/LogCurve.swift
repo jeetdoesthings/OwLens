@@ -92,14 +92,35 @@ enum LogCurve {
         }
     }
 
-    static func apply(_ rgb: SIMD3<Float>, type: LogCurveType) -> SIMD3<Float> {
+    /// Smooth filmic highlight shoulder mapping sensor linear [0, 1] to scene reflectance [0, rMax].
+    /// Perfectly preserves 100% linear calibration for midtones & shadows (r <= rKnee),
+    /// while smoothly rolling off highlights up to the container ceiling.
+    static func applyHighlightShoulder(_ r: Float, rKnee: Float = 0.36, rMax: Float = 10.0) -> Float {
+        if r <= rKnee {
+            return r
+        }
+        let delta = max(rMax - rKnee, 1e-4)
+        let p = (1.0 - rKnee) / delta
+        let t = simd_clamp((r - rKnee) / max(1.0 - rKnee, 1e-4), 0.0, 1.0)
+        return rKnee + delta * (1.0 - pow(max(1.0 - t, 0.0), p))
+    }
+
+    static func apply(_ rgb: SIMD3<Float>, type: LogCurveType, headroomScale: Float = 1.0) -> SIMD3<Float> {
+        var input = rgb
+        if headroomScale > 1.0 && type != .linear {
+            input = SIMD3(
+                applyHighlightShoulder(input.x, rMax: headroomScale),
+                applyHighlightShoulder(input.y, rMax: headroomScale),
+                applyHighlightShoulder(input.z, rMax: headroomScale)
+            )
+        }
         switch type {
         case .linear:
-            return simd_clamp(rgb, SIMD3(0,0,0), SIMD3(1,1,1))
+            return simd_clamp(input, SIMD3(0,0,0), SIMD3(1,1,1))
         case .sLog3Approx:
-            return SIMD3(sLog3Approx(rgb.x), sLog3Approx(rgb.y), sLog3Approx(rgb.z))
+            return SIMD3(sLog3Approx(input.x), sLog3Approx(input.y), sLog3Approx(input.z))
         case .appleLog2:
-            return SIMD3(appleLog2Encode(rgb.x), appleLog2Encode(rgb.y), appleLog2Encode(rgb.z))
+            return SIMD3(appleLog2Encode(input.x), appleLog2Encode(input.y), appleLog2Encode(input.z))
         }
     }
 

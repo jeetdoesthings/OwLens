@@ -62,6 +62,7 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
     private var cachedBlackLevel: Float?
     private var cachedWhiteLevel: Float?
     private var cachedISO: Float?
+    private var cachedKelvin: Float?
     private var cachedColorMatrices: (bt2020: simd_float3x3?, sgamut: simd_float3x3?)?
 
     // MARK: - Session Configuration
@@ -1138,13 +1139,19 @@ extension CaptureController: AVCapturePhotoCaptureDelegate {
         // will cause severe vignette under/over correction. (Phase 2 feature pending).
         let lsc = SIMD4<Float>(0.0, 0.0, 0.0, 0.0)
 
+        let currentKelvin = device.map { dev -> Float in
+            let gains = dev.deviceWhiteBalanceGains
+            return dev.temperatureAndTintValues(for: gains).temperature
+        }
+
         let colorMatrices: (bt2020: simd_float3x3?, sgamut: simd_float3x3?)
-        if let cached = cachedColorMatrices {
+        if let cached = cachedColorMatrices, let ck = cachedKelvin, let currentKelvin, abs(ck - currentKelvin) < 100.0 {
             colorMatrices = cached
         } else {
-            colorMatrices = extractColorMatrices(from: photo)
+            colorMatrices = extractColorMatrices(from: photo, kelvin: currentKelvin)
             if colorMatrices.bt2020 != nil {
                 cachedColorMatrices = colorMatrices
+                cachedKelvin = currentKelvin
             }
         }
 
@@ -1165,7 +1172,7 @@ extension CaptureController: AVCapturePhotoCaptureDelegate {
         onRawFrameData?(frameData)
     }
 
-    private func extractColorMatrices(from photo: AVCapturePhoto) -> (bt2020: simd_float3x3?, sgamut: simd_float3x3?) {
+    private func extractColorMatrices(from photo: AVCapturePhoto, kelvin: Float? = nil) -> (bt2020: simd_float3x3?, sgamut: simd_float3x3?) {
         guard let dng = photo.metadata["{DNG}"] as? [String: Any] else { return (nil, nil) }
 
         // Standard CIE XYZ D50 to ITU-R BT.2020 (D65) matrix (CIE XYZ D65 -> BT.2020 * Bradford D50 -> D65):
@@ -1196,10 +1203,29 @@ extension CaptureController: AVCapturePhotoCaptureDelegate {
             SIMD3<Float>(-0.210545,  0.149400,  0.868207)
         )
 
-        // Priority 1: DNG ForwardMatrix2 (D65) or ForwardMatrix1 (Standard Light A).
-        // ForwardMatrix maps white-balanced camera RGB directly to XYZ D50.
-        let fmRaw = (dng["ForwardMatrix2"] as? [Any]) ?? (dng["ForwardMatrix1"] as? [Any])
-        if let fm = fmRaw, let fmVals = Self.parseMatrixFloats(fm), fmVals.count == 9 {
+        // Priority 1: DNG ForwardMatrix (Dual-Illuminant Interpolation between Standard Light A ~2856K and D65 ~6504K)
+        let fm1Raw = dng["ForwardMatrix1"] as? [Any]
+        let fm2Raw = dng["ForwardMatrix2"] as? [Any]
+        let fm1Vals = fm1Raw.flatMap(Self.parseMatrixFloats)
+        let fm2Vals = fm2Raw.flatMap(Self.parseMatrixFloats)
+
+        var finalFMVals: [Float]? = nil
+        if let fm1Vals, let fm2Vals, let kelvin {
+            // DNG spec interpolation based on correlated color temperature
+            let t1: Float = 2856.0
+            let t2: Float = 6504.0
+            let t = simd_clamp(kelvin, 2000.0, 10000.0)
+            let g = simd_clamp((1.0 / t - 1.0 / t2) / (1.0 / t1 - 1.0 / t2), 0.0, 1.0)
+            var blended = [Float](repeating: 0, count: 9)
+            for i in 0..<9 {
+                blended[i] = g * fm1Vals[i] + (1.0 - g) * fm2Vals[i]
+            }
+            finalFMVals = blended
+        } else {
+            finalFMVals = fm2Vals ?? fm1Vals
+        }
+
+        if let fmVals = finalFMVals, fmVals.count == 9 {
             let fmMatrix = simd_float3x3(
                 SIMD3<Float>(fmVals[0], fmVals[3], fmVals[6]), // column 0
                 SIMD3<Float>(fmVals[1], fmVals[4], fmVals[7]), // column 1

@@ -12,6 +12,7 @@ struct CameraPreviewView: UIViewRepresentable {
     @Binding var textureChangeCount: UInt64
     @Binding var showClipping: Bool
     @Binding var showFocusPeaking: Bool
+    var showDisplayLUT: Bool = false
     var overlayOnly: Bool = false
  
     func makeUIView(context: Context) -> MTKView {
@@ -39,6 +40,7 @@ struct CameraPreviewView: UIViewRepresentable {
         context.coordinator.currentTexture = currentTexture
         context.coordinator.showClipping = showClipping
         context.coordinator.showFocusPeaking = showFocusPeaking
+        context.coordinator.showDisplayLUT = showDisplayLUT
         context.coordinator.overlayOnly = overlayOnly
         context.coordinator.isAppActive = UIApplication.shared.applicationState == .active
         uiView.clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: overlayOnly ? 0 : 1)
@@ -58,6 +60,7 @@ struct CameraPreviewView: UIViewRepresentable {
         var currentTexture: MTLTexture?
         var showClipping: Bool = false
         var showFocusPeaking: Bool = false
+        var showDisplayLUT: Bool = false
         var overlayOnly: Bool = false
         /// Cached app state — updated from MainActor via updateUIView, read on render thread.
         var isAppActive: Bool = true
@@ -190,6 +193,9 @@ struct CameraPreviewView: UIViewRepresentable {
                 
                 var overlay: Int32 = overlayOnly ? 1 : 0
                 renderEncoder.setFragmentBytes(&overlay, length: MemoryLayout<Int32>.size, index: 4)
+                
+                var lut: Int32 = showDisplayLUT ? 1 : 0
+                renderEncoder.setFragmentBytes(&lut, length: MemoryLayout<Int32>.size, index: 5)
                 
                 // Draw full-screen triangle
                 renderEncoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)

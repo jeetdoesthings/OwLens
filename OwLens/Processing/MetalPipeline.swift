@@ -34,20 +34,21 @@ struct WhiteBalanceParams {
         colorMatrix: matrix_identity_float3x3
     )
 
-    /// Calibrated CCM mapping white-balanced iPhone Sony Bayer sensor RGB to ITU-R BT.2020 linear primaries (D65).
-    /// Preserves neutral white balance (row sums equal 1.0).
+    /// Calibrated CCM mapping white-balanced iPhone Sony Bayer sensor RGB to ITU-R BT.2020 container (D65).
+    /// Calibrated so that DaVinci Resolve CST (BT.2020 -> Rec.709) produces natural, un-distorted skin tones
+    /// and preserves neutral white balance (row sums equal 1.0).
     static let defaultSensorToBT2020 = simd_float3x3(
-        SIMD3<Float>( 1.2030, -0.1361,  0.0119), // column 0
-        SIMD3<Float>(-0.1778,  1.2547, -0.2469), // column 1
-        SIMD3<Float>(-0.0252, -0.1186,  1.2350)  // column 2
+        SIMD3<Float>( 0.8595, -0.0380, -0.0073), // column 0
+        SIMD3<Float>( 0.1842,  1.1232, -0.0569), // column 1
+        SIMD3<Float>(-0.0437, -0.0852,  1.0643)  // column 2
     )
 
-    /// Calibrated CCM mapping white-balanced iPhone Sony Bayer sensor RGB to Sony S-Gamut3.Cine primaries (D65).
+    /// Calibrated CCM mapping white-balanced iPhone Sony Bayer sensor RGB to Sony S-Gamut3.Cine container (D65).
     /// Preserves neutral white balance (row sums equal 1.0).
     static let defaultSensorToSGamut3Cine = simd_float3x3(
-        SIMD3<Float>( 1.2626, -0.0485,  0.0418), // column 0
-        SIMD3<Float>(-0.3185,  0.9485, -0.1834), // column 1
-        SIMD3<Float>( 0.0559,  0.1000,  1.1417)  // column 2
+        SIMD3<Float>( 0.8955,  0.0099,  0.0175), // column 0
+        SIMD3<Float>( 0.0807,  0.8915, -0.0014), // column 1
+        SIMD3<Float>( 0.0237,  0.0986,  0.9838)  // column 2
     )
 }
 
@@ -60,6 +61,12 @@ struct FusedParams {
     var wbGains: SIMD3<Float>
     var lscCoefficients: SIMD4<Float>
     var greenBalance: Float
+    var headroomScale: Float
+}
+
+struct LogOnlyParams {
+    var curveType: Int32
+    var headroomScale: Float
 }
 
 struct LSCParams {
@@ -209,6 +216,9 @@ final class MetalPipeline: @unchecked Sendable {
     private var pixelBufferPoolH: Int = 0
 
     var curveType: LogCurveType = .sLog3Approx
+    /// Scene reflectance headroom multiplier (e.g. 10.0 for Apple Log 2 / S-Log3).
+    /// Maps sensor clipping to the top of the log container with a filmic highlight shoulder.
+    var headroomScale: Float = 10.0
     var wbParams: WhiteBalanceParams = .identity
     var bayerPattern: Int32 = 0
     var blackLevel: Float = 0
@@ -677,7 +687,8 @@ final class MetalPipeline: @unchecked Sendable {
                     curveType: Int32(curveType.rawValue),
                     wbGains: wbParams.gains,
                     lscCoefficients: lscCoefficients,
-                    greenBalance: greenBalance
+                    greenBalance: greenBalance,
+                    headroomScale: curveType == .linear ? 1.0 : headroomScale
                 )
                 enc.setBytes(&params, length: MemoryLayout<FusedParams>.stride, index: 0)
                 enc.setBytes(&lscParams, length: MemoryLayout<LSCParams>.stride, index: 1)
@@ -720,7 +731,8 @@ final class MetalPipeline: @unchecked Sendable {
                     curveType: Int32(curveType.rawValue),
                     wbGains: wbParams.gains,
                     lscCoefficients: lscCoefficients,
-                    greenBalance: greenBalance
+                    greenBalance: greenBalance,
+                    headroomScale: 1.0
                 )
                 enc.setBytes(&params, length: MemoryLayout<FusedParams>.stride, index: 0)
                 enc.setBytes(&lscParams, length: MemoryLayout<LSCParams>.stride, index: 1)
@@ -902,8 +914,11 @@ final class MetalPipeline: @unchecked Sendable {
                 enc.setComputePipelineState(logOnlyPipeline)
                 enc.setTexture(postDenoiseTex, index: 0)
                 enc.setTexture(fusedOut, index: 1)
-                var cType = Int32(curveType.rawValue)
-                enc.setBytes(&cType, length: MemoryLayout<Int32>.stride, index: 0)
+                var logParams = LogOnlyParams(
+                    curveType: Int32(curveType.rawValue),
+                    headroomScale: curveType == .linear ? 1.0 : headroomScale
+                )
+                enc.setBytes(&logParams, length: MemoryLayout<LogOnlyParams>.stride, index: 0)
                 dispatch(enc, width: bayerW, height: bayerH, state: logOnlyPipeline)
                 enc.endEncoding()
             }
@@ -1030,7 +1045,8 @@ final class MetalPipeline: @unchecked Sendable {
                 curveType: Int32(curveType.rawValue),
                 wbGains: wbParams.gains,
                 lscCoefficients: lscCoefficients,
-                greenBalance: greenBalance
+                greenBalance: greenBalance,
+                headroomScale: curveType == .linear ? 1.0 : headroomScale
             )
             enc.setBytes(&params, length: MemoryLayout<FusedParams>.stride, index: 0)
             enc.setBytes(&lscParams, length: MemoryLayout<LSCParams>.stride, index: 1)

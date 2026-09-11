@@ -51,6 +51,7 @@ struct RootView: View {
                             textureChangeCount: $viewModel.textureChangeCount,
                             showClipping: $viewModel.showClipping,
                             showFocusPeaking: $viewModel.showFocusPeaking,
+                            showDisplayLUT: viewModel.showDisplayLUT,
                             overlayOnly: viewModel.previewDisplayMode == .normalVideo
                         )
                         .opacity(viewModel.previewDisplayMode == .log || viewModel.showClipping || viewModel.showFocusPeaking ? 1 : 0)
