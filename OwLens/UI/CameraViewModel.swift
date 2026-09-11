@@ -91,8 +91,8 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
     @Published var showScopes = false
     @Published var scopeData: ScopeData = .empty
     @Published var previewDisplayMode: PreviewDisplayMode = .log
-    /// When true, renders a natural Rec.709 display transform on screen in Log mode without affecting recorded log data.
-    @Published var showDisplayLUT: Bool = true
+    /// Optional viewfinder display transform; defaults to false so log preview remains untouched.
+    @Published var showDisplayLUT: Bool = false
     @Published var showLevel = false {
         didSet {
             if showLevel {

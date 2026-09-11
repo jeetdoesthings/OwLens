@@ -264,13 +264,6 @@ struct ControlsView: View {
             }
 
             monitoringToolButton(
-                systemName: viewModel.showDisplayLUT ? "wand.and.stars" : "circle.lefthalf.filled",
-                isActive: viewModel.showDisplayLUT
-            ) {
-                viewModel.toggleDisplayLUT()
-            }
-
-            monitoringToolButton(
                 systemName: "grid",
                 isActive: viewModel.showGrid
             ) {
