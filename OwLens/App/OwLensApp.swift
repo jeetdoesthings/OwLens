@@ -14,9 +14,6 @@ struct OwLensApp: App {
 struct RootView: View {
     @StateObject private var viewModel = CameraViewModel()
     @State private var permissionDenied = false
-    @State private var showSplash = true
-    /// Minimum splash display time so branding is legible.
-    @State private var minSplashElapsed = false
     @State private var showSilentModeWarning = false
     @State private var tapFocusPoint: CGPoint? = nil
     @State private var focusReticleOpacity: Double = 0
@@ -27,7 +24,7 @@ struct RootView: View {
         ZStack {
             if permissionDenied {
                 permissionDeniedView
-            } else if viewModel.isDeviceUnsupportedForLog && !showSplash {
+            } else if viewModel.isDeviceUnsupportedForLog {
                 unsupportedView
             } else if let pipeline = viewModel.metalPipeline, viewModel.isCameraReady {
                 GeometryReader { geo in
@@ -137,18 +134,11 @@ struct RootView: View {
                 // Interactive HUD Controls & Panels
                 ControlsView(viewModel: viewModel)
                     .frame(maxWidth: UIDevice.current.userInterfaceIdiom == .pad ? 750 : .infinity)
-            } else if !showSplash && viewModel.metalPipeline == nil {
+            } else if viewModel.metalPipeline == nil {
                 metalUnavailableView
             } else {
                 // Background loading placeholder
                 Color.black.ignoresSafeArea()
-            }
-
-            // Animated Splash Screen
-            if showSplash {
-                SplashView()
-                    .transition(.opacity)
-                    .zIndex(10)
             }
 
             // Silent Mode Advisory Banner
@@ -171,39 +161,19 @@ struct RootView: View {
                 .zIndex(5)
             }
         }
-        .animation(.easeOut(duration: 0.3), value: showSplash)
         .statusBarHidden()
         .persistentSystemOverlays(.hidden)
         .onAppear {
             requestCameraPermission()
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) {
-                minSplashElapsed = true
-                dismissSplashIfReady()
-            }
-        }
-        .onChange(of: viewModel.isCameraReady) { _, ready in
-            if ready { dismissSplashIfReady() }
-        }
-        .onChange(of: viewModel.isDeviceUnsupportedForLog) { _, unsupported in
-            if unsupported { dismissSplashIfReady() }
-        }
-        .onChange(of: viewModel.errorMessage) { _, msg in
-            if msg != nil { dismissSplashIfReady() }
-        }
-        .onChange(of: permissionDenied) { _, denied in
-            if denied {
-                minSplashElapsed = true
-                showSplash = false
-            }
-        }
-        .onChange(of: showSplash) { _, isShowing in
-            if !isShowing && !viewModel.captureController.isShutterSoundSuppressionSupported {
-                withAnimation {
-                    showSilentModeWarning = true
-                }
-                DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) {
+            if !viewModel.captureController.isShutterSoundSuppressionSupported {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
                     withAnimation {
-                        showSilentModeWarning = false
+                        showSilentModeWarning = true
+                    }
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) {
+                        withAnimation {
+                            showSilentModeWarning = false
+                        }
                     }
                 }
             }
@@ -284,17 +254,7 @@ struct RootView: View {
         }
     }
 
-    // MARK: - Splash & Permission Logic
-
-    private func dismissSplashIfReady() {
-        guard minSplashElapsed else { return }
-        let canLeaveSplash = viewModel.isCameraReady
-            || viewModel.isDeviceUnsupportedForLog
-            || viewModel.errorMessage != nil
-        if canLeaveSplash {
-            showSplash = false
-        }
-    }
+    // MARK: - Permission Logic
 
     private var permissionDeniedView: some View {
         VStack(spacing: 16) {
