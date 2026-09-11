@@ -16,7 +16,7 @@ final class LevelMonitor: ObservableObject {
     func start() {
         guard !isRunning, motion.isDeviceMotionAvailable else { return }
         isRunning = true
-        motion.deviceMotionUpdateInterval = 1.0 / 30.0
+        motion.deviceMotionUpdateInterval = 1.0 / 12.0
         motion.startDeviceMotionUpdates(using: .xArbitraryZVertical, to: .main) { [weak self] data, _ in
             guard let self, let g = data?.gravity else { return }
             // Landscape-friendly horizon angle from gravity vector
@@ -25,8 +25,12 @@ final class LevelMonitor: ObservableObject {
             var tilt = angle
             if tilt > 90 { tilt -= 180 }
             if tilt < -90 { tilt += 180 }
-            self.tiltDegrees = tilt
-            self.isLevel = abs(tilt) < 1.5
+            let newIsLevel = abs(tilt) < 1.5
+            // Deadband threshold prevents sub-pixel noise from spamming SwiftUI renders
+            if abs(tilt - self.tiltDegrees) >= 0.15 || newIsLevel != self.isLevel {
+                self.tiltDegrees = tilt
+                self.isLevel = newIsLevel
+            }
         }
     }
 

@@ -30,3 +30,4 @@ Carthage/Build/
 !README.md
 !docs/**/*.md
 .DS_Store
+.agents/

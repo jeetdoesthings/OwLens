@@ -13,7 +13,6 @@ extension MetalPipeline {
         let width = 32
         let height = 32
         let bytesPerRow = width * 2
-        let totalBytes = bytesPerRow * height
 
         var rawBytes = [UInt16](repeating: 4096, count: width * height)
         // Inject a single saturated pixel near the center.
@@ -128,6 +127,192 @@ extension MetalPipeline {
         }
         print("[SyntheticTest] hot pixel region min=\(minValue) max=\(maxValue) — \(passed ? "PASS" : "FAIL")")
         return passed
+    }
+
+    /// Verifies Apple Log 2 transfer function accuracy against the published Apple Log White Paper reference values.
+    static func runAppleLog2AccuracyTest() -> Bool {
+        var allPassed = true
+
+        let testCases: [(r: Float, expectedP: Float, name: String)] = [
+            (0.0, 0.150477, "0% reflectance"),
+            (0.18, 0.488272, "18% reflectance (middle gray)"),
+            (0.90, 0.681686, "90% reflectance"),
+            (12.0, 1.000000, "1200% reflectance")
+        ]
+
+        let eps: Float = 0.0001
+        for tc in testCases {
+            let encoded = LogCurve.appleLog2Encode(tc.r)
+            let diff = abs(encoded - tc.expectedP)
+            let pass = diff <= eps
+            if !pass {
+                print("[AppleLog2Test] FAIL \(tc.name): got \(encoded), expected \(tc.expectedP), diff \(diff)")
+                allPassed = false
+            } else {
+                print("[AppleLog2Test] PASS \(tc.name): \(encoded) ≈ \(tc.expectedP)")
+            }
+        }
+
+        // Below R0 clamp test
+        let belowR0 = LogCurve.appleLog2Encode(-0.1)
+        if belowR0 != 0.0 {
+            print("[AppleLog2Test] FAIL below R0 clamp: got \(belowR0), expected 0.0")
+            allPassed = false
+        } else {
+            print("[AppleLog2Test] PASS below R0 clamp: \(belowR0) == 0.0")
+        }
+
+        // Roundtrip invertibility test
+        let roundtripValues: [Float] = [0.0, 0.005, 0.01, 0.18, 0.90, 1.0, 4.0, 12.0]
+        for r in roundtripValues {
+            let enc = LogCurve.appleLog2Encode(r)
+            let dec = LogCurve.appleLog2Decode(enc)
+            let diff = abs(dec - r)
+            if diff > 0.0002 {
+                print("[AppleLog2Test] FAIL roundtrip at R=\(r): decoded \(dec), diff \(diff)")
+                allPassed = false
+            } else {
+                print("[AppleLog2Test] PASS roundtrip at R=\(r): encoded=\(enc) -> decoded=\(dec)")
+            }
+        }
+
+        // SIMD3 test
+        let rgbIn = SIMD3<Float>(0.0, 0.18, 0.90)
+        let rgbEnc = LogCurve.apply(rgbIn, type: .appleLog2)
+        let rgbDec = LogCurve.inverse(rgbEnc, type: .appleLog2)
+        if abs(rgbDec.x - rgbIn.x) > eps || abs(rgbDec.y - rgbIn.y) > eps || abs(rgbDec.z - rgbIn.z) > eps {
+            print("[AppleLog2Test] FAIL SIMD3 roundtrip: in=\(rgbIn), out=\(rgbDec)")
+            allPassed = false
+        } else {
+            print("[AppleLog2Test] PASS SIMD3 apply/inverse: \(rgbEnc)")
+        }
+
+        return allPassed
+    }
+
+    /// Verifies that the calibrated sensor-to-gamut matrices preserve neutral white balance
+    /// and map colors accurately without blowing out saturation.
+    static func runColorMatrixValidationTest() -> Bool {
+        var allPassed = true
+        let eps: Float = 0.001
+
+        let m2020 = WhiteBalanceParams.defaultSensorToBT2020
+        let mSGamut = WhiteBalanceParams.defaultSensorToSGamut3Cine
+
+        // Verify row sums equal 1.0 (neutral white preservation)
+        let r0_2020 = m2020[0, 0] + m2020[1, 0] + m2020[2, 0]
+        let r1_2020 = m2020[0, 1] + m2020[1, 1] + m2020[2, 1]
+        let r2_2020 = m2020[0, 2] + m2020[1, 2] + m2020[2, 2]
+
+        if abs(r0_2020 - 1.0) > eps || abs(r1_2020 - 1.0) > eps || abs(r2_2020 - 1.0) > eps {
+            print("[ColorMatrixTest] FAIL BT.2020 row sums: [\(r0_2020), \(r1_2020), \(r2_2020)]")
+            allPassed = false
+        } else {
+            print("[ColorMatrixTest] PASS BT.2020 row sums preserve white: [\(r0_2020), \(r1_2020), \(r2_2020)]")
+        }
+
+        let r0_sg = mSGamut[0, 0] + mSGamut[1, 0] + mSGamut[2, 0]
+        let r1_sg = mSGamut[0, 1] + mSGamut[1, 1] + mSGamut[2, 1]
+        let r2_sg = mSGamut[0, 2] + mSGamut[1, 2] + mSGamut[2, 2]
+
+        if abs(r0_sg - 1.0) > eps || abs(r1_sg - 1.0) > eps || abs(r2_sg - 1.0) > eps {
+            print("[ColorMatrixTest] FAIL SGamut3Cine row sums: [\(r0_sg), \(r1_sg), \(r2_sg)]")
+            allPassed = false
+        } else {
+            print("[ColorMatrixTest] PASS SGamut3Cine row sums preserve white: [\(r0_sg), \(r1_sg), \(r2_sg)]")
+        }
+
+        // Verify 18% neutral gray maps exactly to 18% neutral gray
+        let gray = SIMD3<Float>(0.18, 0.18, 0.18)
+        let out2020 = m2020 * gray
+        let outSG = mSGamut * gray
+
+        if abs(out2020.x - 0.18) > eps || abs(out2020.y - 0.18) > eps || abs(out2020.z - 0.18) > eps {
+            print("[ColorMatrixTest] FAIL BT.2020 neutral gray: \(out2020)")
+            allPassed = false
+        } else {
+            print("[ColorMatrixTest] PASS BT.2020 neutral gray 0.18 preserved: \(out2020)")
+        }
+
+        if abs(outSG.x - 0.18) > eps || abs(outSG.y - 0.18) > eps || abs(outSG.z - 0.18) > eps {
+            print("[ColorMatrixTest] FAIL SGamut3Cine neutral gray: \(outSG)")
+            allPassed = false
+        } else {
+            print("[ColorMatrixTest] PASS SGamut3Cine neutral gray 0.18 preserved: \(outSG)")
+        }
+
+        // Verify diagonal bounds (must be well-conditioned ~0.85 to 1.45, not boosting saturation beyond physical bounds)
+        let diag2020 = [m2020[0, 0], m2020[1, 1], m2020[2, 2]]
+        let diagSG = [mSGamut[0, 0], mSGamut[1, 1], mSGamut[2, 2]]
+        for d in diag2020 {
+            if d < 0.85 || d > 1.45 {
+                print("[ColorMatrixTest] FAIL BT.2020 diagonal out of bounds: \(d)")
+                allPassed = false
+            }
+        }
+        for d in diagSG {
+            if d < 0.85 || d > 1.45 {
+                print("[ColorMatrixTest] FAIL SGamut3Cine diagonal out of bounds: \(d)")
+                allPassed = false
+            }
+        }
+
+        return allPassed
+    }
+
+    /// Benchmarks the optimized pipeline (single-pass fused demosaic + direct BGRA scaling)
+    /// on synthetic Bayer frames to verify that GPU frame times stay comfortably below the real-time budget.
+    func runPipelineThroughputBenchmark() -> Bool {
+        let width = 1920
+        let height = 1080
+        let bytesPerRow = width * 2
+        let rawBytes = [UInt16](repeating: 4096, count: width * height)
+
+        let pixelBuffer: CVPixelBuffer? = rawBytes.withUnsafeBytes { ptr in
+            var pb: CVPixelBuffer?
+            let status = CVPixelBufferCreateWithBytes(
+                kCFAllocatorDefault,
+                width, height,
+                kCVPixelFormatType_14Bayer_RGGB,
+                UnsafeMutableRawPointer(mutating: ptr.baseAddress!),
+                bytesPerRow,
+                nil, nil, nil,
+                &pb
+            )
+            return status == kCVReturnSuccess ? pb : nil
+        }
+
+        guard let buffer = pixelBuffer else {
+            print("[ThroughputBenchmark] Failed to create synthetic pixel buffer")
+            return false
+        }
+
+        // Warm up
+        let warmupSem = DispatchSemaphore(value: 0)
+        process(buffer, encodeWidth: width, encodeHeight: height, encodeAsBGRA: true) { _, _ in
+            warmupSem.signal()
+        }
+        warmupSem.wait()
+
+        // Benchmark 10 iterations
+        let iterations = 10
+        var totalMs: Double = 0.0
+        for _ in 0..<iterations {
+            let t0 = CACurrentMediaTime()
+            let sem = DispatchSemaphore(value: 0)
+            process(buffer, encodeWidth: width, encodeHeight: height, encodeAsBGRA: true) { _, _ in
+                let dt = (CACurrentMediaTime() - t0) * 1000.0
+                totalMs += dt
+                sem.signal()
+            }
+            sem.wait()
+        }
+
+        let avgMs = totalMs / Double(iterations)
+        print("[ThroughputBenchmark] 1080p average frame time: \(String(format: "%.2f", avgMs)) ms across \(iterations) frames")
+        let pass = avgMs < 33.33 // must easily fit in 30 fps budget
+        print("[ThroughputBenchmark] Result: \(pass ? "PASS" : "FAIL") (target < 33.33 ms)")
+        return pass
     }
 }
 

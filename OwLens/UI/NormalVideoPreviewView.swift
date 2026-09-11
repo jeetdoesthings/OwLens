@@ -28,7 +28,7 @@ struct NormalVideoPreviewView: UIViewRepresentable {
         }
         if context.coordinator.lensID != lensID {
             context.coordinator.lensID = lensID
-            uiView.refreshSession(session)
+            uiView.updateVideoOrientation()
         }
         uiView.updateVideoOrientation()
     }
@@ -85,18 +85,23 @@ final class PreviewLayerView: UIView {
     }
 
     func updateVideoOrientation() {
-        guard let connection = previewLayer.connection,
-              connection.isVideoOrientationSupported else { return }
+        guard let connection = previewLayer.connection else { return }
 
+        // videoRotationAngle is in degrees (iOS 17+), matching AVCaptureVideoOrientation:
+        // .landscapeRight = 0, .portrait = 90, .landscapeLeft = 180, .portraitUpsideDown = 270.
         let interfaceOrientation = window?.windowScene?.interfaceOrientation
+        let angle: CGFloat
         switch interfaceOrientation {
-        case .landscapeLeft:
-            connection.videoOrientation = .landscapeLeft
-        case .landscapeRight:
-            connection.videoOrientation = .landscapeRight
-        default:
-            connection.videoOrientation = .landscapeRight
+        case .landscapeLeft: angle = 180
+        case .landscapeRight: angle = 0
+        default: angle = 0
         }
+
+        // isVideoRotationAngleSupported(_:) is a method (not a property here): it
+        // returns false for non-video connections, preserving the old guard, and
+        // avoids NSInvalidArgumentException when assigning an unsupported angle.
+        guard connection.isVideoRotationAngleSupported(angle) else { return }
+        connection.videoRotationAngle = angle
     }
 
     private func aspectFitRect(in bounds: CGRect, aspect: CGFloat) -> CGRect {

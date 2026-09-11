@@ -19,12 +19,10 @@ struct CameraPreviewView: UIViewRepresentable {
         mtkView.delegate = context.coordinator
         mtkView.framebufferOnly = true
         mtkView.colorPixelFormat = .bgra8Unorm
-        // Run the display link at a fixed rate so draw(in:) is called ~30 times per
-        // second. The coordinator's currentTexture is updated via updateUIView which is
-        // reliably called because textureChangeCount (UInt64, Equatable) changes every frame.
-        mtkView.enableSetNeedsDisplay = false
-        mtkView.isPaused = false
-        mtkView.preferredFramesPerSecond = 30
+        // Drive rendering directly from incoming processed frames (setNeedsDisplay)
+        // rather than an unsynchronized 30Hz timer, eliminating 3:2 pulldown judder.
+        mtkView.enableSetNeedsDisplay = true
+        mtkView.isPaused = true
         mtkView.autoResizeDrawable = true
         mtkView.clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: overlayOnly ? 0 : 1)
         mtkView.backgroundColor = overlayOnly ? .clear : .black
@@ -38,8 +36,6 @@ struct CameraPreviewView: UIViewRepresentable {
     }
  
     func updateUIView(_ uiView: MTKView, context: Context) {
-        // Propagate latest texture to the coordinator — the display link ticks at 30 Hz
-        // so draw(in:) picks it up naturally within ~33 ms of the change.
         context.coordinator.currentTexture = currentTexture
         context.coordinator.showClipping = showClipping
         context.coordinator.showFocusPeaking = showFocusPeaking
@@ -50,8 +46,7 @@ struct CameraPreviewView: UIViewRepresentable {
         uiView.isOpaque = !overlayOnly
         uiView.layer.isOpaque = !overlayOnly
         (uiView.layer as? CAMetalLayer)?.isOpaque = !overlayOnly
-        // The display link runs continuously so draw(in:) picks up new textures
-        // within ~33 ms of the coordinator receiving them via updateUIView.
+        uiView.setNeedsDisplay()
     }
  
     func makeCoordinator() -> Coordinator {
@@ -96,6 +91,22 @@ struct CameraPreviewView: UIViewRepresentable {
             // Skip Metal when app not active (avoids IOGPU background permission error)
             // isAppActive is set on MainActor via updateUIView, read safely here on render thread
             guard isAppActive else { return }
+
+            // When overlayOnly is true (hardware Rec.709 preview is active) and no overlays are requested,
+            // skip all texture sampling and fragment shader passes entirely to free 100% GPU bandwidth.
+            if overlayOnly && !showClipping && !showFocusPeaking {
+                if let drawable = view.currentDrawable,
+                   let commandBuffer = renderCommandQueue?.makeCommandBuffer() {
+                    if let renderPassDescriptor = view.currentRenderPassDescriptor,
+                       let renderEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: renderPassDescriptor) {
+                        renderEncoder.endEncoding()
+                    }
+                    commandBuffer.present(drawable)
+                    commandBuffer.commit()
+                }
+                return
+            }
+
             guard let drawable = view.currentDrawable,
                   let commandBuffer = renderCommandQueue?.makeCommandBuffer() else {
                 return

@@ -1,6 +1,7 @@
 import AVFoundation
 import CoreVideo
 import QuartzCore
+import simd
 
 /// Metadata extracted from each RAW photo capture.
 /// `pixelBuffer` is always an **owned copy** so the capture pipeline can start the next still immediately.
@@ -14,9 +15,11 @@ struct RawFrameData {
     let lscCoefficients: SIMD4<Float>
     let iso: Float
     let exposureDurationSeconds: Double
+    let colorMatrix: simd_float3x3?
+    let sgamutMatrix: simd_float3x3?
 }
 
-final class CaptureController: NSObject, ObservableObject {
+final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
     let session = AVCaptureSession()
     private let photoOutput = AVCapturePhotoOutput()
     var isShutterSoundSuppressionSupported: Bool {
@@ -51,9 +54,15 @@ final class CaptureController: NSObject, ObservableObject {
     /// Whether the capture timer runs in recording mode (tighter settings).
     private var isRecordingMode = false
 
+    private var bayerBufferPool: CVPixelBufferPool?
+    private var bayerPoolW: Int = 0
+    private var bayerPoolH: Int = 0
+    private var bayerPoolFormat: OSType = 0
+
     private var cachedBlackLevel: Float?
     private var cachedWhiteLevel: Float?
     private var cachedISO: Float?
+    private var cachedColorMatrices: (bt2020: simd_float3x3?, sgamut: simd_float3x3?)?
 
     // MARK: - Session Configuration
 
@@ -62,10 +71,16 @@ final class CaptureController: NSObject, ObservableObject {
         // system shutter sound that otherwise fires 24×/sec during RAW burst.
         do {
             let audioSession = AVAudioSession.sharedInstance()
-            try audioSession.setCategory(.playAndRecord, mode: .videoRecording, options: [.defaultToSpeaker, .mixWithOthers])
+            try audioSession.setCategory(
+                .playAndRecord,
+                mode: .videoRecording,
+                options: [.defaultToSpeaker, .allowBluetoothHFP, .allowBluetoothA2DP, .mixWithOthers]
+            )
+            try audioSession.setPreferredSampleRate(48_000)
+            try audioSession.setPreferredIOBufferDuration(0.02)
             try audioSession.setActive(true)
         } catch {
-            print("[CaptureController] Audio session shutter-suppress failed (non-fatal): \(error)")
+            print("[CaptureController] Audio session configure failed (non-fatal): \(error)")
         }
 
         // Build graph under begin/commit, then resolve Bayer *after* commit.
@@ -123,7 +138,7 @@ final class CaptureController: NSObject, ObservableObject {
         try applyDefaultCameraModes(on: camera)
         lockSensorToTargetFPS(on: camera, fps: targetFPS)
 
-        try resolveBayerRAWOrThrow()
+        try resolveBayerRAWOrThrow(allowFallbackToOtherLenses: true)
 
         // Burst helpers only after Bayer is confirmed
         enableBurstHelpersIfSafe()
@@ -150,11 +165,13 @@ final class CaptureController: NSObject, ObservableObject {
                 print("[CaptureController] Sensor FPS \(rate) not in range; leaving default")
                 return
             }
-            let duration = CMTime(value: 1, timescale: CMTimeScale(rate))
-            camera.activeVideoMinFrameDuration = duration
-            camera.activeVideoMaxFrameDuration = duration
+            let maxDuration = CMTime(value: 1, timescale: CMTimeScale(rate))
+            camera.activeVideoMaxFrameDuration = maxDuration
+            if let minRange = ranges.first(where: { $0.minFrameRate <= rate && rate <= $0.maxFrameRate }) {
+                camera.activeVideoMinFrameDuration = minRange.minFrameDuration
+            }
             let dims = CMVideoFormatDescriptionGetDimensions(camera.activeFormat.formatDescription)
-            print("[CaptureController] Sensor \(dims.width)x\(dims.height) locked @ \(rate)fps (preset .photo)")
+            print("[CaptureController] Sensor \(dims.width)x\(dims.height) locked @ max \(rate)fps (preset .photo)")
         } catch {
             print("[CaptureController] lockSensorToTargetFPS: \(error)")
         }
@@ -197,33 +214,43 @@ final class CaptureController: NSObject, ObservableObject {
     }
 
     /// Must run **after** `session.commitConfiguration()` with photo input+output attached.
-    private func resolveBayerRAWOrThrow() throws {
+    private func resolveBayerRAWOrThrow(allowFallbackToOtherLenses: Bool = false) throws {
         var allRaw = photoOutput.availableRawPhotoPixelFormatTypes
         print("[CaptureController] Available RAW formats: \(allRaw.map { fourCC($0) })")
 
         var bayer = bayerFormatsAvailable()
         print("[CaptureController] Bayer formats: \(bayer.map { fourCC($0) })")
 
+        // When switching lenses on an active session, the camera hardware/pipeline
+        // can require a few milliseconds to re-negotiate format capabilities.
+        if bayer.isEmpty {
+            for _ in 0..<8 {
+                Thread.sleep(forTimeInterval: 0.025)
+                allRaw = photoOutput.availableRawPhotoPixelFormatTypes
+                bayer = bayerFormatsAvailable()
+                if !bayer.isEmpty { break }
+            }
+        }
+
         if bayer.isEmpty {
             print("[CaptureController] Bayer empty — soft reset (.photo, no burst opts)")
             session.beginConfiguration()
             session.sessionPreset = .photo
             photoOutput.maxPhotoQualityPrioritization = .speed
-            if #available(iOS 17.0, *) {
-                if photoOutput.isZeroShutterLagSupported { photoOutput.isZeroShutterLagEnabled = false }
-                if photoOutput.isResponsiveCaptureSupported { photoOutput.isResponsiveCaptureEnabled = false }
-                if photoOutput.isFastCapturePrioritizationSupported { photoOutput.isFastCapturePrioritizationEnabled = false }
-            }
             maxInFlight = 1
             session.commitConfiguration()
 
-            allRaw = photoOutput.availableRawPhotoPixelFormatTypes
-            bayer = bayerFormatsAvailable()
+            for _ in 0..<8 {
+                Thread.sleep(forTimeInterval: 0.025)
+                allRaw = photoOutput.availableRawPhotoPixelFormatTypes
+                bayer = bayerFormatsAvailable()
+                if !bayer.isEmpty { break }
+            }
             print("[CaptureController] Bayer after soft reset: \(bayer.map { fourCC($0) }) all=\(allRaw.map { fourCC($0) })")
         }
 
-        // Try other back lenses if needed
-        if bayer.isEmpty {
+        // Try other back lenses ONLY if allowFallbackToOtherLenses is true (initial setup only)
+        if bayer.isEmpty && allowFallbackToOtherLenses {
             for lens in Self.discoverBackLenses() {
                 guard lens.uniqueID != device?.uniqueID,
                       let cam = AVCaptureDevice(uniqueID: lens.uniqueID) else { continue }
@@ -248,7 +275,7 @@ final class CaptureController: NSObject, ObservableObject {
             throw NSError(
                 domain: "OwLens",
                 code: 4,
-                userInfo: [NSLocalizedDescriptionKey: "No Bayer RAW available. Use Photo preset + Wide camera. Reboot if stuck."]
+                userInfo: [NSLocalizedDescriptionKey: "No Bayer RAW available for \(device?.localizedName ?? "selected lens")."]
             )
         }
         self.rawPixelFormat = rawFormat
@@ -278,8 +305,17 @@ final class CaptureController: NSObject, ObservableObject {
             videoInput = newInput
             device = camera
             session.sessionPreset = .photo
+            photoOutput.maxPhotoQualityPrioritization = .speed
+            if #available(iOS 17.0, *) {
+                if photoOutput.isZeroShutterLagSupported { photoOutput.isZeroShutterLagEnabled = false }
+                if photoOutput.isResponsiveCaptureSupported { photoOutput.isResponsiveCaptureEnabled = false }
+                if photoOutput.isFastCapturePrioritizationSupported { photoOutput.isFastCapturePrioritizationEnabled = false }
+            }
+            maxInFlight = 1
             session.commitConfiguration()
             try? applyDefaultCameraModes(on: camera)
+            lockSensorToTargetFPS(on: camera, fps: targetFPS)
+            enableBurstHelpersIfSafe()
             return true
         } catch {
             session.commitConfiguration()
@@ -519,7 +555,7 @@ final class CaptureController: NSObject, ObservableObject {
 
     var currentLensUniqueID: String? { device?.uniqueID }
 
-    func selectLens(uniqueID: String, completion: ((Error?) -> Void)? = nil) {
+    func selectLens(uniqueID: String, completion: (@Sendable (Error?) -> Void)? = nil) {
         if uniqueID == device?.uniqueID {
             completion?(nil)
             return
@@ -568,13 +604,16 @@ final class CaptureController: NSObject, ObservableObject {
                 self.device = camera
 
                 self.session.sessionPreset = .photo
+                self.photoOutput.maxPhotoQualityPrioritization = .speed
+                self.maxInFlight = 1
                 self.session.commitConfiguration()
 
                 // Resolve Bayer *after* commit (list is empty mid-configuration)
                 do {
                     try self.applyDefaultCameraModes(on: camera)
+                    try self.resolveBayerRAWOrThrow(allowFallbackToOtherLenses: false)
                     self.lockSensorToTargetFPS(on: camera, fps: self.targetFPS)
-                    try self.resolveBayerRAWOrThrow()
+                    self.enableBurstHelpersIfSafe()
                 } catch {
                     // Roll back lens
                     if let old = previousInput, let prev = previousDevice {
@@ -586,9 +625,12 @@ final class CaptureController: NSObject, ObservableObject {
                             self.device = prev
                         }
                         self.session.sessionPreset = .photo
+                        self.photoOutput.maxPhotoQualityPrioritization = .speed
+                        self.maxInFlight = 1
                         self.session.commitConfiguration()
                         try? self.applyDefaultCameraModes(on: prev)
-                        try? self.resolveBayerRAWOrThrow()
+                        try? self.resolveBayerRAWOrThrow(allowFallbackToOtherLenses: false)
+                        self.enableBurstHelpersIfSafe()
                     }
                     throw error
                 }
@@ -596,6 +638,7 @@ final class CaptureController: NSObject, ObservableObject {
                 self.cachedBlackLevel = nil
                 self.cachedWhiteLevel = nil
                 self.cachedISO = nil
+                self.cachedColorMatrices = nil
                 self.prepareRAWPhotoResources()
 
                 if wasRunning {
@@ -637,7 +680,7 @@ final class CaptureController: NSObject, ObservableObject {
 
     var currentAudioPortUID: String? { selectedAudioPortUID }
 
-    func selectAudioSource(portUID: String?, completion: ((Error?) -> Void)? = nil) {
+    func selectAudioSource(portUID: String?, completion: (@Sendable (Error?) -> Void)? = nil) {
         if portUID == selectedAudioPortUID {
             completion?(nil)
             return
@@ -759,9 +802,24 @@ final class CaptureController: NSObject, ObservableObject {
 
     func setManualFocus(lensPosition: Float) {
         guard let device = device else { return }
+        // setFocusModeLocked raises NSInvalidArgumentException ("Unsupported
+        // focusMode") when .locked isn't supported (e.g. front camera / simulator)
+        // and when lensPosition is outside the [0, 1] AVCaptureLensPosition range.
+        // Clamp defensively and guard the mode before invoking it.
+        let position = min(1.0, max(0.0, lensPosition))
         do {
             try device.lockForConfiguration()
-            device.setFocusModeLocked(lensPosition: lensPosition, completionHandler: nil)
+            if device.isFocusModeSupported(.locked) {
+                device.setFocusModeLocked(lensPosition: position, completionHandler: nil)
+            } else {
+                // Degrade to a supported AF mode instead of raising.
+                if device.isFocusModeSupported(.continuousAutoFocus) {
+                    device.focusMode = .continuousAutoFocus
+                } else if device.isFocusModeSupported(.autoFocus) {
+                    device.focusMode = .autoFocus
+                }
+                print("[CaptureController] Manual focus (.locked) unsupported — using auto focus")
+            }
             device.unlockForConfiguration()
         } catch {
             print("[CaptureController] Error setting manual focus: \(error)")
@@ -845,11 +903,15 @@ final class CaptureController: NSObject, ObservableObject {
     }
 
     /// Adjust capture pipeline behavior for recording.
-    /// Recording mode reduces in-flight captures to minimize per-frame latency.
+    /// Retains responsive capture double-buffering (maxInFlight=2) so sensor throughput hits full 24/30 fps.
     /// Must be called from the main thread.
     func setRecordingMode(_ recording: Bool) {
         isRecordingMode = recording
-        maxInFlight = recording ? 1 : 3
+        if photoOutput.isResponsiveCaptureEnabled {
+            maxInFlight = 2
+        } else {
+            maxInFlight = 1
+        }
     }
 
     // MARK: - Continuous RAW Capture Loop
@@ -860,11 +922,8 @@ final class CaptureController: NSObject, ObservableObject {
         captureTimer?.cancel()
         captureTimer = nil
         minFrameInterval = 1.0 / max(1, fps)
-        // Aggressive poll so we never sit idle after a free slot
-        // In recording mode poll at minFrameInterval to reduce CPU load.
-        let poll = isRecordingMode ? minFrameInterval : min(1.0 / 120.0, minFrameInterval / 2)
         let timer = DispatchSource.makeTimerSource(queue: captureQueue)
-        timer.schedule(deadline: .now(), repeating: poll)
+        timer.schedule(deadline: .now(), repeating: minFrameInterval)
         timer.setEventHandler { [weak self] in
             self?.captureOneRawFrame()
         }
@@ -876,30 +935,13 @@ final class CaptureController: NSObject, ObservableObject {
     private func captureOneRawFrame() {
         if isReconfiguringAudio { return }
 
-        let now = CACurrentMediaTime()
-        if now - lastCaptureStart < minFrameInterval {
-            return
-        }
-
         captureLock.lock()
         if inFlightCaptures >= maxInFlight {
             captureLock.unlock()
             return
         }
-        // Responsive capture: also respect captureReadiness when available
-        if #available(iOS 17.0, *) {
-            if photoOutput.isResponsiveCaptureEnabled {
-                switch photoOutput.captureReadiness {
-                case .ready, .notReadyMomentarily:
-                    break
-                default:
-                    captureLock.unlock()
-                    return
-                }
-            }
-        }
         inFlightCaptures += 1
-        lastCaptureStart = now
+        lastCaptureStart = CACurrentMediaTime()
         captureLock.unlock()
 
         if !photoOutput.availableRawPhotoPixelFormatTypes.contains(rawPixelFormat) {
@@ -925,10 +967,6 @@ final class CaptureController: NSObject, ObservableObject {
         captureLock.lock()
         inFlightCaptures = max(0, inFlightCaptures - 1)
         captureLock.unlock()
-        // Immediately attempt next still
-        captureQueue.async { [weak self] in
-            self?.captureOneRawFrame()
-        }
     }
 
     private func waitForInFlightClear(timeout: TimeInterval) {
@@ -944,22 +982,60 @@ final class CaptureController: NSObject, ObservableObject {
 
     // MARK: - Bayer buffer copy (critical for stills rate)
 
-    /// Deep-copy Bayer plane so AVCapture can recycle its pool and start the next RAW.
-    private static func copyBayerPixelBuffer(_ src: CVPixelBuffer) -> CVPixelBuffer? {
+    /// Deep-copy Bayer plane into a pooled buffer so AVCapture can recycle its internal buffer and start the next RAW.
+    /// Reuses existing IOSurfaces to eliminate ~720 MB/s of runtime heap allocations and Mach IPC overhead.
+    private func copyBayerPixelBuffer(_ src: CVPixelBuffer) -> CVPixelBuffer? {
         let width = CVPixelBufferGetWidth(src)
         let height = CVPixelBufferGetHeight(src)
         let format = CVPixelBufferGetPixelFormatType(src)
 
+        if bayerBufferPool == nil || bayerPoolW != width || bayerPoolH != height || bayerPoolFormat != format {
+            let poolAttrs: [String: Any] = [
+                kCVPixelBufferPoolMinimumBufferCountKey as String: 6
+            ]
+            let pbAttrs: [String: Any] = [
+                kCVPixelBufferPixelFormatTypeKey as String: format,
+                kCVPixelBufferWidthKey as String: width,
+                kCVPixelBufferHeightKey as String: height,
+                kCVPixelBufferIOSurfacePropertiesKey as String: [:] as [String: Any],
+                kCVPixelBufferMetalCompatibilityKey as String: true
+            ]
+            var newPool: CVPixelBufferPool?
+            let status = CVPixelBufferPoolCreate(
+                nil,
+                poolAttrs as CFDictionary,
+                pbAttrs as CFDictionary,
+                &newPool
+            )
+            if status == kCVReturnSuccess {
+                bayerBufferPool = newPool
+                bayerPoolW = width
+                bayerPoolH = height
+                bayerPoolFormat = format
+            }
+        }
+
         var dst: CVPixelBuffer?
-        let attrs: [CFString: Any] = [
-            kCVPixelBufferIOSurfacePropertiesKey: [:] as CFDictionary,
-            kCVPixelBufferMetalCompatibilityKey: true
-        ]
-        let status = CVPixelBufferCreate(
-            kCFAllocatorDefault, width, height, format,
-            attrs as CFDictionary, &dst
-        )
-        guard status == kCVReturnSuccess, let dst else { return nil }
+        if let pool = bayerBufferPool {
+            let status = CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pool, &dst)
+            if status != kCVReturnSuccess {
+                dst = nil
+            }
+        }
+
+        if dst == nil {
+            let attrs: [CFString: Any] = [
+                kCVPixelBufferIOSurfacePropertiesKey: [:] as CFDictionary,
+                kCVPixelBufferMetalCompatibilityKey: true
+            ]
+            let status = CVPixelBufferCreate(
+                kCFAllocatorDefault, width, height, format,
+                attrs as CFDictionary, &dst
+            )
+            guard status == kCVReturnSuccess, let _ = dst else { return nil }
+        }
+
+        guard let dst else { return nil }
 
         CVPixelBufferLockBaseAddress(src, .readOnly)
         CVPixelBufferLockBaseAddress(dst, [])
@@ -998,8 +1074,18 @@ extension CaptureController: AVCapturePhotoCaptureDelegate {
     // on iOS 18+. No per-frame AudioServices calls needed.
 
     func photoOutput(_ output: AVCapturePhotoOutput, didFinishProcessingPhoto photo: AVCapturePhoto, error: Error?) {
-        // Always free the capture slot ASAP after we copy the buffer.
-        defer { endInFlight() }
+        // Free the capture slot ASAP after we copy the buffer, and re-trigger immediately if due
+        defer {
+            endInFlight()
+            if isRecordingMode {
+                let now = CACurrentMediaTime()
+                if now - lastCaptureStart >= minFrameInterval {
+                    captureQueue.async { [weak self] in
+                        self?.captureOneRawFrame()
+                    }
+                }
+            }
+        }
 
         if let error {
             print("[CaptureController] Capture error: \(error.localizedDescription)")
@@ -1012,7 +1098,7 @@ extension CaptureController: AVCapturePhotoCaptureDelegate {
         }
 
         // CRITICAL: copy then drop system buffer reference so next RAW can start.
-        guard let owned = Self.copyBayerPixelBuffer(systemBuffer) else {
+        guard let owned = copyBayerPixelBuffer(systemBuffer) else {
             print("[CaptureController] Failed to copy Bayer buffer")
             return
         }
@@ -1052,6 +1138,16 @@ extension CaptureController: AVCapturePhotoCaptureDelegate {
         // will cause severe vignette under/over correction. (Phase 2 feature pending).
         let lsc = SIMD4<Float>(0.0, 0.0, 0.0, 0.0)
 
+        let colorMatrices: (bt2020: simd_float3x3?, sgamut: simd_float3x3?)
+        if let cached = cachedColorMatrices {
+            colorMatrices = cached
+        } else {
+            colorMatrices = extractColorMatrices(from: photo)
+            if colorMatrices.bt2020 != nil {
+                cachedColorMatrices = colorMatrices
+            }
+        }
+
         let frameData = RawFrameData(
             pixelBuffer: owned,
             whiteBalanceGains: device?.deviceWhiteBalanceGains,
@@ -1061,10 +1157,112 @@ extension CaptureController: AVCapturePhotoCaptureDelegate {
             pixelFormat: bufferFormat,
             lscCoefficients: lsc,
             iso: currentISO,
-            exposureDurationSeconds: device?.exposureDuration.seconds ?? 0
+            exposureDurationSeconds: device?.exposureDuration.seconds ?? 0,
+            colorMatrix: colorMatrices.bt2020,
+            sgamutMatrix: colorMatrices.sgamut
         )
 
         onRawFrameData?(frameData)
+    }
+
+    private func extractColorMatrices(from photo: AVCapturePhoto) -> (bt2020: simd_float3x3?, sgamut: simd_float3x3?) {
+        guard let dng = photo.metadata["{DNG}"] as? [String: Any] else { return (nil, nil) }
+
+        // Standard CIE XYZ D50 to ITU-R BT.2020 (D65) matrix (CIE XYZ D65 -> BT.2020 * Bradford D50 -> D65):
+        let mD50to2020 = simd_float3x3(
+            SIMD3<Float>( 1.647184, -0.682664,  0.029669), // column 0
+            SIMD3<Float>(-0.393683,  1.647714, -0.062927), // column 1
+            SIMD3<Float>(-0.235960,  0.012817,  1.253558)  // column 2
+        )
+
+        // Standard CIE XYZ D50 to Sony S-Gamut3.Cine (D65) matrix (XYZ D65 -> S-Gamut3.Cine * Bradford D50 -> D65):
+        let mD50toSGamut = simd_float3x3(
+            SIMD3<Float>( 1.776877, -0.458267,  0.049283), // column 0
+            SIMD3<Float>(-0.569584,  1.279227, -0.002952), // column 1
+            SIMD3<Float>(-0.174344,  0.197160,  1.157947)  // column 2
+        )
+
+        // Standard CIE XYZ D65 to ITU-R BT.2020 matrix (stored column-major):
+        let mXYZto2020 = simd_float3x3(
+            SIMD3<Float>( 1.716651, -0.666684,  0.017640),
+            SIMD3<Float>(-0.355671,  1.616481, -0.042771),
+            SIMD3<Float>(-0.253366,  0.015769,  0.942103)
+        )
+
+        // Standard CIE XYZ D65 to Sony S-Gamut3.Cine matrix (stored column-major):
+        let mXYZtoSGamut = simd_float3x3(
+            SIMD3<Float>( 1.846779, -0.444153,  0.040855),
+            SIMD3<Float>(-0.525986,  1.259443,  0.015641),
+            SIMD3<Float>(-0.210545,  0.149400,  0.868207)
+        )
+
+        // Priority 1: DNG ForwardMatrix2 (D65) or ForwardMatrix1 (Standard Light A).
+        // ForwardMatrix maps white-balanced camera RGB directly to XYZ D50.
+        let fmRaw = (dng["ForwardMatrix2"] as? [Any]) ?? (dng["ForwardMatrix1"] as? [Any])
+        if let fm = fmRaw, let fmVals = Self.parseMatrixFloats(fm), fmVals.count == 9 {
+            let fmMatrix = simd_float3x3(
+                SIMD3<Float>(fmVals[0], fmVals[3], fmVals[6]), // column 0
+                SIMD3<Float>(fmVals[1], fmVals[4], fmVals[7]), // column 1
+                SIMD3<Float>(fmVals[2], fmVals[5], fmVals[8])  // column 2
+            )
+            if abs(fmMatrix.determinant) > 1e-5 {
+                let camTo2020 = Self.normalizeMatrixRows(mD50to2020 * fmMatrix)
+                let camToSGamut = Self.normalizeMatrixRows(mD50toSGamut * fmMatrix)
+                return (camTo2020, camToSGamut)
+            }
+        }
+
+        // Priority 2: DNG ColorMatrix2 (D65) or ColorMatrix1 (Standard Light A).
+        // ColorMatrix maps XYZ D65 to raw (un-white-balanced) camera native RGB.
+        // To apply to white-balanced camera RGB, we must invert ColorMatrix and multiply
+        // by the inverse of the sensor's native D65 white-balance gains D^-1.
+        let cmRaw = (dng["ColorMatrix2"] as? [Any]) ?? (dng["ColorMatrix1"] as? [Any])
+        if let cm = cmRaw, let cmVals = Self.parseMatrixFloats(cm), cmVals.count == 9 {
+            let cmMatrix = simd_float3x3(
+                SIMD3<Float>(cmVals[0], cmVals[3], cmVals[6]), // column 0
+                SIMD3<Float>(cmVals[1], cmVals[4], cmVals[7]), // column 1
+                SIMD3<Float>(cmVals[2], cmVals[5], cmVals[8])  // column 2
+            )
+            guard abs(cmMatrix.determinant) > 1e-5 else { return (nil, nil) }
+
+            // Compute sensor native white balance under D65:
+            let d65White = SIMD3<Float>(0.95047, 1.00000, 1.08883)
+            let rawWhite = cmMatrix * d65White
+            let wbR = rawWhite.y / max(rawWhite.x, 1e-4)
+            let wbB = rawWhite.y / max(rawWhite.z, 1e-4)
+            let dInv = simd_float3x3(
+                SIMD3<Float>(1.0 / wbR, 0, 0),
+                SIMD3<Float>(0, 1.0, 0),
+                SIMD3<Float>(0, 0, 1.0 / wbB)
+            )
+            let camToXYZ = cmMatrix.inverse * dInv
+
+            let camTo2020 = Self.normalizeMatrixRows(mXYZto2020 * camToXYZ)
+            let camToSGamut = Self.normalizeMatrixRows(mXYZtoSGamut * camToXYZ)
+            return (camTo2020, camToSGamut)
+        }
+
+        return (nil, nil)
+    }
+
+    private static func parseMatrixFloats(_ raw: [Any]) -> [Float]? {
+        var vals = [Float]()
+        for item in raw {
+            if let f = floatFromAny(item) { vals.append(f) }
+        }
+        return vals.count == 9 ? vals : nil
+    }
+
+    private static func normalizeMatrixRows(_ m: simd_float3x3) -> simd_float3x3 {
+        let r0Sum = m[0, 0] + m[1, 0] + m[2, 0]
+        let r1Sum = m[0, 1] + m[1, 1] + m[2, 1]
+        let r2Sum = m[0, 2] + m[1, 2] + m[2, 2]
+        guard abs(r0Sum) > 1e-4, abs(r1Sum) > 1e-4, abs(r2Sum) > 1e-4 else { return m }
+        return simd_float3x3(
+            SIMD3<Float>(m[0, 0] / r0Sum, m[0, 1] / r1Sum, m[0, 2] / r2Sum),
+            SIMD3<Float>(m[1, 0] / r0Sum, m[1, 1] / r1Sum, m[1, 2] / r2Sum),
+            SIMD3<Float>(m[2, 0] / r0Sum, m[2, 1] / r1Sum, m[2, 2] / r2Sum)
+        )
     }
 
     private func extractBlackWhiteLevels(from photo: AVCapturePhoto, pixelFormat: OSType) -> (Float, Float) {

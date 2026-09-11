@@ -2,12 +2,21 @@ import AVFoundation
 import VideoToolbox
 import QuartzCore
 
+/// Wraps a non-Sendable reference so it can be captured by a `@Sendable` closure
+/// (e.g. `AVAssetWriter.finishWriting`'s callback). `AVAssetWriter` is not
+/// `Sendable`, but here it is retired before this callback runs and is not used
+/// concurrently elsewhere, so `@unchecked` isolation is sound.
+private final class SendableAssetWriter: @unchecked Sendable {
+    let value: AVAssetWriter
+    init(_ value: AVAssetWriter) { self.value = value }
+}
+
 /// AVAssetWriter — HEVC + optional AAC at **constant** 24 or 30 fps.
 ///
 /// Capture often delivers fewer real RAW frames than target. We still write a
 /// true CFR timeline: missing slots **hold the last real frame**.
 /// Result: file reports 24/30 fps, duration ≈ wall-clock, no “20 fps” metadata.
-final class VideoWriter {
+final class VideoWriter: @unchecked Sendable {
     private var assetWriter: AVAssetWriter?
     private var videoInput: AVAssetWriterInput?
     private var audioInput: AVAssetWriterInput?
@@ -21,6 +30,8 @@ final class VideoWriter {
     private var audioReferenceTime: CMTime = .invalid
     private var hasStartedSession = false
     private var lastPixelBuffer: CVPixelBuffer?
+    private var pendingAudioBuffers: [CMSampleBuffer] = []
+    private let maxPendingAudioBuffers = 50
     private let lock = NSLock()
 
     var isRecording = false
@@ -40,7 +51,8 @@ final class VideoWriter {
         height: Int,
         bitrate: Int = 100_000_000,
         targetFPS: Double = 24,
-        includeAudio: Bool = true
+        includeAudio: Bool = true,
+        curveType: LogCurveType = .sLog3Approx
     ) throws {
         lock.lock()
         defer { lock.unlock() }
@@ -62,11 +74,29 @@ final class VideoWriter {
             AVVideoMaxKeyFrameIntervalKey: Int(fps),
             AVVideoAllowFrameReorderingKey: false as NSNumber
         ]
-        let videoSettings: [String: Any] = [
+
+        let colorProperties: [String: Any]
+        switch curveType {
+        case .linear:
+            colorProperties = [
+                AVVideoColorPrimariesKey: AVVideoColorPrimaries_ITU_R_709_2,
+                AVVideoTransferFunctionKey: AVVideoTransferFunction_ITU_R_709_2,
+                AVVideoYCbCrMatrixKey: AVVideoYCbCrMatrix_ITU_R_709_2
+            ]
+        case .appleLog2, .sLog3Approx:
+            colorProperties = [
+                AVVideoColorPrimariesKey: AVVideoColorPrimaries_ITU_R_2020,
+                AVVideoTransferFunctionKey: AVVideoTransferFunction_ITU_R_709_2,
+                AVVideoYCbCrMatrixKey: AVVideoYCbCrMatrix_ITU_R_2020
+            ]
+        }
+
+        var videoSettings: [String: Any] = [
             AVVideoCodecKey: AVVideoCodecType.hevc,
             AVVideoWidthKey: width,
             AVVideoHeightKey: height,
-            AVVideoCompressionPropertiesKey: compression
+            AVVideoCompressionPropertiesKey: compression,
+            AVVideoColorPropertiesKey: colorProperties
         ]
 
         let vInput = AVAssetWriterInput(mediaType: .video, outputSettings: videoSettings)
@@ -106,6 +136,7 @@ final class VideoWriter {
         guard writer.startWriting() else {
             throw writer.error ?? NSError(domain: "RawLogCam", code: 11, userInfo: [NSLocalizedDescriptionKey: "AVAssetWriter failed to start"])
         }
+        writer.startSession(atSourceTime: .zero)
 
         self.assetWriter = writer
         self.videoInput = vInput
@@ -114,12 +145,22 @@ final class VideoWriter {
         self.frameCount = 0
         self.realFrameCount = 0
         self.droppedFrames = 0
-        self.startHostTime = 0
-        self.hasStartedSession = false
+        self.startHostTime = CACurrentMediaTime()
+        self.hasStartedSession = true
         self.lastPixelBuffer = nil
+        self.audioReferenceTime = .invalid
+        self.pendingAudioBuffers.removeAll()
         self.isRecording = true
 
         print("[VideoWriter] CFR \(Int(fps))fps \(width)x\(height) codec=HEVC bitrate=\(bitrate)")
+    }
+
+    private func drainPendingAudioBuffersLocked() {
+        guard let input = audioInput else { return }
+        while !pendingAudioBuffers.isEmpty && input.isReadyForMoreMediaData {
+            let next = pendingAudioBuffers.removeFirst()
+            _ = input.append(next)
+        }
     }
 
     /// Append a real camera frame. Fills any missing CFR slots by holding last frame.
@@ -147,40 +188,25 @@ final class VideoWriter {
             startHostTime = now
             assetWriter?.startSession(atSourceTime: .zero)
             hasStartedSession = true
-            guard input.isReadyForMoreMediaData else {
-                droppedFrames += 1
-                lastPixelBuffer = pixelBuffer
-                return false
-            }
-            if writeCFR(pixelBuffer, index: 0, adaptor: adaptor) {
-                lastPixelBuffer = pixelBuffer
-                frameCount = 1
-                realFrameCount = 1
-                return true
-            }
-            droppedFrames += 1
-            return false
         }
 
         let elapsed = max(0, now - startHostTime)
         // How many CFR frames should exist by this wall time (0-based next index)
-        // e.g. at t=1.0s @ 24fps → need frames 0..23 written (count 24) → targetCount = 24
+        // e.g. at t=1.0s @ 24fps -> need frames 0..23 written (count 24) -> targetCount = 24
         let wallTargetCount = Int64(floor(elapsed * targetFPS + 1e-9)) + 1
         // Always advance at least one slot for this real frame
         let targetCount = max(frameCount + 1, wallTargetCount)
 
-        var wroteAny = false
-
-        // Hold last real frame for skipped slots
+        // Hold last real frame for skipped slots to maintain strict CFR duration
         if let hold = lastPixelBuffer {
-            while frameCount < targetCount - 1 {
+            let maxHold = min(targetCount - 1, frameCount + 10)
+            while frameCount < maxHold {
                 guard input.isReadyForMoreMediaData else {
                     droppedFrames += 1
                     break
                 }
                 if writeCFR(hold, index: frameCount, adaptor: adaptor) {
                     frameCount += 1
-                    wroteAny = true
                 } else {
                     droppedFrames += 1
                     break
@@ -188,21 +214,25 @@ final class VideoWriter {
             }
         }
 
+        // Drain any pending audio buffers now that video input might have made room
+        drainPendingAudioBuffersLocked()
+
         // Current real frame
         guard input.isReadyForMoreMediaData else {
             lastPixelBuffer = pixelBuffer
             droppedFrames += 1
-            return wroteAny
+            return false
         }
+
         if writeCFR(pixelBuffer, index: frameCount, adaptor: adaptor) {
             frameCount += 1
             realFrameCount += 1
             lastPixelBuffer = pixelBuffer
             return true
+        } else {
+            droppedFrames += 1
+            return false
         }
-        droppedFrames += 1
-        lastPixelBuffer = pixelBuffer
-        return wroteAny
     }
 
     private func writeCFR(
@@ -225,11 +255,13 @@ final class VideoWriter {
               hasStartedSession else {
             return false
         }
-        guard input.isReadyForMoreMediaData else { return false }
         guard CMSampleBufferDataIsReady(sampleBuffer) else { return false }
 
+        // Drain previously queued audio buffers first if input is ready
+        drainPendingAudioBuffersLocked()
+
         var timingCount: CMItemCount = 0
-        CMSampleBufferGetOutputSampleTimingInfoArray(sampleBuffer, entryCount: 0, arrayToFill: nil, entriesNeededOut: &timingCount)
+        CMSampleBufferGetSampleTimingInfoArray(sampleBuffer, entryCount: 0, arrayToFill: nil, entriesNeededOut: &timingCount)
         guard timingCount > 0 else { return false }
 
         var timings = Array(repeating: CMSampleTimingInfo(
@@ -237,7 +269,7 @@ final class VideoWriter {
             presentationTimeStamp: .invalid,
             decodeTimeStamp: .invalid
         ), count: timingCount)
-        CMSampleBufferGetOutputSampleTimingInfoArray(sampleBuffer, entryCount: timingCount, arrayToFill: &timings, entriesNeededOut: &timingCount)
+        CMSampleBufferGetSampleTimingInfoArray(sampleBuffer, entryCount: timingCount, arrayToFill: &timings, entriesNeededOut: &timingCount)
 
         // Use the first audio sample's PTS as reference to keep all retiming
         // in the audio clock domain (not host time / CACurrentMediaTime).
@@ -246,11 +278,15 @@ final class VideoWriter {
         if CMTimeCompare(audioReferenceTime, .invalid) == 0 {
             audioReferenceTime = firstPTS
         }
-        
+
         for i in 0..<timings.count {
-            timings[i].presentationTimeStamp = CMTimeSubtract(timings[i].presentationTimeStamp, audioReferenceTime)
+            var pts = CMTimeSubtract(timings[i].presentationTimeStamp, audioReferenceTime)
+            if CMTimeCompare(pts, .zero) < 0 {
+                pts = .zero
+            }
+            timings[i].presentationTimeStamp = pts
             if timings[i].decodeTimeStamp.isValid {
-                timings[i].decodeTimeStamp = timings[i].presentationTimeStamp
+                timings[i].decodeTimeStamp = pts
             }
         }
 
@@ -263,10 +299,24 @@ final class VideoWriter {
             sampleBufferOut: &retimed
         )
         guard status == noErr, let retimed else { return false }
-        return input.append(retimed)
+
+        if input.isReadyForMoreMediaData && pendingAudioBuffers.isEmpty {
+            return input.append(retimed)
+        } else {
+            // Buffer temporarily during video encode backpressure to avoid sample gaps/static
+            if pendingAudioBuffers.count < maxPendingAudioBuffers {
+                pendingAudioBuffers.append(retimed)
+                return true
+            } else {
+                // Buffer capacity reached (long stall): drop oldest to maintain real-time queue
+                pendingAudioBuffers.removeFirst()
+                pendingAudioBuffers.append(retimed)
+                return false
+            }
+        }
     }
 
-    func finish(completion: @escaping (URL?) -> Void) {
+    func finish(completion: @Sendable @escaping (URL?) -> Void) {
         lock.lock()
         guard isRecording else {
             lock.unlock()
@@ -274,11 +324,30 @@ final class VideoWriter {
             return
         }
 
-        // Skip padToWallClockLocked: synchronous hold-frame padding blocked stopRecording().
-        // Real frames are already written; extra padding is not needed for playback or Photos compatibility.
+        // Bounded pad to wall clock: pad at most 4 hold frames to match audio duration cleanly
+        if let hold = lastPixelBuffer,
+           let adaptor = pixelBufferAdaptor,
+           let vIn = videoInput {
+            let elapsed = max(0, CACurrentMediaTime() - startHostTime)
+            let targetCount = min(Int64((elapsed * targetFPS).rounded()), frameCount + 4)
+            while frameCount < targetCount && vIn.isReadyForMoreMediaData {
+                if writeCFR(hold, index: frameCount, adaptor: adaptor) {
+                    frameCount += 1
+                } else {
+                    break
+                }
+            }
+        }
+
+        // Drain any remaining buffered audio
+        drainPendingAudioBuffersLocked()
+        pendingAudioBuffers.removeAll()
 
         let url = assetWriter?.outputURL
         isRecording = false
+        audioReferenceTime = .invalid
+        hasStartedSession = false
+        lastPixelBuffer = nil
         let writer = assetWriter
         let vIn = videoInput
         let aIn = audioInput
@@ -290,12 +359,22 @@ final class VideoWriter {
 
         vIn?.markAsFinished()
         aIn?.markAsFinished()
-        writer?.finishWriting {
+
+        // `writer` (AVAssetWriter) is non-Sendable; box it so the @Sendable
+        // finishWriting callback can capture it. If there is no writer there is
+        // nothing to finalize — report failure instead of silently never
+        // invoking completion (which would hang the caller).
+        guard let writer else {
+            completion(nil)
+            return
+        }
+        let boxedWriter = SendableAssetWriter(writer)
+        writer.finishWriting {
+            let status = boxedWriter.value.status
             let duration = Double(total) / fps
-            let status = writer?.status
             print("[VideoWriter] Done. timeline=\(total) real=\(real) holds=\(total - real) drops=\(drops) \(String(format: "%.2f", duration))s @ \(Int(fps))fps status=\(String(describing: status))")
             if status == .failed {
-                print("[VideoWriter] Error: \(String(describing: writer?.error))")
+                print("[VideoWriter] Error: \(String(describing: boxedWriter.value.error))")
                 completion(nil)
             } else {
                 completion(url)

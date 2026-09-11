@@ -1,6 +1,6 @@
 import SwiftUI
 
-/// Rule-of-thirds grid + spirit-level horizon, framed to video aspect (not full screen).
+/// Rule-of-thirds grid + precision spirit-level horizon, framed to video aspect ratio.
 struct GridLevelOverlay: View {
     var showGrid: Bool
     var showLevel: Bool
@@ -27,7 +27,7 @@ struct GridLevelOverlay: View {
         .allowsHitTesting(false)
     }
 
-    /// Same aspect-fit math as CameraPreviewView Metal letterbox.
+    /// Aspect-fit math matching viewfinder framing.
     private func videoFrame(in size: CGSize, aspect: CGFloat) -> CGRect {
         guard size.width > 0, size.height > 0, aspect > 0 else {
             return CGRect(origin: .zero, size: size)
@@ -45,42 +45,63 @@ struct GridLevelOverlay: View {
     private func grid(in frame: CGRect) -> some View {
         let w = frame.width
         let h = frame.height
-        return Path { path in
-            path.move(to: CGPoint(x: w / 3, y: 0))
-            path.addLine(to: CGPoint(x: w / 3, y: h))
-            path.move(to: CGPoint(x: 2 * w / 3, y: 0))
-            path.addLine(to: CGPoint(x: 2 * w / 3, y: h))
-            path.move(to: CGPoint(x: 0, y: h / 3))
-            path.addLine(to: CGPoint(x: w, y: h / 3))
-            path.move(to: CGPoint(x: 0, y: 2 * h / 3))
-            path.addLine(to: CGPoint(x: w, y: 2 * h / 3))
+        let crossSize: CGFloat = 8
+
+        return ZStack {
+            // Rule of thirds lines
+            Path { path in
+                // Vertical lines
+                path.move(to: CGPoint(x: w / 3, y: 0))
+                path.addLine(to: CGPoint(x: w / 3, y: h))
+                path.move(to: CGPoint(x: 2 * w / 3, y: 0))
+                path.addLine(to: CGPoint(x: 2 * w / 3, y: h))
+
+                // Horizontal lines
+                path.move(to: CGPoint(x: 0, y: h / 3))
+                path.addLine(to: CGPoint(x: w, y: h / 3))
+                path.move(to: CGPoint(x: 0, y: 2 * h / 3))
+                path.addLine(to: CGPoint(x: w, y: 2 * h / 3))
+            }
+            .stroke(Color.white.opacity(0.25), lineWidth: 0.5)
+
+            // Center target crosshair
+            Path { path in
+                path.move(to: CGPoint(x: w / 2 - crossSize, y: h / 2))
+                path.addLine(to: CGPoint(x: w / 2 + crossSize, y: h / 2))
+                path.move(to: CGPoint(x: w / 2, y: h / 2 - crossSize))
+                path.addLine(to: CGPoint(x: w / 2, y: h / 2 + crossSize))
+            }
+            .stroke(Color.white.opacity(0.45), lineWidth: 0.75)
         }
-        .stroke(Color.white.opacity(0.4), lineWidth: 0.8)
     }
 
     private func level(in frame: CGRect) -> some View {
-        // Invert: physical tilt left → line tilts opposite (spirit-level feel)
         let tilt = -levelMonitor.tiltDegrees
         let isLevel = levelMonitor.isLevel
         let clamped = max(-45, min(45, tilt))
+        let levelColor = isLevel ? Color.white : Color.white.opacity(0.50)
+
         return ZStack {
+            // Artificial horizon line
             Rectangle()
-                .fill(isLevel ? Color.green.opacity(0.85) : Color.yellow.opacity(0.75))
-                .frame(width: min(frame.width * 0.55, 280), height: 2)
+                .fill(levelColor.opacity(isLevel ? 0.9 : 0.5))
+                .frame(width: min(frame.width * 0.45, 240), height: 1)
                 .rotationEffect(.degrees(clamped))
 
+            // Center spirit reticle
             Circle()
-                .strokeBorder(isLevel ? Color.green : Color.white.opacity(0.7), lineWidth: 1.5)
+                .strokeBorder(isLevel ? Color.white : Color.white.opacity(0.5), lineWidth: 1)
                 .frame(width: 10, height: 10)
 
+            // Tilt degree readout pill
             Text(String(format: "%+.1f°", tilt))
-                .font(.system(size: 11, weight: .semibold, design: .monospaced))
-                .foregroundColor(isLevel ? .green : .white.opacity(0.85))
-                .padding(.horizontal, 8)
+                .font(.geistMono(.medium, size: 9))
+                .foregroundColor(levelColor)
+                .padding(.horizontal, 7)
                 .padding(.vertical, 3)
-                .background(Color.black.opacity(0.45))
-                .clipShape(Capsule())
-                .offset(y: 28)
+                .background(OwLensTheme.glassBaseHeavy)
+                .glassPill(customBorder: levelColor.opacity(0.25))
+                .offset(y: 24)
         }
     }
 }

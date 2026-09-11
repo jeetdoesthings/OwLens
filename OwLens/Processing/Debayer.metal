@@ -109,6 +109,31 @@ static inline float3 encodeLogCurve(float3 rgb, int curveType) {
         return saturate(rgb);
     }
 
+    if (curveType == 3) {
+        // Apple Log 2 published OETF (Apple Log Profile White Paper)
+        // Transfer function on scene-linear reflectance (18% mid grey ≈ 0.18)
+        constexpr float r0 = -0.05641088f;
+        constexpr float rt = 0.01f;
+        constexpr float c  = 47.28711236f;
+        constexpr float beta  = 0.00964052f;
+        constexpr float gamma = 0.08550479f;
+        constexpr float delta = 0.69336945f;
+
+        float3 result;
+        for (int i = 0; i < 3; i++) {
+            float r = rgb[i];
+            if (r < r0) {
+                result[i] = 0.0f;
+            } else if (r < rt) {
+                float diff = r - r0;
+                result[i] = c * diff * diff;
+            } else {
+                result[i] = gamma * metal::log2(r + beta) + delta;
+            }
+        }
+        return saturate(result);
+    }
+
     // Sony S-Log3 published OETF on scene-linear (18% mid grey ≈ 0.18)
     // Output code values roughly 0–1 (10-bit /1023).
     float3 result;
@@ -175,6 +200,7 @@ kernel void debayerWBLinear(
     texture2d<float, access::write> outTexture [[texture(1)]],
     constant FusedParams &params   [[buffer(0)]],
     constant LSCParams &lsc       [[buffer(1)]],
+    constant float3x3 &colorMatrix [[buffer(2)]],
     uint2 gid [[thread_position_in_grid]])
 {
     if (gid.x >= outTexture.get_width() || gid.y >= outTexture.get_height()) return;
@@ -250,12 +276,185 @@ kernel void debayerWBLinear(
     rgb *= params.wbGains;
     rgb = max(rgb, float3(0.0));
 
+    // ── Color Correction Matrix (Sensor Native → Target Gamut e.g. BT.2020) ──
+    rgb = colorMatrix * rgb;
+    rgb = max(rgb, float3(0.0));
+
     // Clipping flag on raw demosaiced values (sensor saturation)
     bool isClipped = (r >= 0.99 || g >= 0.99 || b >= 0.99);
     float alpha = isClipped ? 0.0 : 1.0;
 
     // Output scene-linear RGB (NO log curve)
     outTexture.write(float4(rgb, alpha), gid);
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// FUSED: demosaic + LSC + WB + CCM + Log OETF in ONE kernel.
+// Used for 4K recording, OpenGate fast path, and live viewfinder preview
+// when spatial/chroma denoise is bypassed. Eliminates 1 full GPU pass
+// and ~196 MB/frame of intermediate memory traffic.
+// ──────────────────────────────────────────────────────────────────────
+kernel void debayerFusedLog(
+    texture2d<float, access::read>  rawTexture [[texture(0)]],
+    texture2d<float, access::write> outTexture [[texture(1)]],
+    constant FusedParams &params   [[buffer(0)]],
+    constant LSCParams &lsc       [[buffer(1)]],
+    constant float3x3 &colorMatrix [[buffer(2)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    if (gid.x >= outTexture.get_width() || gid.y >= outTexture.get_height()) return;
+
+    int x = int(gid.x);
+    int y = int(gid.y);
+
+    bool xEven = (x % 2 == 0);
+    bool yEven = (y % 2 == 0);
+
+    int pattern = params.bayerPattern;
+    if (pattern == 1) { xEven = !xEven; }
+    else if (pattern == 2) { yEven = !yEven; }
+    else if (pattern == 3) { xEven = !xEven; yEven = !yEven; }
+
+    float black = params.blackLevel;
+    float white = params.whiteLevel;
+
+    // ── Directional Demosaic (Malvar-He-Cutler) ──
+    float c00 = sampleBayerClamp(rawTexture, x, y, 0, 0, black, white);
+    float cN1 = sampleBayerClamp(rawTexture, x, y, 0, -1, black, white);
+    float cS1 = sampleBayerClamp(rawTexture, x, y, 0, 1, black, white);
+    float cE1 = sampleBayerClamp(rawTexture, x, y, 1, 0, black, white);
+    float cW1 = sampleBayerClamp(rawTexture, x, y, -1, 0, black, white);
+    
+    float cN2 = sampleBayerClamp(rawTexture, x, y, 0, -2, black, white);
+    float cS2 = sampleBayerClamp(rawTexture, x, y, 0, 2, black, white);
+    float cE2 = sampleBayerClamp(rawTexture, x, y, 2, 0, black, white);
+    float cW2 = sampleBayerClamp(rawTexture, x, y, -2, 0, black, white);
+    
+    float cNE = sampleBayerClamp(rawTexture, x, y, 1, -1, black, white);
+    float cNW = sampleBayerClamp(rawTexture, x, y, -1, -1, black, white);
+    float cSE = sampleBayerClamp(rawTexture, x, y, 1, 1, black, white);
+    float cSW = sampleBayerClamp(rawTexture, x, y, -1, 1, black, white);
+
+    float G_at_RB = (2*(cN1 + cS1 + cE1 + cW1) + 4*c00 - (cN2 + cS2 + cE2 + cW2)) / 8.0;
+    float Color_at_G_H = (4*(cE1 + cW1) + 5*c00 - (cE2 + cW2) - 0.5*(cN2 + cS2) - (cNE + cNW + cSE + cSW)) / 8.0;
+    float Color_at_G_V = (4*(cN1 + cS1) + 5*c00 - (cN2 + cS2) - 0.5*(cE2 + cW2) - (cNE + cNW + cSE + cSW)) / 8.0;
+    float Color_at_Diag = (2*(cNE + cNW + cSE + cSW) + 6*c00 - 1.5*(cN2 + cS2 + cE2 + cW2)) / 8.0;
+
+    float r, g, b;
+    if (yEven && xEven) {
+        r = c00; g = G_at_RB; b = Color_at_Diag;
+    } else if (yEven && !xEven) {
+        r = Color_at_G_H; g = c00; b = Color_at_G_V;
+    } else if (!yEven && xEven) {
+        b = Color_at_G_H; g = c00; r = Color_at_G_V;
+    } else {
+        b = c00; g = G_at_RB; r = Color_at_Diag;
+    }
+    r = max(r, 0.0);
+    g = max(g, 0.0);
+    b = max(b, 0.0);
+
+    // Gr/Gb green balance before LSC/WB.
+    g *= params.greenBalance;
+
+    // Per-channel Lens Shading Correction (LSC): 4-term radial + azimuth model.
+    float outW = float(outTexture.get_width());
+    float outH = float(outTexture.get_height());
+    float2 uv = (float2(float(x) + 0.5, float(y) + 0.5) / float2(outW, outH)) - 0.5;
+    float r2 = dot(uv, uv);
+    float r4 = r2 * r2;
+    float theta = atan2(uv.y, uv.x);
+
+    float gainR = 1.0 + lsc.radialR * r2 + lsc.radial4R * r4 + lsc.azimuthR * cos(2.0 * theta);
+    float gainG = 1.0 + lsc.radialG * r2 + lsc.radial4G * r4 + lsc.azimuthG * cos(2.0 * theta);
+    float gainB = 1.0 + lsc.radialB * r2 + lsc.radial4B * r4 + lsc.azimuthB * cos(2.0 * theta);
+    float3 rgb = float3(r * gainR, g * gainG, b * gainB);
+    rgb = min(rgb, float3(8.0));
+
+    // ── White Balance ──
+    rgb *= params.wbGains;
+    rgb = max(rgb, float3(0.0));
+
+    // ── Color Correction Matrix (Sensor Native → Target Gamut e.g. BT.2020) ──
+    rgb = colorMatrix * rgb;
+    rgb = max(rgb, float3(0.0));
+
+    // Clipping flag on raw demosaiced values (sensor saturation)
+    bool isClipped = (r >= 0.99 || g >= 0.99 || b >= 0.99);
+    float alpha = isClipped ? 0.0 : 1.0;
+
+    // ── Direct Log OETF Encoding ──
+    float3 logRGB = encodeLogCurve(rgb, params.curveType);
+
+    outTexture.write(float4(logRGB, alpha), gid);
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// ULTRA-FAST 1-TAP FORMAT CONVERSION: rgba16Float -> bgra8Unorm.
+// 1 vectorized load + 1 vectorized store per pixel (<1ms at 4K).
+// Used instead of expensive multi-tap Lanczos sinc filtering when
+// resolution already matches target framing.
+// ──────────────────────────────────────────────────────────────────────
+kernel void convertRgba16FloatToBgra8(
+    texture2d<float, access::read>  src [[texture(0)]],
+    texture2d<float, access::write> dst [[texture(1)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    if (gid.x >= dst.get_width() || gid.y >= dst.get_height()) return;
+    dst.write(src.read(gid), gid);
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// ADAPTIVE UNSHARP MASK: enhances fine edge details without boosting noise.
+// ──────────────────────────────────────────────────────────────────────
+kernel void unsharpMaskAdaptive(
+    texture2d<float, access::read>  inTexture [[texture(0)]],
+    texture2d<float, access::write> outTexture [[texture(1)]],
+    constant float &strength [[buffer(0)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    if (gid.x >= outTexture.get_width() || gid.y >= outTexture.get_height()) return;
+
+    float4 center = inTexture.read(gid);
+    if (strength <= 0.001f) {
+        outTexture.write(center, gid);
+        return;
+    }
+
+    int x = int(gid.x);
+    int y = int(gid.y);
+    int w = inTexture.get_width();
+    int h = inTexture.get_height();
+
+    int ym1 = max(0, y - 1);
+    int yp1 = min(h - 1, y + 1);
+    int xm1 = max(0, x - 1);
+    int xp1 = min(w - 1, x + 1);
+
+    // 3x3 Gaussian blur approximation
+    float3 blur = (
+        inTexture.read(uint2(xm1, ym1)).rgb * 1.0f +
+        inTexture.read(uint2(x,   ym1)).rgb * 2.0f +
+        inTexture.read(uint2(xp1, ym1)).rgb * 1.0f +
+        inTexture.read(uint2(xm1, y)).rgb   * 2.0f +
+        center.rgb                          * 4.0f +
+        inTexture.read(uint2(xp1, y)).rgb   * 2.0f +
+        inTexture.read(uint2(xm1, yp1)).rgb * 1.0f +
+        inTexture.read(uint2(x,   yp1)).rgb * 2.0f +
+        inTexture.read(uint2(xp1, yp1)).rgb * 1.0f
+    ) * (1.0f / 16.0f);
+
+    float3 highPass = center.rgb - blur;
+    float detailLuma = abs(dot(highPass, float3(0.2126f, 0.7152f, 0.0722f)));
+
+    // Adaptive coring: only sharpen true edge detail, not low-amplitude shadow noise
+    float coringThreshold = 0.006f;
+    float coringFactor = smoothstep(0.001f, coringThreshold, detailLuma);
+
+    float3 sharpened = center.rgb + highPass * (strength * coringFactor);
+    sharpened = max(sharpened, float3(0.0f));
+
+    outTexture.write(float4(sharpened, center.a), gid);
 }
 
 
@@ -707,8 +906,14 @@ kernel void temporalDenoiseRing(
         float chromaMotion = saturate(chromaDiff / chromaThreshold);
         float motion = max(lumaMotion, chromaMotion);
 
-        // i=0 newest gets λ^0 = 1; older slots decay.
-        float recency = pow(params.lambda, float(i));
+        // i=0 newest gets λ^0 = 1; older slots decay (lambda^i).
+        // slotCount == 3 (validSlots <= 3), so i ∈ {0,1,2}: compute powers
+        // directly instead of pow() — GPU pow() expands to a costly
+        // fexp(flog(x)*y) per thread. This is numerically identical.
+        float recency;
+        if (i == 1) { recency = params.lambda; }
+        else if (i == 2) { recency = params.lambda * params.lambda; }
+        else { recency = 1.0f; }
         float slotWeight = params.maxBlend * (1.0 - motion) * recency;
         // Soft motion gate: smooth taper replaces hard binary cutoff to eliminate
         // ghosting from threshold-edge content. At motion=0.15 the gate starts

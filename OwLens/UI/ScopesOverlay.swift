@@ -4,22 +4,17 @@ struct ScopesOverlay: View {
     let data: ScopeData
 
     var body: some View {
-        VStack(spacing: 8) {
-            scopeBlock(title: "RGB", height: 26) {
+        VStack(spacing: 5) {
+            scopeBlock(title: "RGB HISTOGRAM", height: 30) {
                 histogramCanvas
             }
-            scopeBlock(title: "WFM", height: 36) {
+            scopeBlock(title: "LUMA WAVEFORM", height: 40) {
                 waveformCanvas
             }
         }
-        .frame(width: 110)
-        .padding(4)
-        .background(Color.black.opacity(0.5))
-        .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: 6, style: .continuous)
-                .strokeBorder(Color.white.opacity(0.12), lineWidth: 1)
-        )
+        .frame(width: 120)
+        .padding(5)
+        .glassPanel(cornerRadius: OwLensTheme.radiusSm, border: OwLensTheme.glassBorderActive, background: OwLensTheme.glassBaseHeavy)
     }
 
     private func scopeBlock<Content: View>(
@@ -27,28 +22,35 @@ struct ScopesOverlay: View {
         height: CGFloat,
         @ViewBuilder content: () -> Content
     ) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
+        VStack(alignment: .leading, spacing: 3) {
             Text(title)
-                .font(.system(size: 7, weight: .bold, design: .monospaced))
-                .foregroundColor(.white.opacity(0.5))
+                .font(.geistMono(.medium, size: 7))
+                .foregroundColor(OwLensTheme.textMuted)
+                .tracking(0.5)
+
             content()
                 .frame(height: height)
-                .background(Color.black.opacity(0.3))
-                .clipShape(RoundedRectangle(cornerRadius: 3, style: .continuous))
+                .background(Color.black.opacity(0.5))
+                .clipShape(RoundedRectangle(cornerRadius: 4, style: .continuous))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 4, style: .continuous)
+                        .strokeBorder(Color.white.opacity(0.06), lineWidth: 0.5)
+                )
         }
     }
 
+    // Monochromatic histogram — all channels rendered as white at different opacities
     private var histogramCanvas: some View {
         Canvas { context, size in
-            drawHistogram(data.histogramRed, color: .red, context: &context, size: size)
-            drawHistogram(data.histogramGreen, color: .green, context: &context, size: size)
-            drawHistogram(data.histogramBlue, color: .blue, context: &context, size: size)
+            drawHistogram(data.histogramRed, opacity: 0.35, context: &context, size: size)
+            drawHistogram(data.histogramGreen, opacity: 0.50, context: &context, size: size)
+            drawHistogram(data.histogramBlue, opacity: 0.25, context: &context, size: size)
         }
     }
 
     private func drawHistogram(
         _ values: [Float],
-        color: Color,
+        opacity: Double,
         context: inout GraphicsContext,
         size: CGSize
     ) {
@@ -63,7 +65,7 @@ struct ScopesOverlay: View {
                 width: max(1, step - 0.5),
                 height: height
             )
-            context.fill(Path(rect), with: .color(color.opacity(0.42)))
+            context.fill(Path(rect), with: .color(Color.white.opacity(opacity)))
         }
     }
 
@@ -79,23 +81,24 @@ struct ScopesOverlay: View {
                 for col in 0..<columns {
                     let value = data.waveform[row * columns + col]
                     guard value > 0.015 else { continue }
-                    let alpha = min(0.82, 0.1 + Double(value) * 0.85)
+                    let alpha = min(0.80, 0.10 + Double(value) * 0.85)
                     let rect = CGRect(
                         x: CGFloat(col) * cellW,
                         y: CGFloat(row) * cellH,
                         width: max(1, cellW),
                         height: max(1, cellH)
                     )
-                    context.fill(Path(rect), with: .color(.green.opacity(alpha)))
+                    context.fill(Path(rect), with: .color(Color.white.opacity(alpha)))
                 }
             }
 
+            // Reference graticules
             for guide in [0.25, 0.5, 0.75] {
                 var path = Path()
                 let y = size.height * guide
                 path.move(to: CGPoint(x: 0, y: y))
                 path.addLine(to: CGPoint(x: size.width, y: y))
-                context.stroke(path, with: .color(.white.opacity(0.08)), lineWidth: 1)
+                context.stroke(path, with: .color(Color.white.opacity(0.08)), lineWidth: 0.5)
             }
         }
     }

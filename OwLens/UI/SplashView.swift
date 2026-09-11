@@ -1,31 +1,38 @@
 import SwiftUI
 
-/// Black launch / loading splash — Helvetica “OwLens” while camera initializes.
+/// Launch & setup splash screen — pure monochromatic, Geist typography.
 struct SplashView: View {
     var body: some View {
         ZStack {
             Color.black.ignoresSafeArea()
-            Text("OwLens")
-                .font(.custom("Geist-SemiBold", size: 42))
-                .fontWeight(.regular)
-                .foregroundColor(.white)
-                .tracking(2)
+
+            VStack(spacing: 6) {
+                Text("OwLens")
+                    .font(.geist(.bold, size: 44))
+                    .foregroundColor(.white)
+                    .tracking(2.5)
+
+                Text("RAW LOG CINEMA CAMERA")
+                    .font(.geistMono(.regular, size: 10))
+                    .foregroundColor(OwLensTheme.textMuted)
+                    .tracking(3)
+            }
 
             VStack {
                 Spacer()
-                HStack(spacing: 8) {
+                HStack(spacing: 6) {
                     Image("github_logo")
                         .resizable()
                         .renderingMode(.template)
                         .aspectRatio(contentMode: .fit)
-                        .frame(width: 16, height: 16)
-                        .foregroundColor(.white.opacity(0.4))
+                        .frame(width: 14, height: 14)
+                        .foregroundColor(OwLensTheme.textMuted)
                     Text("jeetdoesthings")
-                        .font(.custom("Geist-Regular", size: 14))
-                        .foregroundColor(.white.opacity(0.4))
-                        .tracking(1)
+                        .font(.geist(.regular, size: 13))
+                        .foregroundColor(OwLensTheme.textMuted)
+                        .tracking(0.5)
                 }
-                .padding(.bottom, 40)
+                .padding(.bottom, 36)
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)

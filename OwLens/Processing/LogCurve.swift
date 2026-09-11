@@ -7,6 +7,7 @@ import simd
 enum LogCurveType: Int, CaseIterable, Identifiable {
     case linear = 0
     case sLog3Approx = 2
+    case appleLog2 = 3
 
     var id: Int { rawValue }
 
@@ -14,11 +15,20 @@ enum LogCurveType: Int, CaseIterable, Identifiable {
         switch self {
         case .linear: return "Linear"
         case .sLog3Approx: return "S-Log3"
+        case .appleLog2: return "Apple Log 2"
+        }
+    }
+
+    var fileLabel: String {
+        switch self {
+        case .linear: return "Linear"
+        case .sLog3Approx: return "SLog3"
+        case .appleLog2: return "AppleLog2"
         }
     }
 
     /// The curves exposed in the UI (hide linear unless debugging).
-    static var uiCases: [LogCurveType] { [.sLog3Approx] }
+    static var uiCases: [LogCurveType] { [.sLog3Approx, .appleLog2] }
 }
 
 /// CPU-side log curve math — used for LUT generation and validation.
@@ -43,12 +53,53 @@ enum LogCurve {
         }
     }
 
+    /// Apple Log 2 published transfer function (Apple Log Profile White Paper).
+    /// Takes scene-linear reflectance R directly (0.18 = 18% gray reference).
+    static func appleLog2Encode(_ linear: Float) -> Float {
+        let r0: Float = -0.05641088
+        let rt: Float = 0.01
+        let c: Float = 47.28711236
+        let beta: Float = 0.00964052
+        let gamma: Float = 0.08550479
+        let delta: Float = 0.69336945
+
+        if linear < r0 {
+            return 0.0
+        } else if linear < rt {
+            let diff = linear - r0
+            return c * diff * diff
+        } else {
+            return gamma * log2(linear + beta) + delta
+        }
+    }
+
+    /// Inverse Apple Log 2 — decodes encoded pixel value P back to scene reflectance R.
+    static func appleLog2Decode(_ encoded: Float) -> Float {
+        let r0: Float = -0.05641088
+        let rt: Float = 0.01
+        let c: Float = 47.28711236
+        let beta: Float = 0.00964052
+        let gamma: Float = 0.08550479
+        let delta: Float = 0.69336945
+        let pt: Float = c * (rt - r0) * (rt - r0)
+
+        if encoded < 0.0 {
+            return r0
+        } else if encoded < pt {
+            return sqrt(encoded / c) + r0
+        } else {
+            return pow(2.0, (encoded - delta) / gamma) - beta
+        }
+    }
+
     static func apply(_ rgb: SIMD3<Float>, type: LogCurveType) -> SIMD3<Float> {
         switch type {
         case .linear:
             return simd_clamp(rgb, SIMD3(0,0,0), SIMD3(1,1,1))
         case .sLog3Approx:
             return SIMD3(sLog3Approx(rgb.x), sLog3Approx(rgb.y), sLog3Approx(rgb.z))
+        case .appleLog2:
+            return SIMD3(appleLog2Encode(rgb.x), appleLog2Encode(rgb.y), appleLog2Encode(rgb.z))
         }
     }
 
@@ -58,6 +109,8 @@ enum LogCurve {
             return simd_clamp(rgb, SIMD3(0,0,0), SIMD3(1,1,1))
         case .sLog3Approx:
             return SIMD3(inverseSLog3Approx(rgb.x), inverseSLog3Approx(rgb.y), inverseSLog3Approx(rgb.z))
+        case .appleLog2:
+            return SIMD3(appleLog2Decode(rgb.x), appleLog2Decode(rgb.y), appleLog2Decode(rgb.z))
         }
     }
 }
