@@ -3,20 +3,29 @@ import UIKit
 
 // MARK: - Typography
 
-enum GeistWeight: String {
-    case regular = "Geist-Regular"
-    case medium = "Geist-Medium"
-    case semiBold = "Geist-SemiBold"
-    case bold = "Geist-Bold"
+enum GeistWeight {
+    case regular
+    case medium
+    case semiBold
+    case bold
+
+    var systemWeight: Font.Weight {
+        switch self {
+        case .regular:  return .regular
+        case .medium:   return .medium
+        case .semiBold: return .semibold
+        case .bold:     return .bold
+        }
+    }
 }
 
 extension Font {
     static func geist(_ weight: GeistWeight = .regular, size: CGFloat) -> Font {
-        .custom(weight.rawValue, size: size)
+        .system(size: size, weight: weight.systemWeight)
     }
 
     static func geistMono(_ weight: GeistWeight = .regular, size: CGFloat) -> Font {
-        .custom(weight.rawValue, size: size).monospacedDigit()
+        .system(size: size, weight: weight.systemWeight, design: .monospaced).monospacedDigit()
     }
 }
 
