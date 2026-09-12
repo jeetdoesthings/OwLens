@@ -19,8 +19,6 @@ struct RootView: View {
     @State private var focusReticleOpacity: Double = 0
     @State private var focusReticleScale: CGFloat = 1.3
     @State private var touchDownDate: Date? = nil
-    @State private var scopesOffset: CGSize = .zero
-    @State private var scopesDragTranslation: CGSize = .zero
 
     var body: some View {
         ZStack {
@@ -76,28 +74,7 @@ struct RootView: View {
                                 .transition(.opacity)
                         }
 
-                        // Scopes Overlay (RGB Histogram & Luma Waveform)
-                        if viewModel.showScopes {
-                            ScopesOverlay(data: viewModel.scopeData)
-                                .offset(x: scopesOffset.width + scopesDragTranslation.width,
-                                        y: scopesOffset.height + scopesDragTranslation.height)
-                                .gesture(
-                                    DragGesture()
-                                        .onChanged { value in
-                                            scopesDragTranslation = value.translation
-                                        }
-                                        .onEnded { value in
-                                            scopesOffset.width += value.translation.width
-                                            scopesOffset.height += value.translation.height
-                                            scopesDragTranslation = .zero
-                                        }
-                                )
-                                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-                                .padding(.leading, 72)
-                                .padding(.top, 48)
-                                .zIndex(3)
-                                .transition(.opacity)
-                        }
+
 
                         // Pro-Cinema Tap-to-Focus Reticle
                         if let focusPt = tapFocusPoint {
@@ -168,7 +145,7 @@ struct RootView: View {
                     .foregroundColor(OwLensTheme.textPrimary)
                     .padding(.vertical, 8)
                     .padding(.horizontal, 16)
-                    .glassPanel(cornerRadius: OwLensTheme.radiusPill, border: OwLensTheme.glassBorderActive, background: OwLensTheme.glassBaseHeavy)
+                    .glassPanel(cornerRadius: OwLensTheme.radiusCard, border: OwLensTheme.glassBorderActive, background: OwLensTheme.glassBaseHeavy)
                     .padding(.bottom, 80)
                 }
                 .transition(.move(edge: .bottom).combined(with: .opacity))

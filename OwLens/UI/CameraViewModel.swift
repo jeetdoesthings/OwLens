@@ -88,7 +88,7 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
     @Published var showGrid = false
     @Published var showClipping = false
     @Published var showFocusPeaking = false
-    @Published var showScopes = false
+    @Published var showScopes = true
     @Published var scopeData: ScopeData = .empty
     @Published var previewDisplayMode: PreviewDisplayMode = .log
     /// Optional viewfinder display transform; defaults to false so log preview remains untouched.
@@ -281,7 +281,7 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
     nonisolated(unsafe) private var activeEncodeHeight = 1440
     nonisolated(unsafe) private var activeFPS: Double = 24
 nonisolated(unsafe) private var isRecordingUnsafe = false
-    nonisolated(unsafe) private var showScopesUnsafe = false
+    nonisolated(unsafe) private var showScopesUnsafe = true
     nonisolated(unsafe) private var lastScopeUpdateTime: CFTimeInterval = 0
     nonisolated(unsafe) var isAppActive = true
     /// Measured LSC override from device calibration (set once at setup).

@@ -71,31 +71,7 @@ struct ControlsView: View {
                 }
                 .padding(.horizontal, 10)
                 .frame(height: 30)
-                .glassPanel(cornerRadius: OwLensTheme.radiusPill, border: OwLensTheme.glassBorderRed, background: OwLensTheme.glassBaseHeavy)
-            } else {
-                Button {
-                    Haptics.impact(.medium)
-                    if viewModel.controlsLocked {
-                        viewModel.unlockControls()
-                    } else {
-                        viewModel.lockControls()
-                    }
-                } label: {
-                    HStack(spacing: 5) {
-                        Image(systemName: viewModel.controlsLocked ? "lock.fill" : "lock.open")
-                            .font(.system(size: 9, weight: .semibold))
-                        Text(viewModel.controlsLocked ? "LOCKED" : "UNLOCK")
-                            .font(.geistMono(.semiBold, size: 9))
-                    }
-                    .foregroundColor(viewModel.controlsLocked ? OwLensTheme.textPrimary : OwLensTheme.textSecondary)
-                    .padding(.horizontal, 10)
-                    .frame(height: 30)
-                    .glassPanel(
-                        cornerRadius: OwLensTheme.radiusPill,
-                        border: viewModel.controlsLocked ? OwLensTheme.glassBorderActive : OwLensTheme.glassBorder
-                    )
-                }
-                .buttonStyle(.plain)
+                .glassPanel(cornerRadius: OwLensTheme.radiusCard, border: OwLensTheme.glassBorderRed, background: OwLensTheme.glassBaseHeavy)
             }
 
             if viewModel.droppedFrames > 0 {
@@ -108,7 +84,7 @@ struct ControlsView: View {
                 .foregroundColor(OwLensTheme.textPrimary)
                 .padding(.horizontal, 8)
                 .frame(height: 30)
-                .glassPanel(cornerRadius: OwLensTheme.radiusPill, border: OwLensTheme.glassBorderActive)
+                .glassPanel(cornerRadius: OwLensTheme.radiusCard, border: OwLensTheme.glassBorderActive)
             }
         }
     }
@@ -136,7 +112,7 @@ struct ControlsView: View {
                 .padding(.horizontal, 10)
                 .frame(height: 30)
                 .glassPanel(
-                    cornerRadius: OwLensTheme.radiusPill,
+                    cornerRadius: OwLensTheme.radiusCard,
                     border: (viewModel.activePanel == .format || viewModel.activePanel == .fps) ? OwLensTheme.glassBorderActive : OwLensTheme.glassBorder,
                     background: (viewModel.activePanel == .format || viewModel.activePanel == .fps) ? OwLensTheme.glassActiveBg : OwLensTheme.glassBase
                 )
@@ -157,7 +133,7 @@ struct ControlsView: View {
                     .padding(.horizontal, 9)
                     .frame(height: 30)
                     .glassPanel(
-                        cornerRadius: OwLensTheme.radiusPill,
+                        cornerRadius: OwLensTheme.radiusCard,
                         border: viewModel.activePanel == .log ? OwLensTheme.glassBorderActive : OwLensTheme.glassBorder,
                         background: viewModel.activePanel == .log ? OwLensTheme.glassActiveBg : OwLensTheme.glassBase
                     )
@@ -184,7 +160,7 @@ struct ControlsView: View {
                         .frame(height: 24)
                         .padding(.horizontal, 4)
                         .background(
-                            Capsule(style: .continuous)
+                            RoundedRectangle(cornerRadius: 6, style: .continuous)
                                 .fill(isSelected ? (isTopLocked ? OwLensTheme.glassBaseHeavy : OwLensTheme.glassActive) : Color.clear)
                         )
                         .contentShape(Rectangle())
@@ -195,7 +171,7 @@ struct ControlsView: View {
         }
         .padding(3)
         .frame(height: 30)
-        .glassPanel(cornerRadius: OwLensTheme.radiusPill)
+        .glassPanel(cornerRadius: OwLensTheme.radiusCard)
         .opacity(isTopLocked ? 0.4 : (viewModel.isSwitchingLens ? 0.5 : 1.0))
         .animation(.easeInOut(duration: 0.15), value: viewModel.isSwitchingLens)
     }
@@ -217,7 +193,7 @@ struct ControlsView: View {
                 .padding(.horizontal, 8)
                 .frame(height: 30)
                 .glassPanel(
-                    cornerRadius: OwLensTheme.radiusPill,
+                    cornerRadius: OwLensTheme.radiusCard,
                     border: viewModel.activePanel == .denoise ? OwLensTheme.glassBorderActive : OwLensTheme.glassBorder,
                     background: viewModel.activePanel == .denoise ? OwLensTheme.glassActiveBg : OwLensTheme.glassBase
                 )
@@ -235,7 +211,7 @@ struct ControlsView: View {
                     .font(.system(size: 10, weight: .medium))
                     .foregroundColor(isTopLocked ? OwLensTheme.textDisabled : OwLensTheme.textSecondary)
                     .frame(width: 30, height: 30)
-                    .glassPanel(cornerRadius: OwLensTheme.radiusPill)
+                    .glassPanel(cornerRadius: OwLensTheme.radiusCard)
             }
             .buttonStyle(.plain)
             .disabled(isTopLocked)
@@ -247,7 +223,7 @@ struct ControlsView: View {
                 .foregroundColor(OwLensTheme.textMuted)
                 .padding(.horizontal, 8)
                 .frame(height: 30)
-                .glassPanel(cornerRadius: OwLensTheme.radiusPill)
+                .glassPanel(cornerRadius: OwLensTheme.radiusCard)
                 .opacity(isTopLocked ? 0.4 : 1.0)
         }
     }
@@ -317,7 +293,7 @@ struct ControlsView: View {
                 .foregroundColor(isActive ? .black : OwLensTheme.textSecondary)
                 .frame(width: 34, height: 34)
                 .background(
-                    RoundedRectangle(cornerRadius: OwLensTheme.radiusSm, style: .continuous)
+                    RoundedRectangle(cornerRadius: OwLensTheme.radiusCard, style: .continuous)
                         .fill(isActive ? OwLensTheme.glassActive : Color.clear)
                 )
                 .contentShape(Rectangle())
@@ -328,7 +304,7 @@ struct ControlsView: View {
     // MARK: - Bottom Exposure Deck
 
     private var bottomExposureDeck: some View {
-        HStack(spacing: 5) {
+        HStack(spacing: 6) {
             // ISO & Shutter Angle
             deckTile(
                 title: "EXPOSURE",
@@ -336,7 +312,7 @@ struct ControlsView: View {
                 subvalue: viewModel.isAutoExposureEnabled ? "AUTO" : "MANUAL",
                 isSelected: viewModel.activePanel == .exposure,
                 isDisabled: exposureControlsDisabled,
-                width: 86
+                width: 92
             ) {
                 viewModel.togglePanel(.exposure)
             }
@@ -348,7 +324,7 @@ struct ControlsView: View {
                 subvalue: viewModel.isAutoWhiteBalanceEnabled ? "AUTO" : "MANUAL",
                 isSelected: viewModel.activePanel == .wb,
                 isDisabled: exposureControlsDisabled,
-                width: 68
+                width: 72
             ) {
                 viewModel.togglePanel(.wb)
             }
@@ -360,21 +336,9 @@ struct ControlsView: View {
                 subvalue: viewModel.isAutoFocus ? "CONT" : String(format: "%.2f", viewModel.focusLensPosition),
                 isSelected: viewModel.activePanel == .focus,
                 isDisabled: exposureControlsDisabled,
-                width: 58
+                width: 64
             ) {
                 viewModel.togglePanel(.focus)
-            }
-
-            // Format & Aspect
-            deckTile(
-                title: "FORMAT",
-                value: "\(viewModel.selectedFormat.shortLabel)·\(viewModel.selectedFPS.label)",
-                subvalue: viewModel.selectedFormat.detailLabel,
-                isSelected: viewModel.activePanel == .format || viewModel.activePanel == .fps,
-                isDisabled: viewModel.isRecording || viewModel.controlsLocked,
-                width: 70
-            ) {
-                viewModel.togglePanel(.format)
             }
 
             // Bitrate
@@ -384,7 +348,7 @@ struct ControlsView: View {
                 subvalue: "HEVC",
                 isSelected: viewModel.activePanel == .bitrate,
                 isDisabled: viewModel.isRecording || viewModel.controlsLocked,
-                width: 58
+                width: 66
             ) {
                 viewModel.togglePanel(.bitrate)
             }
@@ -396,7 +360,7 @@ struct ControlsView: View {
                 subvalue: viewModel.selectedAudioSource.portUID == nil ? "MUTED" : "ACTIVE",
                 isSelected: viewModel.activePanel == .mic,
                 isDisabled: viewModel.isRecording || viewModel.controlsLocked,
-                width: 64
+                width: 68
             ) {
                 viewModel.togglePanel(.mic)
             }
@@ -435,11 +399,11 @@ struct ControlsView: View {
             }
             .frame(width: width, height: 42)
             .background(
-                RoundedRectangle(cornerRadius: OwLensTheme.radiusSm, style: .continuous)
+                RoundedRectangle(cornerRadius: OwLensTheme.radiusCard, style: .continuous)
                     .fill(isSelected ? OwLensTheme.glassActive : (isDisabled ? OwLensTheme.glassBase.opacity(0.3) : OwLensTheme.glassBaseHeavy))
             )
             .overlay(
-                RoundedRectangle(cornerRadius: OwLensTheme.radiusSm, style: .continuous)
+                RoundedRectangle(cornerRadius: OwLensTheme.radiusCard, style: .continuous)
                     .strokeBorder(isSelected ? Color.clear : OwLensTheme.glassBorder, lineWidth: 0.5)
             )
             .contentShape(Rectangle())
@@ -507,7 +471,7 @@ struct ControlsView: View {
         .foregroundColor(color)
         .padding(.horizontal, 12)
         .padding(.vertical, 6)
-        .glassPanel(cornerRadius: OwLensTheme.radiusPill, border: color.opacity(0.25), background: OwLensTheme.glassBaseHeavy)
+        .glassPanel(cornerRadius: OwLensTheme.radiusCard, border: color.opacity(0.25), background: OwLensTheme.glassBaseHeavy)
     }
 
     // MARK: - Floating Adjustment Drawer Panels
@@ -582,10 +546,10 @@ struct ControlsView: View {
                                 .padding(.horizontal, 8)
                                 .padding(.vertical, 4)
                                 .background(
-                                    Capsule(style: .continuous)
+                                    RoundedRectangle(cornerRadius: 6, style: .continuous)
                                         .fill(isSelected ? OwLensTheme.glassActive : OwLensTheme.glassBase)
                                 )
-                                .contentShape(Capsule())
+                                .contentShape(Rectangle())
                         }
                         .buttonStyle(.plain)
                     }
@@ -642,10 +606,10 @@ struct ControlsView: View {
                                 .padding(.horizontal, 7)
                                 .padding(.vertical, 4)
                                 .background(
-                                    Capsule(style: .continuous)
+                                    RoundedRectangle(cornerRadius: 6, style: .continuous)
                                         .fill(isMatch ? OwLensTheme.glassActive : OwLensTheme.glassBase)
                                 )
-                                .contentShape(Capsule())
+                                .contentShape(Rectangle())
                         }
                         .buttonStyle(.plain)
                     }
@@ -692,10 +656,10 @@ struct ControlsView: View {
                                 .padding(.horizontal, 7)
                                 .padding(.vertical, 4)
                                 .background(
-                                    Capsule(style: .continuous)
+                                    RoundedRectangle(cornerRadius: 6, style: .continuous)
                                         .fill(isMatch ? OwLensTheme.glassActive : OwLensTheme.glassBase)
                                 )
-                                .contentShape(Capsule())
+                                .contentShape(Rectangle())
                         }
                         .buttonStyle(.plain)
                     }
@@ -721,10 +685,10 @@ struct ControlsView: View {
                         .padding(.horizontal, 14)
                         .padding(.vertical, 6)
                         .background(
-                            Capsule(style: .continuous)
+                            RoundedRectangle(cornerRadius: 6, style: .continuous)
                                 .fill(viewModel.isAutoFocus ? OwLensTheme.glassActive : OwLensTheme.glassBase)
                         )
-                        .contentShape(Capsule())
+                        .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
 
@@ -738,10 +702,10 @@ struct ControlsView: View {
                         .padding(.horizontal, 14)
                         .padding(.vertical, 6)
                         .background(
-                            Capsule(style: .continuous)
+                            RoundedRectangle(cornerRadius: 6, style: .continuous)
                                 .fill(!viewModel.isAutoFocus ? OwLensTheme.glassActive : OwLensTheme.glassBase)
                         )
-                        .contentShape(Capsule())
+                        .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
 
@@ -802,11 +766,11 @@ struct ControlsView: View {
                             .frame(maxWidth: .infinity)
                             .padding(.vertical, 8)
                             .background(
-                                RoundedRectangle(cornerRadius: OwLensTheme.radiusSm, style: .continuous)
+                                RoundedRectangle(cornerRadius: OwLensTheme.radiusCard, style: .continuous)
                                     .fill(isSelected ? OwLensTheme.glassActive : OwLensTheme.glassBase)
                             )
                             .overlay(
-                                RoundedRectangle(cornerRadius: OwLensTheme.radiusSm, style: .continuous)
+                                RoundedRectangle(cornerRadius: OwLensTheme.radiusCard, style: .continuous)
                                     .strokeBorder(isSelected ? Color.clear : OwLensTheme.glassBorder, lineWidth: 0.5)
                             )
                             .contentShape(Rectangle())
@@ -840,11 +804,11 @@ struct ControlsView: View {
                             .frame(maxWidth: .infinity)
                             .padding(.vertical, 8)
                             .background(
-                                RoundedRectangle(cornerRadius: OwLensTheme.radiusSm, style: .continuous)
+                                RoundedRectangle(cornerRadius: OwLensTheme.radiusCard, style: .continuous)
                                     .fill(isSelected ? OwLensTheme.glassActive : OwLensTheme.glassBase)
                             )
                             .overlay(
-                                RoundedRectangle(cornerRadius: OwLensTheme.radiusSm, style: .continuous)
+                                RoundedRectangle(cornerRadius: OwLensTheme.radiusCard, style: .continuous)
                                     .strokeBorder(isSelected ? Color.clear : OwLensTheme.glassBorder, lineWidth: 0.5)
                             )
                             .contentShape(Rectangle())
@@ -878,7 +842,7 @@ struct ControlsView: View {
                         .frame(maxWidth: .infinity)
                         .padding(.vertical, 8)
                         .background(
-                            RoundedRectangle(cornerRadius: OwLensTheme.radiusSm, style: .continuous)
+                            RoundedRectangle(cornerRadius: OwLensTheme.radiusCard, style: .continuous)
                                 .fill(isSelected ? OwLensTheme.glassActive : OwLensTheme.glassBase)
                         )
                         .contentShape(Rectangle())
@@ -911,7 +875,7 @@ struct ControlsView: View {
                         .frame(maxWidth: .infinity)
                         .padding(.vertical, 8)
                         .background(
-                            RoundedRectangle(cornerRadius: OwLensTheme.radiusSm, style: .continuous)
+                            RoundedRectangle(cornerRadius: OwLensTheme.radiusCard, style: .continuous)
                                 .fill(isSelected ? OwLensTheme.glassActive : OwLensTheme.glassBase)
                         )
                         .contentShape(Rectangle())
@@ -944,7 +908,7 @@ struct ControlsView: View {
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .padding(10)
                         .background(
-                            RoundedRectangle(cornerRadius: OwLensTheme.radiusSm, style: .continuous)
+                            RoundedRectangle(cornerRadius: OwLensTheme.radiusCard, style: .continuous)
                                 .fill(isSelected ? OwLensTheme.glassActive : OwLensTheme.glassBase)
                         )
                         .contentShape(Rectangle())
@@ -986,7 +950,7 @@ struct ControlsView: View {
                                 .padding(.horizontal, 12)
                                 .padding(.vertical, 8)
                                 .background(
-                                    RoundedRectangle(cornerRadius: OwLensTheme.radiusSm, style: .continuous)
+                                    RoundedRectangle(cornerRadius: OwLensTheme.radiusCard, style: .continuous)
                                         .fill(isSelected ? OwLensTheme.glassActive : OwLensTheme.glassBase)
                                 )
                                 .contentShape(Rectangle())
@@ -1053,7 +1017,7 @@ struct ControlsView: View {
                         .frame(maxWidth: .infinity)
                         .padding(.vertical, 10)
                         .background(
-                            RoundedRectangle(cornerRadius: OwLensTheme.radiusSm, style: .continuous)
+                            RoundedRectangle(cornerRadius: OwLensTheme.radiusCard, style: .continuous)
                                 .fill(isSelected ? OwLensTheme.glassActive : OwLensTheme.glassBase)
                         )
                         .contentShape(Rectangle())
@@ -1087,7 +1051,7 @@ struct ControlsView: View {
                         .frame(maxWidth: .infinity)
                         .padding(.vertical, 8)
                         .background(
-                            RoundedRectangle(cornerRadius: OwLensTheme.radiusSm, style: .continuous)
+                            RoundedRectangle(cornerRadius: OwLensTheme.radiusCard, style: .continuous)
                                 .fill(isSelected ? OwLensTheme.glassActive : OwLensTheme.glassBase)
                         )
                         .contentShape(Rectangle())
@@ -1215,29 +1179,35 @@ struct ControlsView: View {
     // MARK: - Right Record Grip
 
     private var rightRecordGrip: some View {
-        VStack(spacing: 14) {
-            // Lock / Unlock Switch
+        VStack(spacing: 10) {
+            // Lock / Unlock Switch (Only lock button in HUD, on top of record button)
+            let isLocked = viewModel.controlsLocked
+            let lockColor: Color = isLocked ? OwLensTheme.lockLocked : OwLensTheme.lockUnlocked
             Button {
                 Haptics.impact(.medium)
-                if viewModel.controlsLocked {
+                if isLocked {
                     viewModel.unlockControls()
                 } else {
                     viewModel.lockControls()
                 }
             } label: {
-                Image(systemName: viewModel.controlsLocked ? "lock.fill" : "lock.open")
-                    .font(.system(size: 14, weight: .medium))
-                    .foregroundColor(viewModel.controlsLocked ? OwLensTheme.textPrimary : OwLensTheme.textSecondary)
-                    .frame(width: 44, height: 44)
-                    .background(
-                        Circle()
-                            .fill(OwLensTheme.glassBaseHeavy)
-                    )
-                    .overlay(
-                        Circle()
-                            .strokeBorder(viewModel.controlsLocked ? OwLensTheme.glassBorderActive : OwLensTheme.glassBorder, lineWidth: 0.5)
-                    )
-                    .contentShape(Circle())
+                HStack(spacing: 4) {
+                    Image(systemName: isLocked ? "lock.fill" : "lock.open")
+                        .font(.system(size: 11, weight: .semibold))
+                    Text(isLocked ? "LOCKED" : "UNLOCK")
+                        .font(.geistMono(.bold, size: 8))
+                }
+                .foregroundColor(lockColor)
+                .frame(width: 72, height: 32)
+                .background(
+                    RoundedRectangle(cornerRadius: OwLensTheme.radiusCard, style: .continuous)
+                        .fill(lockColor.opacity(0.14))
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: OwLensTheme.radiusCard, style: .continuous)
+                        .strokeBorder(lockColor.opacity(0.40), lineWidth: 0.75)
+                )
+                .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
             .disabled(viewModel.isRecording)
@@ -1262,14 +1232,14 @@ struct ControlsView: View {
                     // Outer Ring
                     Circle()
                         .strokeBorder(OwLensTheme.textPrimary, lineWidth: 2.5)
-                        .frame(width: 68, height: 68)
+                        .frame(width: 64, height: 64)
                         .shadow(color: viewModel.isRecording ? OwLensTheme.recordingRed.opacity(0.6) : Color.clear, radius: 8)
 
                     if viewModel.isRecording {
                         // Red Stop Square
                         RoundedRectangle(cornerRadius: 5, style: .continuous)
                             .fill(OwLensTheme.recordingRed)
-                            .frame(width: 24, height: 24)
+                            .frame(width: 22, height: 22)
                     } else {
                         // Inner Record Circle
                         Circle()
@@ -1278,17 +1248,23 @@ struct ControlsView: View {
                                     ? Color.gray.opacity(0.3)
                                     : (viewModel.controlsLocked ? OwLensTheme.recordingRed : OwLensTheme.recordingRed.opacity(0.35))
                             )
-                            .frame(width: 52, height: 52)
+                            .frame(width: 48, height: 48)
                     }
                 }
-                .frame(width: 68, height: 68)
+                .frame(width: 64, height: 64)
                 .contentShape(Circle())
             }
             .buttonStyle(.plain)
             .disabled(viewModel.isDeviceUnsupportedForLog)
+
+            // Scopes Overlay (Histogram & Waveform) docked under record button
+            if viewModel.showScopes {
+                ScopesOverlay(data: viewModel.scopeData)
+                    .transition(.opacity.combined(with: .scale(scale: 0.95)))
+            }
         }
-        .padding(.trailing, 12)
-        .padding(.vertical, 12)
+        .padding(.trailing, 10)
+        .padding(.vertical, 8)
     }
 
     private func showLockNoticeToast() {

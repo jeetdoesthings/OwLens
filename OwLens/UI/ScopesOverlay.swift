@@ -4,17 +4,17 @@ struct ScopesOverlay: View {
     let data: ScopeData
 
     var body: some View {
-        VStack(spacing: 5) {
-            scopeBlock(title: "RGB HISTOGRAM", height: 30) {
+        VStack(spacing: 4) {
+            scopeBlock(title: "HISTOGRAM", height: 26) {
                 histogramCanvas
             }
-            scopeBlock(title: "LUMA WAVEFORM", height: 40) {
+            scopeBlock(title: "WAVEFORM", height: 32) {
                 waveformCanvas
             }
         }
-        .frame(width: 120)
+        .frame(width: 80)
         .padding(5)
-        .glassPanel(cornerRadius: OwLensTheme.radiusSm, border: OwLensTheme.glassBorderActive, background: OwLensTheme.glassBaseHeavy)
+        .glassPanel(cornerRadius: OwLensTheme.radiusCard, border: OwLensTheme.glassBorderActive, background: OwLensTheme.glassBaseHeavy)
     }
 
     private func scopeBlock<Content: View>(
@@ -22,30 +22,29 @@ struct ScopesOverlay: View {
         height: CGFloat,
         @ViewBuilder content: () -> Content
     ) -> some View {
-        VStack(alignment: .leading, spacing: 3) {
+        VStack(alignment: .leading, spacing: 2) {
             Text(title)
                 .font(.geistMono(.medium, size: 7))
                 .foregroundColor(OwLensTheme.textMuted)
-                .tracking(0.5)
+                .tracking(0.3)
 
             content()
                 .frame(height: height)
-                .background(Color.black.opacity(0.5))
-                .clipShape(RoundedRectangle(cornerRadius: 4, style: .continuous))
+                .background(Color.black.opacity(0.55))
+                .clipShape(RoundedRectangle(cornerRadius: 5, style: .continuous))
                 .overlay(
-                    RoundedRectangle(cornerRadius: 4, style: .continuous)
+                    RoundedRectangle(cornerRadius: 5, style: .continuous)
                         .strokeBorder(Color.white.opacity(0.06), lineWidth: 0.5)
                 )
         }
     }
 
-    // Cinema RGB Histogram — distinct red, green, and blue channels with additive color blending
+    // Cinema RGB Histogram — original Red, Green, Blue channels with transparent layering
     private var histogramCanvas: some View {
         Canvas { context, size in
-            context.blendMode = .plusLighter
-            drawHistogram(data.histogramRed, color: Color(red: 1.0, green: 0.25, blue: 0.25, opacity: 0.65), context: &context, size: size)
-            drawHistogram(data.histogramGreen, color: Color(red: 0.25, green: 0.88, blue: 0.35, opacity: 0.60), context: &context, size: size)
-            drawHistogram(data.histogramBlue, color: Color(red: 0.20, green: 0.55, blue: 1.0, opacity: 0.65), context: &context, size: size)
+            drawHistogram(data.histogramRed, color: .red, context: &context, size: size)
+            drawHistogram(data.histogramGreen, color: .green, context: &context, size: size)
+            drawHistogram(data.histogramBlue, color: .blue, context: &context, size: size)
         }
     }
 
@@ -66,10 +65,11 @@ struct ScopesOverlay: View {
                 width: max(1, step - 0.5),
                 height: height
             )
-            context.fill(Path(rect), with: .color(color))
+            context.fill(Path(rect), with: .color(color.opacity(0.45)))
         }
     }
 
+    // Luma Waveform — original cinema oscilloscope green
     private var waveformCanvas: some View {
         Canvas { context, size in
             let columns = data.waveformColumns
@@ -82,14 +82,14 @@ struct ScopesOverlay: View {
                 for col in 0..<columns {
                     let value = data.waveform[row * columns + col]
                     guard value > 0.015 else { continue }
-                    let alpha = min(0.80, 0.10 + Double(value) * 0.85)
+                    let alpha = min(0.85, 0.12 + Double(value) * 0.85)
                     let rect = CGRect(
                         x: CGFloat(col) * cellW,
                         y: CGFloat(row) * cellH,
                         width: max(1, cellW),
                         height: max(1, cellH)
                     )
-                    context.fill(Path(rect), with: .color(Color.white.opacity(alpha)))
+                    context.fill(Path(rect), with: .color(Color.green.opacity(alpha)))
                 }
             }
 

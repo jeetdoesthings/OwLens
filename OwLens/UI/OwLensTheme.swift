@@ -48,6 +48,10 @@ enum OwLensTheme {
     // Active Recording Indicator (Red — strictly reserved for REC tally)
     static let recordingRed = Color(red: 235/255, green: 40/255, blue: 40/255)
 
+    // Lock / Unlock Indicators (Green = Unlocked, Red = Locked)
+    static let lockUnlocked = Color(red: 0.25, green: 0.88, blue: 0.40)
+    static let lockLocked = recordingRed
+
     // ── Glass HUD Surfaces ──
     // Fewer layers, lower opacity — let the viewfinder breathe.
     static let glassBase = Color.black.opacity(0.45)
@@ -70,12 +74,13 @@ enum OwLensTheme {
     static let textMuted = Color.white.opacity(0.32)
     static let textDisabled = Color.white.opacity(0.18)
 
-    // ── Dimensions ──
+    // ── Dimensions (Unified Curved-Rectangular Design) ──
+    static let radiusCard: CGFloat = 8
     static let radiusSm: CGFloat = 6
     static let radiusMd: CGFloat = 8
-    static let radiusLg: CGFloat = 12
-    static let radiusXl: CGFloat = 18
-    static let radiusPill: CGFloat = 999
+    static let radiusLg: CGFloat = 10
+    static let radiusXl: CGFloat = 16
+    static let radiusPill: CGFloat = 8 // Transition legacy pill references to clean curved-rectangular
 }
 
 // MARK: - Haptic Feedback
