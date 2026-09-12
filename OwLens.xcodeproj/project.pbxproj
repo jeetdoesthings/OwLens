@@ -57,7 +57,7 @@
 		88ACB79376A4ADB2E76D6A84 /* Geist-Bold.otf */ = {isa = PBXFileReference; lastKnownFileType = file; path = "Geist-Bold.otf"; sourceTree = "<group>"; };
 		8BE4DD470C3C760B3483647C /* MetalPipelineSyntheticTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MetalPipelineSyntheticTests.swift; sourceTree = "<group>"; };
 		A1CC0C26A24F5131659B8690 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
-		A554E8A0A0080DCEE9A9F97E /* OwLens.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = OwLens.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		A554E8A0A0080DCEE9A9F97E /* OwLens.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = OwLens.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		B787E965A9BE33E34BB992CA /* ExposureStops.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ExposureStops.swift; sourceTree = "<group>"; };
 		BE3A5DA21D761DE0620AC086 /* MetalPipeline.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MetalPipeline.swift; sourceTree = "<group>"; };
 		CD4D88339EDB4CCE3E689AC1 /* ScopeData.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ScopeData.swift; sourceTree = "<group>"; };
@@ -205,7 +205,6 @@
 				LastUpgradeCheck = 1600;
 				TargetAttributes = {
 					31260F3EB779569B78DC48B6 = {
-						DevelopmentTeam = "";
 						ProvisioningStyle = Automatic;
 					};
 				};
@@ -283,7 +282,7 @@
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CODE_SIGN_IDENTITY = "iPhone Developer";
 				CODE_SIGN_STYLE = Automatic;
-				DEVELOPMENT_TEAM = "";
+				DEVELOPMENT_TEAM = G2FY7G8XX4;
 				INFOPLIST_FILE = OwLens/Resources/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
@@ -368,7 +367,7 @@
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CODE_SIGN_IDENTITY = "iPhone Developer";
 				CODE_SIGN_STYLE = Automatic;
-				DEVELOPMENT_TEAM = "";
+				DEVELOPMENT_TEAM = G2FY7G8XX4;
 				INFOPLIST_FILE = OwLens/Resources/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",

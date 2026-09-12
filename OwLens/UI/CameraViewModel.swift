@@ -184,6 +184,7 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
     }
     @Published var isAutoFocus: Bool = true {
         didSet {
+            guard !controlsLocked else { return }
             if isAutoFocus {
                 isFocusLocked = false
                 captureController.setContinuousAutoFocus()
@@ -1029,8 +1030,16 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
                 }
                 isAutoExposureEnabled = false
                 isAutoExposureAdjusting = false
+                let minISO = device.activeFormat.minISO
+                let maxISO = device.activeFormat.maxISO
+                let clampedISO = max(minISO, min(maxISO, curISO))
+                let minDuration = device.activeFormat.minExposureDuration
+                let maxDuration = device.activeFormat.maxExposureDuration
+                var clampedDuration = curDuration
+                if CMTimeCompare(clampedDuration, minDuration) < 0 { clampedDuration = minDuration }
+                if CMTimeCompare(clampedDuration, maxDuration) > 0 { clampedDuration = maxDuration }
                 if device.isExposureModeSupported(.custom) {
-                    device.setExposureModeCustom(duration: curDuration, iso: curISO)
+                    device.setExposureModeCustom(duration: clampedDuration, iso: clampedISO)
                 } else if device.isExposureModeSupported(.locked) {
                     device.exposureMode = .locked
                 }
@@ -1050,14 +1059,16 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
                 }
             }
 
-            // Lock focus at current position — no continuous AF during recording.
+            // Lock focus at current position without calling setFocusModeLocked with invalid lensPosition.
             if isAutoFocus {
                 let pos = device.lensPosition
-                focusLensPosition = pos
+                if pos >= 0.0 && pos <= 1.0 {
+                    focusLensPosition = pos
+                }
                 isAutoFocus = false
                 isFocusLocked = true
                 if device.isFocusModeSupported(.locked) {
-                    device.setFocusModeLocked(lensPosition: pos)
+                    device.focusMode = .locked
                 }
             }
 
