@@ -34,6 +34,7 @@ struct ControlsView: View {
         .animation(.spring(response: 0.28, dampingFraction: 0.82), value: viewModel.activePanel)
         .animation(.spring(response: 0.28, dampingFraction: 0.82), value: viewModel.isRecording)
         .animation(.spring(response: 0.28, dampingFraction: 0.82), value: viewModel.controlsLocked)
+        .animation(.spring(response: 0.28, dampingFraction: 0.82), value: viewModel.showScopes)
     }
 
     // MARK: - Top Status Bar
@@ -1179,10 +1180,11 @@ struct ControlsView: View {
     // MARK: - Right Record Grip
 
     private var rightRecordGrip: some View {
-        VStack(spacing: 10) {
+        let isLocked = viewModel.controlsLocked
+        let lockColor: Color = isLocked ? OwLensTheme.lockLocked : OwLensTheme.lockUnlocked
+
+        return VStack(spacing: 12) {
             // Lock / Unlock Switch (Only lock button in HUD, on top of record button)
-            let isLocked = viewModel.controlsLocked
-            let lockColor: Color = isLocked ? OwLensTheme.lockLocked : OwLensTheme.lockUnlocked
             Button {
                 Haptics.impact(.medium)
                 if isLocked {
@@ -1191,23 +1193,19 @@ struct ControlsView: View {
                     viewModel.lockControls()
                 }
             } label: {
-                HStack(spacing: 4) {
-                    Image(systemName: isLocked ? "lock.fill" : "lock.open")
-                        .font(.system(size: 11, weight: .semibold))
-                    Text(isLocked ? "LOCKED" : "UNLOCK")
-                        .font(.geistMono(.bold, size: 8))
-                }
-                .foregroundColor(lockColor)
-                .frame(width: 72, height: 32)
-                .background(
-                    RoundedRectangle(cornerRadius: OwLensTheme.radiusCard, style: .continuous)
-                        .fill(lockColor.opacity(0.14))
-                )
-                .overlay(
-                    RoundedRectangle(cornerRadius: OwLensTheme.radiusCard, style: .continuous)
-                        .strokeBorder(lockColor.opacity(0.40), lineWidth: 0.75)
-                )
-                .contentShape(Rectangle())
+                Image(systemName: isLocked ? "lock.fill" : "lock.open")
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundColor(lockColor)
+                    .frame(width: 44, height: 36)
+                    .background(
+                        RoundedRectangle(cornerRadius: OwLensTheme.radiusCard, style: .continuous)
+                            .fill(lockColor.opacity(0.14))
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: OwLensTheme.radiusCard, style: .continuous)
+                            .strokeBorder(lockColor.opacity(0.40), lineWidth: 0.75)
+                    )
+                    .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
             .disabled(viewModel.isRecording)
@@ -1256,15 +1254,18 @@ struct ControlsView: View {
             }
             .buttonStyle(.plain)
             .disabled(viewModel.isDeviceUnsupportedForLog)
-
+        }
+        .frame(width: 84)
+        .overlay(alignment: .top) {
             // Scopes Overlay (Histogram & Waveform) docked under record button
+            // Anchored in overlay so toggling scopes never shifts the record or lock buttons
             if viewModel.showScopes {
                 ScopesOverlay(data: viewModel.scopeData)
+                    .offset(y: 122) // lock height (36) + spacing (12) + shutter height (64) + gap (10) = 122
                     .transition(.opacity.combined(with: .scale(scale: 0.95)))
             }
         }
         .padding(.trailing, 10)
-        .padding(.vertical, 8)
     }
 
     private func showLockNoticeToast() {
