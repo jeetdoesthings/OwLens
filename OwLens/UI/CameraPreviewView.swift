@@ -41,13 +41,15 @@ struct CameraPreviewView: UIViewRepresentable {
         context.coordinator.showClipping = showClipping
         context.coordinator.showFocusPeaking = showFocusPeaking
         context.coordinator.showDisplayLUT = showDisplayLUT
-        context.coordinator.overlayOnly = overlayOnly
         context.coordinator.isAppActive = UIApplication.shared.applicationState == .active
-        uiView.clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: overlayOnly ? 0 : 1)
-        uiView.backgroundColor = overlayOnly ? .clear : .black
-        uiView.isOpaque = !overlayOnly
-        uiView.layer.isOpaque = !overlayOnly
-        (uiView.layer as? CAMetalLayer)?.isOpaque = !overlayOnly
+        if context.coordinator.overlayOnly != overlayOnly {
+            context.coordinator.overlayOnly = overlayOnly
+            uiView.clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: overlayOnly ? 0 : 1)
+            uiView.backgroundColor = overlayOnly ? .clear : .black
+            uiView.isOpaque = !overlayOnly
+            uiView.layer.isOpaque = !overlayOnly
+            (uiView.layer as? CAMetalLayer)?.isOpaque = !overlayOnly
+        }
         uiView.setNeedsDisplay()
     }
  

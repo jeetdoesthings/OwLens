@@ -64,11 +64,14 @@ final class RawFrameBuffer {
 
         guard count > 0 else { return nil }
 
-        while count > 1 {
-            buffer[readIndex] = nil
-            readIndex = (readIndex + 1) % capacity
-            count -= 1
-            _droppedCount += 1
+        let dropped = count - 1
+        if dropped > 0 {
+            for _ in 0..<dropped {
+                buffer[readIndex] = nil
+                readIndex = (readIndex + 1) % capacity
+            }
+            count -= dropped
+            _droppedCount += dropped
         }
 
         let frame = buffer[readIndex]

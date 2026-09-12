@@ -9,9 +9,11 @@ struct ScopeData: Equatable {
     let waveformRows: Int
 
     var histogram: [Float] {
-        zip(zip(histogramRed, histogramGreen), histogramBlue).map { channels in
-            max(channels.0.0, channels.0.1, channels.1)
+        var result = [Float](repeating: 0, count: histogramRed.count)
+        for i in 0..<histogramRed.count {
+            result[i] = max(histogramRed[i], histogramGreen[i], histogramBlue[i])
         }
+        return result
     }
 
     static let empty = ScopeData(
@@ -40,21 +42,43 @@ struct ScopeData: Equatable {
         var histogramBlue = [Float](repeating: 0, count: histogramBins)
         var waveform = [Float](repeating: 0, count: waveformColumns * waveformRows)
 
-        for y in 0..<height {
-            for x in 0..<width {
-                let i = (y * width + x) * 4
-                let r = min(1, max(0, Float(Float16(bitPattern: pixels[i]))))
-                let g = min(1, max(0, Float(Float16(bitPattern: pixels[i + 1]))))
-                let b = min(1, max(0, Float(Float16(bitPattern: pixels[i + 2]))))
-                let luma = min(1, max(0, 0.2126 * r + 0.7152 * g + 0.0722 * b))
+        let maxHistBin = histogramBins - 1
+        let histScale = Float(maxHistBin)
+        let maxWaveRow = waveformRows - 1
+        let waveScale = Float(maxWaveRow)
 
-                histogramRed[min(histogramBins - 1, Int(r * Float(histogramBins - 1)))] += 1
-                histogramGreen[min(histogramBins - 1, Int(g * Float(histogramBins - 1)))] += 1
-                histogramBlue[min(histogramBins - 1, Int(b * Float(histogramBins - 1)))] += 1
+        // Precompute column mapping: O(W) instead of O(W * H) divisions in inner loop
+        var colMap = [Int](repeating: 0, count: width)
+        for x in 0..<width {
+            colMap[x] = min(waveformColumns - 1, x * waveformColumns / width)
+        }
 
-                let col = min(waveformColumns - 1, x * waveformColumns / width)
-                let row = waveformRows - 1 - min(waveformRows - 1, Int(luma * Float(waveformRows - 1)))
-                waveform[row * waveformColumns + col] += 1
+        pixels.withUnsafeBufferPointer { ptr in
+            guard let base = ptr.baseAddress else { return }
+            var idx = 0
+            for _ in 0..<height {
+                for x in 0..<width {
+                    let r16 = Float16(bitPattern: base[idx])
+                    let g16 = Float16(bitPattern: base[idx + 1])
+                    let b16 = Float16(bitPattern: base[idx + 2])
+                    idx += 4
+
+                    let r = min(1.0, max(0.0, Float(r16)))
+                    let g = min(1.0, max(0.0, Float(g16)))
+                    let b = min(1.0, max(0.0, Float(b16)))
+                    let luma = min(1.0, max(0.0, 0.2126 * r + 0.7152 * g + 0.0722 * b))
+
+                    let rBin = min(maxHistBin, Int(r * histScale))
+                    let gBin = min(maxHistBin, Int(g * histScale))
+                    let bBin = min(maxHistBin, Int(b * histScale))
+                    histogramRed[rBin] += 1
+                    histogramGreen[gBin] += 1
+                    histogramBlue[bBin] += 1
+
+                    let col = colMap[x]
+                    let row = maxWaveRow - min(maxWaveRow, Int(luma * waveScale))
+                    waveform[row * waveformColumns + col] += 1
+                }
             }
         }
 
@@ -75,8 +99,9 @@ struct ScopeData: Equatable {
 
     private static func normalize(_ values: inout [Float]) {
         guard let maxValue = values.max(), maxValue > 0 else { return }
+        let invMax = 1.0 / maxValue
         for i in values.indices {
-            values[i] = min(1, values[i] / maxValue)
+            values[i] = min(1.0, values[i] * invMax)
         }
     }
 }

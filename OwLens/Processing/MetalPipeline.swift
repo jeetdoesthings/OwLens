@@ -1229,13 +1229,20 @@ final class MetalPipeline: @unchecked Sendable {
             let componentsPerPixel = 4
             let bytesPerComponent = MemoryLayout<UInt16>.stride
             let bytesPerRow = width * componentsPerPixel * bytesPerComponent
-            var pixels = [UInt16](repeating: 0, count: width * height * componentsPerPixel)
-            outputBox.value.getBytes(
-                &pixels,
-                bytesPerRow: bytesPerRow,
-                from: MTLRegionMake2D(0, 0, width, height),
-                mipmapLevel: 0
-            )
+            let totalElements = width * height * componentsPerPixel
+            let pixels = [UInt16](unsafeUninitializedCapacity: totalElements) { buffer, initializedCount in
+                if let base = buffer.baseAddress {
+                    outputBox.value.getBytes(
+                        base,
+                        bytesPerRow: bytesPerRow,
+                        from: MTLRegionMake2D(0, 0, width, height),
+                        mipmapLevel: 0
+                    )
+                    initializedCount = totalElements
+                } else {
+                    initializedCount = 0
+                }
+            }
             completionBox.value(ScopeData.make(fromHalfRGBA: pixels, width: width, height: height))
         }
         cb.commit()

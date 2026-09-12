@@ -39,6 +39,13 @@ static inline float sampleBayerClamp(texture2d<float, access::read> tex, int x, 
     return linearize(v, black, white);
 }
 
+static inline float sampleBayerFast(texture2d<float, access::read> tex, int x, int y, int dx, int dy, float black, float invDenom) {
+    int nx = clamp(x + dx, 0, int(tex.get_width()) - 1);
+    int ny = clamp(y + dy, 0, int(tex.get_height()) - 1);
+    float v = tex.read(uint2(nx, ny)).r;
+    return (v - black) * invDenom;
+}
+
 kernel void correctDefectPixelsBayer(
     texture2d<float, access::read>  src [[texture(0)]],
     texture2d<float, access::write> dst [[texture(1)]],
@@ -49,39 +56,33 @@ kernel void correctDefectPixelsBayer(
     if (gid.x >= dst.get_width() || gid.y >= dst.get_height()) return;
 
     float center = src.read(gid).r;
-    float neighbors[8];
-    int count = 0;
 
-    for (int dy = -1; dy <= 1; dy++) {
-        for (int dx = -1; dx <= 1; dx++) {
-            if (dx == 0 && dy == 0) continue;
-            int nx = clamp(int(gid.x) + dx, 0, int(src.get_width())  - 1);
-            int ny = clamp(int(gid.y) + dy, 0, int(src.get_height()) - 1);
-            // Only collect same-color Bayer neighbors.
-            if (((nx + ny) & 1) == ((int(gid.x) + int(gid.y)) & 1)) {
-                neighbors[count++] = src.read(uint2(nx, ny)).r;
-            }
-        }
-    }
+    // Direct O(1) unrolled sampling of same-color Bayer neighbors (4 diagonals)
+    int w = int(src.get_width()) - 1;
+    int h = int(src.get_height()) - 1;
+    int x = int(gid.x);
+    int y = int(gid.y);
 
-    // Simple median of up to 8 same-color neighbors.
-    for (int i = 0; i < count - 1; i++) {
-        for (int j = i + 1; j < count; j++) {
-            if (neighbors[j] < neighbors[i]) {
-                float tmp = neighbors[i]; neighbors[i] = neighbors[j]; neighbors[j] = tmp;
-            }
-        }
-    }
-    float median = neighbors[count / 2];
+    float n0 = src.read(uint2(clamp(x - 1, 0, w), clamp(y - 1, 0, h))).r;
+    float n1 = src.read(uint2(clamp(x + 1, 0, w), clamp(y - 1, 0, h))).r;
+    float n2 = src.read(uint2(clamp(x - 1, 0, w), clamp(y + 1, 0, h))).r;
+    float n3 = src.read(uint2(clamp(x + 1, 0, w), clamp(y + 1, 0, h))).r;
+
+    // Fast 4-element sorting network: 5 min/max operations, zero loops, zero register spills
+    float min01 = min(n0, n1);
+    float max01 = max(n0, n1);
+    float min23 = min(n2, n3);
+    float max23 = max(n2, n3);
+    float midLo = max(min01, min23);
+    float midHi = min(max01, max23);
+    float median = 0.5f * (midLo + midHi);
 
     float signalNorm = saturate(center / params.whiteLevel);
     float sigmaRaw = sqrt(noise.shotCoeff * signalNorm + noise.readCoeff) * params.whiteLevel;
-    // sigmaRaw is in normalized [0,1] space (whiteLevel scales it). The old floor of
-    // 1.0 assumed raw 16-bit units — it was way too high for normalized data.
-    float threshold = 5.0 * max(sigmaRaw, 1e-3);
+    float threshold = 5.0f * max(sigmaRaw, 1e-3f);
 
     float out = (abs(center - median) > threshold) ? median : center;
-    dst.write(float4(out, 0.0, 0.0, 1.0), gid);
+    dst.write(float4(out, 0.0f, 0.0f, 1.0f), gid);
 }
 
 // CFA-preserving half-res bin: out(x,y) = in(2x+(x&1), 2y+(y&1))
@@ -247,28 +248,29 @@ kernel void debayerWBLinear(
 
     float black = params.blackLevel;
     float white = params.whiteLevel;
+    float invDenom = 1.0f / max(white - black, 1e-6f);
 
-    // ── Directional Demosaic (Malvar-He-Cutler) ──
-    float c00 = sampleBayerClamp(rawTexture, x, y, 0, 0, black, white);
-    float cN1 = sampleBayerClamp(rawTexture, x, y, 0, -1, black, white);
-    float cS1 = sampleBayerClamp(rawTexture, x, y, 0, 1, black, white);
-    float cE1 = sampleBayerClamp(rawTexture, x, y, 1, 0, black, white);
-    float cW1 = sampleBayerClamp(rawTexture, x, y, -1, 0, black, white);
+    // ── Directional Demosaic (Malvar-He-Cutler) with FMA linearize ──
+    float c00 = sampleBayerFast(rawTexture, x, y, 0, 0, black, invDenom);
+    float cN1 = sampleBayerFast(rawTexture, x, y, 0, -1, black, invDenom);
+    float cS1 = sampleBayerFast(rawTexture, x, y, 0, 1, black, invDenom);
+    float cE1 = sampleBayerFast(rawTexture, x, y, 1, 0, black, invDenom);
+    float cW1 = sampleBayerFast(rawTexture, x, y, -1, 0, black, invDenom);
     
-    float cN2 = sampleBayerClamp(rawTexture, x, y, 0, -2, black, white);
-    float cS2 = sampleBayerClamp(rawTexture, x, y, 0, 2, black, white);
-    float cE2 = sampleBayerClamp(rawTexture, x, y, 2, 0, black, white);
-    float cW2 = sampleBayerClamp(rawTexture, x, y, -2, 0, black, white);
+    float cN2 = sampleBayerFast(rawTexture, x, y, 0, -2, black, invDenom);
+    float cS2 = sampleBayerFast(rawTexture, x, y, 0, 2, black, invDenom);
+    float cE2 = sampleBayerFast(rawTexture, x, y, 2, 0, black, invDenom);
+    float cW2 = sampleBayerFast(rawTexture, x, y, -2, 0, black, invDenom);
     
-    float cNE = sampleBayerClamp(rawTexture, x, y, 1, -1, black, white);
-    float cNW = sampleBayerClamp(rawTexture, x, y, -1, -1, black, white);
-    float cSE = sampleBayerClamp(rawTexture, x, y, 1, 1, black, white);
-    float cSW = sampleBayerClamp(rawTexture, x, y, -1, 1, black, white);
+    float cNE = sampleBayerFast(rawTexture, x, y, 1, -1, black, invDenom);
+    float cNW = sampleBayerFast(rawTexture, x, y, -1, -1, black, invDenom);
+    float cSE = sampleBayerFast(rawTexture, x, y, 1, 1, black, invDenom);
+    float cSW = sampleBayerFast(rawTexture, x, y, -1, 1, black, invDenom);
 
-    float G_at_RB = (2*(cN1 + cS1 + cE1 + cW1) + 4*c00 - (cN2 + cS2 + cE2 + cW2)) / 8.0;
-    float Color_at_G_H = (4*(cE1 + cW1) + 5*c00 - (cE2 + cW2) - 0.5*(cN2 + cS2) - (cNE + cNW + cSE + cSW)) / 8.0;
-    float Color_at_G_V = (4*(cN1 + cS1) + 5*c00 - (cN2 + cS2) - 0.5*(cE2 + cW2) - (cNE + cNW + cSE + cSW)) / 8.0;
-    float Color_at_Diag = (2*(cNE + cNW + cSE + cSW) + 6*c00 - 1.5*(cN2 + cS2 + cE2 + cW2)) / 8.0;
+    float G_at_RB = (2*(cN1 + cS1 + cE1 + cW1) + 4*c00 - (cN2 + cS2 + cE2 + cW2)) * 0.125f;
+    float Color_at_G_H = (4*(cE1 + cW1) + 5*c00 - (cE2 + cW2) - 0.5f*(cN2 + cS2) - (cNE + cNW + cSE + cSW)) * 0.125f;
+    float Color_at_G_V = (4*(cN1 + cS1) + 5*c00 - (cN2 + cS2) - 0.5f*(cE2 + cW2) - (cNE + cNW + cSE + cSW)) * 0.125f;
+    float Color_at_Diag = (2*(cNE + cNW + cSE + cSW) + 6*c00 - 1.5f*(cN2 + cS2 + cE2 + cW2)) * 0.125f;
 
     float r, g, b;
     if (yEven && xEven) {
@@ -280,26 +282,26 @@ kernel void debayerWBLinear(
     } else {
         b = c00; g = G_at_RB; r = Color_at_Diag;
     }
-    r = max(r, 0.0);
-    g = max(g, 0.0);
-    b = max(b, 0.0);
+    r = max(r, 0.0f);
+    g = max(g, 0.0f);
+    b = max(b, 0.0f);
 
     // Gr/Gb green balance before LSC/WB.
     g *= params.greenBalance;
 
-    // Per-channel Lens Shading Correction (LSC): 4-term radial + azimuth model.
+    // Fast SIMD Lens Shading Correction (LSC): radial polynomial + algebraic azimuth
     float outW = float(outTexture.get_width());
     float outH = float(outTexture.get_height());
-    float2 uv = (float2(float(x) + 0.5, float(y) + 0.5) / float2(outW, outH)) - 0.5;
+    float2 uv = (float2(float(x) + 0.5f, float(y) + 0.5f) / float2(outW, outH)) - 0.5f;
     float r2 = dot(uv, uv);
     float r4 = r2 * r2;
-    float theta = atan2(uv.y, uv.x);
 
-    float gainR = 1.0 + lsc.radialR * r2 + lsc.radial4R * r4 + lsc.azimuthR * cos(2.0 * theta);
-    float gainG = 1.0 + lsc.radialG * r2 + lsc.radial4G * r4 + lsc.azimuthG * cos(2.0 * theta);
-    float gainB = 1.0 + lsc.radialB * r2 + lsc.radial4B * r4 + lsc.azimuthB * cos(2.0 * theta);
-    float3 rgb = float3(r * gainR, g * gainG, b * gainB);
-    rgb = min(rgb, float3(8.0));
+    float3 gain = float3(1.0f) + float3(lsc.radialR, lsc.radialG, lsc.radialB) * r2 + float3(lsc.radial4R, lsc.radial4G, lsc.radial4B) * r4;
+    if (lsc.azimuthR != 0.0f || lsc.azimuthG != 0.0f || lsc.azimuthB != 0.0f) {
+        float cos2Theta = (uv.x * uv.x - uv.y * uv.y) / max(r2, 1e-6f);
+        gain += float3(lsc.azimuthR, lsc.azimuthG, lsc.azimuthB) * cos2Theta;
+    }
+    float3 rgb = min(float3(r, g, b) * gain, float3(8.0f));
 
     // ── White Balance ──
     rgb *= params.wbGains;
@@ -359,28 +361,29 @@ kernel void debayerFusedLog(
 
     float black = params.blackLevel;
     float white = params.whiteLevel;
+    float invDenom = 1.0f / max(white - black, 1e-6f);
 
-    // ── Directional Demosaic (Malvar-He-Cutler) ──
-    float c00 = sampleBayerClamp(rawTexture, x, y, 0, 0, black, white);
-    float cN1 = sampleBayerClamp(rawTexture, x, y, 0, -1, black, white);
-    float cS1 = sampleBayerClamp(rawTexture, x, y, 0, 1, black, white);
-    float cE1 = sampleBayerClamp(rawTexture, x, y, 1, 0, black, white);
-    float cW1 = sampleBayerClamp(rawTexture, x, y, -1, 0, black, white);
+    // ── Directional Demosaic (Malvar-He-Cutler) with FMA linearize ──
+    float c00 = sampleBayerFast(rawTexture, x, y, 0, 0, black, invDenom);
+    float cN1 = sampleBayerFast(rawTexture, x, y, 0, -1, black, invDenom);
+    float cS1 = sampleBayerFast(rawTexture, x, y, 0, 1, black, invDenom);
+    float cE1 = sampleBayerFast(rawTexture, x, y, 1, 0, black, invDenom);
+    float cW1 = sampleBayerFast(rawTexture, x, y, -1, 0, black, invDenom);
     
-    float cN2 = sampleBayerClamp(rawTexture, x, y, 0, -2, black, white);
-    float cS2 = sampleBayerClamp(rawTexture, x, y, 0, 2, black, white);
-    float cE2 = sampleBayerClamp(rawTexture, x, y, 2, 0, black, white);
-    float cW2 = sampleBayerClamp(rawTexture, x, y, -2, 0, black, white);
+    float cN2 = sampleBayerFast(rawTexture, x, y, 0, -2, black, invDenom);
+    float cS2 = sampleBayerFast(rawTexture, x, y, 0, 2, black, invDenom);
+    float cE2 = sampleBayerFast(rawTexture, x, y, 2, 0, black, invDenom);
+    float cW2 = sampleBayerFast(rawTexture, x, y, -2, 0, black, invDenom);
     
-    float cNE = sampleBayerClamp(rawTexture, x, y, 1, -1, black, white);
-    float cNW = sampleBayerClamp(rawTexture, x, y, -1, -1, black, white);
-    float cSE = sampleBayerClamp(rawTexture, x, y, 1, 1, black, white);
-    float cSW = sampleBayerClamp(rawTexture, x, y, -1, 1, black, white);
+    float cNE = sampleBayerFast(rawTexture, x, y, 1, -1, black, invDenom);
+    float cNW = sampleBayerFast(rawTexture, x, y, -1, -1, black, invDenom);
+    float cSE = sampleBayerFast(rawTexture, x, y, 1, 1, black, invDenom);
+    float cSW = sampleBayerFast(rawTexture, x, y, -1, 1, black, invDenom);
 
-    float G_at_RB = (2*(cN1 + cS1 + cE1 + cW1) + 4*c00 - (cN2 + cS2 + cE2 + cW2)) / 8.0;
-    float Color_at_G_H = (4*(cE1 + cW1) + 5*c00 - (cE2 + cW2) - 0.5*(cN2 + cS2) - (cNE + cNW + cSE + cSW)) / 8.0;
-    float Color_at_G_V = (4*(cN1 + cS1) + 5*c00 - (cN2 + cS2) - 0.5*(cE2 + cW2) - (cNE + cNW + cSE + cSW)) / 8.0;
-    float Color_at_Diag = (2*(cNE + cNW + cSE + cSW) + 6*c00 - 1.5*(cN2 + cS2 + cE2 + cW2)) / 8.0;
+    float G_at_RB = (2*(cN1 + cS1 + cE1 + cW1) + 4*c00 - (cN2 + cS2 + cE2 + cW2)) * 0.125f;
+    float Color_at_G_H = (4*(cE1 + cW1) + 5*c00 - (cE2 + cW2) - 0.5f*(cN2 + cS2) - (cNE + cNW + cSE + cSW)) * 0.125f;
+    float Color_at_G_V = (4*(cN1 + cS1) + 5*c00 - (cN2 + cS2) - 0.5f*(cE2 + cW2) - (cNE + cNW + cSE + cSW)) * 0.125f;
+    float Color_at_Diag = (2*(cNE + cNW + cSE + cSW) + 6*c00 - 1.5f*(cN2 + cS2 + cE2 + cW2)) * 0.125f;
 
     float r, g, b;
     if (yEven && xEven) {
@@ -392,26 +395,26 @@ kernel void debayerFusedLog(
     } else {
         b = c00; g = G_at_RB; r = Color_at_Diag;
     }
-    r = max(r, 0.0);
-    g = max(g, 0.0);
-    b = max(b, 0.0);
+    r = max(r, 0.0f);
+    g = max(g, 0.0f);
+    b = max(b, 0.0f);
 
     // Gr/Gb green balance before LSC/WB.
     g *= params.greenBalance;
 
-    // Per-channel Lens Shading Correction (LSC): 4-term radial + azimuth model.
+    // Fast SIMD Lens Shading Correction (LSC): radial polynomial + algebraic azimuth
     float outW = float(outTexture.get_width());
     float outH = float(outTexture.get_height());
-    float2 uv = (float2(float(x) + 0.5, float(y) + 0.5) / float2(outW, outH)) - 0.5;
+    float2 uv = (float2(float(x) + 0.5f, float(y) + 0.5f) / float2(outW, outH)) - 0.5f;
     float r2 = dot(uv, uv);
     float r4 = r2 * r2;
-    float theta = atan2(uv.y, uv.x);
 
-    float gainR = 1.0 + lsc.radialR * r2 + lsc.radial4R * r4 + lsc.azimuthR * cos(2.0 * theta);
-    float gainG = 1.0 + lsc.radialG * r2 + lsc.radial4G * r4 + lsc.azimuthG * cos(2.0 * theta);
-    float gainB = 1.0 + lsc.radialB * r2 + lsc.radial4B * r4 + lsc.azimuthB * cos(2.0 * theta);
-    float3 rgb = float3(r * gainR, g * gainG, b * gainB);
-    rgb = min(rgb, float3(8.0));
+    float3 gain = float3(1.0f) + float3(lsc.radialR, lsc.radialG, lsc.radialB) * r2 + float3(lsc.radial4R, lsc.radial4G, lsc.radial4B) * r4;
+    if (lsc.azimuthR != 0.0f || lsc.azimuthG != 0.0f || lsc.azimuthB != 0.0f) {
+        float cos2Theta = (uv.x * uv.x - uv.y * uv.y) / max(r2, 1e-6f);
+        gain += float3(lsc.azimuthR, lsc.azimuthG, lsc.azimuthB) * cos2Theta;
+    }
+    float3 rgb = min(float3(r, g, b) * gain, float3(8.0f));
 
     // ── White Balance ──
     rgb *= params.wbGains;

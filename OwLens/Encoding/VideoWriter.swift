@@ -165,9 +165,17 @@ final class VideoWriter: @unchecked Sendable {
 
     private func drainPendingAudioBuffersLocked() {
         guard let input = audioInput else { return }
-        while !pendingAudioBuffers.isEmpty && input.isReadyForMoreMediaData {
-            let next = pendingAudioBuffers.removeFirst()
-            _ = input.append(next)
+        var drainedCount = 0
+        for buffer in pendingAudioBuffers {
+            if input.isReadyForMoreMediaData {
+                _ = input.append(buffer)
+                drainedCount += 1
+            } else {
+                break
+            }
+        }
+        if drainedCount > 0 {
+            pendingAudioBuffers.removeSubrange(0..<drainedCount)
         }
     }
 
