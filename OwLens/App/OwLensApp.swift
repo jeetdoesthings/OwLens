@@ -19,6 +19,8 @@ struct RootView: View {
     @State private var focusReticleOpacity: Double = 0
     @State private var focusReticleScale: CGFloat = 1.3
     @State private var touchDownDate: Date? = nil
+    @State private var scopesOffset: CGSize = .zero
+    @State private var scopesDragTranslation: CGSize = .zero
 
     var body: some View {
         ZStack {
@@ -77,11 +79,23 @@ struct RootView: View {
                         // Scopes Overlay (RGB Histogram & Luma Waveform)
                         if viewModel.showScopes {
                             ScopesOverlay(data: viewModel.scopeData)
-                                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
-                                .padding(.trailing, 92)
+                                .offset(x: scopesOffset.width + scopesDragTranslation.width,
+                                        y: scopesOffset.height + scopesDragTranslation.height)
+                                .gesture(
+                                    DragGesture()
+                                        .onChanged { value in
+                                            scopesDragTranslation = value.translation
+                                        }
+                                        .onEnded { value in
+                                            scopesOffset.width += value.translation.width
+                                            scopesOffset.height += value.translation.height
+                                            scopesDragTranslation = .zero
+                                        }
+                                )
+                                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                                .padding(.leading, 72)
                                 .padding(.top, 48)
                                 .zIndex(3)
-                                .allowsHitTesting(false)
                                 .transition(.opacity)
                         }
 

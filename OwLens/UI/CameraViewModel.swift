@@ -103,6 +103,13 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
         }
     }
 
+    @Published var wbTint: Float = 0.0
+    @Published var meteringMode: MeteringMode = .matrix {
+        didSet {
+            captureController.setMeteringMode(meteringMode)
+        }
+    }
+
     let levelMonitor = LevelMonitor()
 
     /// Frame count for recording telemetry (not published to avoid thrashing SwiftUI on every frame).
@@ -775,7 +782,7 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
                     device.whiteBalanceMode = .continuousAutoWhiteBalance
                 }
             } else {
-                let temperatureAndTint = AVCaptureDevice.WhiteBalanceTemperatureAndTintValues(temperature: wbKelvin, tint: 0)
+                let temperatureAndTint = AVCaptureDevice.WhiteBalanceTemperatureAndTintValues(temperature: wbKelvin, tint: wbTint)
                 let wbGains = device.deviceWhiteBalanceGains(for: temperatureAndTint)
                 let clampedGains = clampWhiteBalanceGains(wbGains, for: device)
                 // setWhiteBalanceModeLocked raises NSInvalidArgumentException when .locked
@@ -834,6 +841,9 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
     }
 
     func setFocusPoint(_ point: CGPoint, lock: Bool = false) {
+        if meteringMode == .spot {
+            captureController.setMeteringMode(.spot, at: point)
+        }
         if isRecording || controlsLocked {
             // During recording: tap always locks focus (no continuous AF).
             // Set the focus point and lock at that position.
@@ -944,13 +954,13 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
         }
         guard controlsLocked, !isRecording else { return }
 
+        activeEncodeWidth = selectedFormat.width
+        activeEncodeHeight = selectedFormat.height
+        activeFPS = selectedFPS.rawValue
         lockAutoModesForRecording()
         updateDenoiseStrength()
         metalPipeline?.curveType = selectedCurve
         metalPipeline?.clearTemporalHistory()
-        activeEncodeWidth = selectedFormat.width
-        activeEncodeHeight = selectedFormat.height
-        activeFPS = selectedFPS.rawValue
         frameBuffer.flush()
         captureController.setRecordingMode(true)
         let effectiveBitrate = min(selectedBitrate.bitsPerSecond, selectedFormat.maxBitratePreset.bitsPerSecond)
@@ -1005,39 +1015,57 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
     private func lockAutoModesForRecording() {
         guard let device = captureController.activeDevice else { return }
 
-        // Lock exposure if auto
-        if isAutoExposureEnabled {
-            isoValue = device.iso
-            let angle = Float(device.exposureDuration.seconds * activeFPS * 360.0)
-            if angle.isFinite && angle > 0 {
-                shutterValue = max(shutterRange.lowerBound, min(shutterRange.upperBound, angle))
+        do {
+            try device.lockForConfiguration()
+
+            // Lock exposure if auto: freeze hardware directly at current duration and ISO
+            if isAutoExposureEnabled {
+                let curDuration = device.exposureDuration
+                let curISO = device.iso
+                isoValue = curISO
+                let angle = Float(curDuration.seconds * activeFPS * 360.0)
+                if angle.isFinite && angle > 0 {
+                    shutterValue = max(shutterRange.lowerBound, min(shutterRange.upperBound, angle))
+                }
+                isAutoExposureEnabled = false
+                isAutoExposureAdjusting = false
+                if device.isExposureModeSupported(.custom) {
+                    device.setExposureModeCustom(duration: curDuration, iso: curISO)
+                } else if device.isExposureModeSupported(.locked) {
+                    device.exposureMode = .locked
+                }
             }
-            isAutoExposureEnabled = false
-            isAutoExposureAdjusting = false
-        }
 
-        // Lock white balance if auto
-        if isAutoWhiteBalanceEnabled {
-            let gains = device.deviceWhiteBalanceGains
-            let temperatureAndTint = device.temperatureAndTintValues(for: gains)
-            wbKelvin = max(2000, min(10000, temperatureAndTint.temperature))
-            isAutoWhiteBalanceEnabled = false
-            isAutoWhiteBalanceAdjusting = false
-        }
+            // Lock white balance if auto: preserve exact device gains and tint without lossy round-tripping
+            if isAutoWhiteBalanceEnabled {
+                let currentGains = device.deviceWhiteBalanceGains
+                let tempTint = device.temperatureAndTintValues(for: currentGains)
+                wbKelvin = max(2000, min(10000, tempTint.temperature))
+                wbTint = tempTint.tint
+                isAutoWhiteBalanceEnabled = false
+                isAutoWhiteBalanceAdjusting = false
+                let clamped = clampWhiteBalanceGains(currentGains, for: device)
+                if device.isWhiteBalanceModeSupported(.locked) {
+                    device.setWhiteBalanceModeLocked(with: clamped)
+                }
+            }
 
-        // Lock focus at current position — no continuous AF during recording.
-        // Tap to focus still works (locks to tapped point), but the camera
-        // won't re-autofocus on its own.
-        if isAutoFocus {
-            let pos = device.lensPosition
-            // Set focusLensPosition BEFORE disabling auto focus so the didSet
-            // uses the current position instead of the default 0.5 (macro).
-            focusLensPosition = pos
-            isAutoFocus = false
-            isFocusLocked = true
-        }
+            // Lock focus at current position — no continuous AF during recording.
+            if isAutoFocus {
+                let pos = device.lensPosition
+                focusLensPosition = pos
+                isAutoFocus = false
+                isFocusLocked = true
+                if device.isFocusModeSupported(.locked) {
+                    device.setFocusModeLocked(lensPosition: pos)
+                }
+            }
 
-        applyManualExposureAndWB()
+            device.unlockForConfiguration()
+            updateWBParams(from: device)
+        } catch {
+            print("[CameraViewModel] lockAutoModesForRecording failed: \(error)")
+        }
     }
 
     func stopRecording() {
@@ -1485,13 +1513,17 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
         }
     }
 
-    /// Convert legacy SIMD4 LSC coefficients (R, Gr, Gb, B) to the expanded LSCParams.
+    /// Convert SIMD4 LSC coefficients (radial k1, radial k2, azimuth, unused) to LSCParams.
     nonisolated private static func simd4ToLSCParams(_ coeffs: SIMD4<Float>) -> LSCParams {
-        LSCParams(
-            radialR: coeffs[0],
-            radialG: (coeffs[1] + coeffs[2]) * 0.5,
-            radialB: coeffs[3],
-            radial4R: 0, radial4G: 0, radial4B: 0,
+        let r2 = coeffs[0]
+        let r4 = coeffs[1]
+        return LSCParams(
+            radialR: r2,
+            radialG: r2,
+            radialB: r2,
+            radial4R: r4,
+            radial4G: r4,
+            radial4B: r4,
             azimuthR: 0, azimuthG: 0, azimuthB: 0
         )
     }
@@ -1525,6 +1557,7 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
                 if abs(wbKelvin - temp) >= 25 {
                     wbKelvin = temp
                 }
+                wbTint = temperatureAndTint.tint
             }
             let isAdj = device.isAdjustingWhiteBalance
             if isAutoWhiteBalanceAdjusting != isAdj {

@@ -39,18 +39,19 @@ struct ScopesOverlay: View {
         }
     }
 
-    // Monochromatic histogram — all channels rendered as white at different opacities
+    // Cinema RGB Histogram — distinct red, green, and blue channels with additive color blending
     private var histogramCanvas: some View {
         Canvas { context, size in
-            drawHistogram(data.histogramRed, opacity: 0.35, context: &context, size: size)
-            drawHistogram(data.histogramGreen, opacity: 0.50, context: &context, size: size)
-            drawHistogram(data.histogramBlue, opacity: 0.25, context: &context, size: size)
+            context.blendMode = .plusLighter
+            drawHistogram(data.histogramRed, color: Color(red: 1.0, green: 0.25, blue: 0.25, opacity: 0.65), context: &context, size: size)
+            drawHistogram(data.histogramGreen, color: Color(red: 0.25, green: 0.88, blue: 0.35, opacity: 0.60), context: &context, size: size)
+            drawHistogram(data.histogramBlue, color: Color(red: 0.20, green: 0.55, blue: 1.0, opacity: 0.65), context: &context, size: size)
         }
     }
 
     private func drawHistogram(
         _ values: [Float],
-        opacity: Double,
+        color: Color,
         context: inout GraphicsContext,
         size: CGSize
     ) {
@@ -65,7 +66,7 @@ struct ScopesOverlay: View {
                 width: max(1, step - 0.5),
                 height: height
             )
-            context.fill(Path(rect), with: .color(Color.white.opacity(opacity)))
+            context.fill(Path(rect), with: .color(color))
         }
     }
 

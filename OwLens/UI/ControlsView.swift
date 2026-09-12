@@ -562,6 +562,36 @@ struct ControlsView: View {
                 autoLabel: "AUTO"
             )
 
+            // Metering Mode Selector
+            HStack(spacing: 10) {
+                Text("METER")
+                    .font(.geistMono(.semiBold, size: 10))
+                    .foregroundColor(OwLensTheme.textSecondary)
+                    .frame(width: 36, alignment: .leading)
+
+                HStack(spacing: 4) {
+                    ForEach(MeteringMode.allCases) { mode in
+                        let isSelected = viewModel.meteringMode == mode
+                        Button {
+                            Haptics.selection()
+                            viewModel.meteringMode = mode
+                        } label: {
+                            Text(mode.rawValue)
+                                .font(.geistMono(isSelected ? .semiBold : .regular, size: 9))
+                                .foregroundColor(isSelected ? .black : OwLensTheme.textSecondary)
+                                .padding(.horizontal, 8)
+                                .padding(.vertical, 4)
+                                .background(
+                                    Capsule(style: .continuous)
+                                        .fill(isSelected ? OwLensTheme.glassActive : OwLensTheme.glassBase)
+                                )
+                                .contentShape(Capsule())
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+            }
+
             VStack(spacing: 8) {
                 // ISO Stepped Stop Control
                 HStack(spacing: 10) {

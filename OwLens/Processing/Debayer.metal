@@ -305,12 +305,25 @@ kernel void debayerWBLinear(
     rgb *= params.wbGains;
     rgb = max(rgb, float3(0.0));
 
+    // ── Highlight Desaturation & Reconstruction ──
+    // When raw sensor channels clip (typically green first on Bayer sensors),
+    // WB gains multiply red/blue channels to ~2x while green stays pinned at 1.0,
+    // causing severe magenta/pink highlights. Smoothly desaturate chroma towards
+    // peak highlight luminance as raw levels approach clipping (> 0.88), rolling off
+    // into clean, neutral white highlights.
+    float maxRaw = max(r, max(g, b));
+    if (maxRaw > 0.88f) {
+        float desat = smoothstep(0.88f, 0.98f, maxRaw);
+        float peakVal = max(rgb.r, max(rgb.g, rgb.b));
+        rgb = mix(rgb, float3(peakVal), desat);
+    }
+
     // ── Color Correction Matrix (Sensor Native → Target Gamut e.g. BT.2020) ──
     rgb = colorMatrix * rgb;
     rgb = max(rgb, float3(0.0));
 
     // Clipping flag on raw demosaiced values (sensor saturation)
-    bool isClipped = (r >= 0.99 || g >= 0.99 || b >= 0.99);
+    bool isClipped = (r >= 0.98 || g >= 0.98 || b >= 0.98);
     float alpha = isClipped ? 0.0 : 1.0;
 
     // Output scene-linear RGB (NO log curve)
@@ -404,12 +417,22 @@ kernel void debayerFusedLog(
     rgb *= params.wbGains;
     rgb = max(rgb, float3(0.0));
 
+    // ── Highlight Desaturation & Reconstruction ──
+    // Smoothly desaturate chroma towards peak highlight luminance as raw levels approach
+    // clipping (> 0.88), preventing pink/magenta cast on clipped highlights.
+    float maxRaw = max(r, max(g, b));
+    if (maxRaw > 0.88f) {
+        float desat = smoothstep(0.88f, 0.98f, maxRaw);
+        float peakVal = max(rgb.r, max(rgb.g, rgb.b));
+        rgb = mix(rgb, float3(peakVal), desat);
+    }
+
     // ── Color Correction Matrix (Sensor Native → Target Gamut e.g. BT.2020) ──
     rgb = colorMatrix * rgb;
     rgb = max(rgb, float3(0.0));
 
     // Clipping flag on raw demosaiced values (sensor saturation)
-    bool isClipped = (r >= 0.99 || g >= 0.99 || b >= 0.99);
+    bool isClipped = (r >= 0.98 || g >= 0.98 || b >= 0.98);
     float alpha = isClipped ? 0.0 : 1.0;
 
     // ── Direct Log OETF Encoding with Filmic Highlight Shoulder ──
@@ -564,35 +587,51 @@ fragment float4 displayFragment(
         finalColor = pow(saturate(rgb709), float3(1.0f / 2.2f));
     }
 
-    finalColor = mix(finalColor, float3(1.0, 0.0, 0.0), applyRed);
-    float overlayAlpha = (overlayOnly > 0 && applyRed > 0.0) ? 0.75 : 0.0;
+    // ── Cinema Diagonal Zebra Stripes for Highlight Clipping ──
+    // Replaces solid opaque red blob with 45-degree diagonal zebra stripes
+    // so camera operators can monitor clipping while seeing scene details underneath.
+    float overlayAlpha = 0.0f;
+    if (showClipping > 0 && isClipped > 0.5f) {
+        float stripe = step(0.5f, fract((in.position.x + in.position.y) / 14.0f));
+        finalColor = mix(finalColor, float3(1.0f, 0.15f, 0.15f), stripe * 0.85f);
+        overlayAlpha = 0.75f;
+    }
     
+    // ── Cinema 3x3 Sobel Focus Peaking ──
+    // Uses horizontal and vertical luminance gradients to detect sharp optical edges
+    // with smooth thresholding, delivering clean neon green outlines on in-focus subjects.
     if (showFocusPeaking > 0) {
-        // Lightweight edge detection (Laplacian approximation)
-        float2 texel = 1.0 / float2(tex.get_width(), tex.get_height());
+        float2 texel = 1.0f / float2(tex.get_width(), tex.get_height());
+        constexpr float3 lumaW = float3(0.2126f, 0.7152f, 0.0722f);
         
-        float c = (color.r + color.g + color.b) / 3.0;
-        float top = (tex.sample(s, uv + float2(0, -texel.y)).r + tex.sample(s, uv + float2(0, -texel.y)).g + tex.sample(s, uv + float2(0, -texel.y)).b) / 3.0;
-        float bottom = (tex.sample(s, uv + float2(0, texel.y)).r + tex.sample(s, uv + float2(0, texel.y)).g + tex.sample(s, uv + float2(0, texel.y)).b) / 3.0;
-        float left = (tex.sample(s, uv + float2(-texel.x, 0)).r + tex.sample(s, uv + float2(-texel.x, 0)).g + tex.sample(s, uv + float2(-texel.x, 0)).b) / 3.0;
-        float right = (tex.sample(s, uv + float2(texel.x, 0)).r + tex.sample(s, uv + float2(texel.x, 0)).g + tex.sample(s, uv + float2(texel.x, 0)).b) / 3.0;
-        
-        float edge = abs(top + bottom + left + right - 4.0 * c);
-        
-        // Threshold for edge detection
-        if (edge > 0.05) {
-            finalColor = float3(0.0, 1.0, 0.0); // Bright Green
-            overlayAlpha = 1.0;
+        float tl = dot(tex.sample(s, uv + float2(-texel.x, -texel.y)).rgb, lumaW);
+        float tc = dot(tex.sample(s, uv + float2( 0.0f,    -texel.y)).rgb, lumaW);
+        float tr = dot(tex.sample(s, uv + float2( texel.x, -texel.y)).rgb, lumaW);
+        float ml = dot(tex.sample(s, uv + float2(-texel.x,  0.0f)).rgb,    lumaW);
+        float mr = dot(tex.sample(s, uv + float2( texel.x,  0.0f)).rgb,    lumaW);
+        float bl = dot(tex.sample(s, uv + float2(-texel.x,  texel.y)).rgb, lumaW);
+        float bc = dot(tex.sample(s, uv + float2( 0.0f,     texel.y)).rgb, lumaW);
+        float br = dot(tex.sample(s, uv + float2( texel.x,  texel.y)).rgb, lumaW);
+
+        float gx = (tr + 2.0f * mr + br) - (tl + 2.0f * ml + bl);
+        float gy = (bl + 2.0f * bc + br) - (tl + 2.0f * tc + tr);
+        float edgeMag = length(float2(gx, gy));
+
+        float peakStrength = smoothstep(0.06f, 0.14f, edgeMag);
+        if (peakStrength > 0.0f) {
+            float3 peakColor = float3(0.0f, 1.0f, 0.2f); // Cinema Neon Green
+            finalColor = mix(finalColor, peakColor, peakStrength * 0.90f);
+            overlayAlpha = max(overlayAlpha, peakStrength);
         }
     }
     
     if (overlayOnly > 0) {
-        if (overlayAlpha <= 0.0) {
-            return float4(0.0, 0.0, 0.0, 0.0);
+        if (overlayAlpha <= 0.0f) {
+            return float4(0.0f, 0.0f, 0.0f, 0.0f);
         }
         return float4(finalColor, overlayAlpha);
     }
-    return float4(finalColor, 1.0);
+    return float4(finalColor, 1.0f);
 }
 
 // ──────────────────────────────────────────────────────────────────────

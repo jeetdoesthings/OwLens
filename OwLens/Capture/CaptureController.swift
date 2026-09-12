@@ -3,6 +3,14 @@ import CoreVideo
 import QuartzCore
 import simd
 
+/// Exposure metering modes supported by the camera pipeline.
+enum MeteringMode: String, CaseIterable, Identifiable, Sendable {
+    case matrix = "MATRIX"
+    case centerWeighted = "CENTER"
+    case spot = "SPOT"
+    var id: String { rawValue }
+}
+
 /// Metadata extracted from each RAW photo capture.
 /// `pixelBuffer` is always an **owned copy** so the capture pipeline can start the next still immediately.
 struct RawFrameData {
@@ -864,6 +872,23 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
         }
     }
 
+    func setMeteringMode(_ mode: MeteringMode, at point: CGPoint? = nil) {
+        guard let device = activeDevice ?? AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back) else { return }
+        guard device.isExposurePointOfInterestSupported else { return }
+        do {
+            try device.lockForConfiguration()
+            switch mode {
+            case .matrix, .centerWeighted:
+                device.exposurePointOfInterest = CGPoint(x: 0.5, y: 0.5)
+            case .spot:
+                device.exposurePointOfInterest = point ?? CGPoint(x: 0.5, y: 0.5)
+            }
+            device.unlockForConfiguration()
+        } catch {
+            print("[CaptureController] Failed to set metering mode: \(error)")
+        }
+    }
+
     // MARK: - Session Lifecycle
 
     func startSession() {
@@ -1135,9 +1160,19 @@ extension CaptureController: AVCapturePhotoCaptureDelegate {
         let black = levels.0
         let white = levels.1
 
-        // Disable hardcoded LSC polynomial. Hardcoding 0.35 across all iPhones/lenses
-        // will cause severe vignette under/over correction. (Phase 2 feature pending).
-        let lsc = SIMD4<Float>(0.0, 0.0, 0.0, 0.0)
+        // Radial Lens Shading Correction (LSC) to eliminate optical vignetting falloff:
+        // Wide (24mm): ~1.4x corner compensation (k1=0.65, k2=0.35)
+        // Ultra-wide (13mm): ~1.65x corner compensation (k1=0.85, k2=0.50)
+        // Telephoto (77mm+): ~1.2x corner compensation (k1=0.40, k2=0.20)
+        let lsc: SIMD4<Float>
+        switch device?.deviceType {
+        case .builtInUltraWideCamera:
+            lsc = SIMD4<Float>(0.85, 0.50, 0.0, 0.0)
+        case .builtInTelephotoCamera:
+            lsc = SIMD4<Float>(0.40, 0.20, 0.0, 0.0)
+        default:
+            lsc = SIMD4<Float>(0.65, 0.35, 0.0, 0.0)
+        }
 
         let currentKelvin = device.map { dev -> Float in
             let gains = dev.deviceWhiteBalanceGains
