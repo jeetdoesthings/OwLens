@@ -93,15 +93,12 @@ struct GridLevelOverlay: View {
                 .strokeBorder(isLevel ? Color.white : Color.white.opacity(0.5), lineWidth: 1)
                 .frame(width: 10, height: 10)
 
-            // Tilt degree readout pill
+            // Tilt degree readout (clean text only, no box wrapping)
             Text(String(format: "%+.1f°", tilt))
-                .font(.geistMono(.medium, size: 9))
+                .font(.geistMono(.medium, size: 10))
                 .foregroundColor(levelColor)
-                .padding(.horizontal, 7)
-                .padding(.vertical, 3)
-                .background(OwLensTheme.glassBaseHeavy)
-                .glassPill(customBorder: levelColor.opacity(0.25))
-                .offset(y: 24)
+                .shadow(color: Color.black.opacity(0.6), radius: 2, x: 0, y: 1)
+                .offset(y: 20)
         }
     }
 }
