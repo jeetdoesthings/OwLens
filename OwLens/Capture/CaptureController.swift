@@ -1377,6 +1377,14 @@ extension CaptureController: AVCapturePhotoCaptureDelegate {
         case let d as Double: return Float(d)
         case let i as Int: return Float(i)
         case let n as NSNumber: return n.floatValue
+        case let str as String:
+            let trimmed = str.trimmingCharacters(in: .whitespacesAndNewlines)
+            if let direct = Float(trimmed) { return direct }
+            let parts = trimmed.split(separator: "/")
+            if parts.count == 2, let num = Float(parts[0]), let den = Float(parts[1]), abs(den) > 1e-6 {
+                return num / den
+            }
+            return nil
         case let arr as [Any]: return floatFromAny(arr.first)
         default: return nil
         }

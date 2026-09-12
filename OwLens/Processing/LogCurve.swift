@@ -96,13 +96,21 @@ enum LogCurve {
     /// Perfectly preserves 100% linear calibration for midtones & shadows (r <= rKnee),
     /// while smoothly rolling off highlights up to the container ceiling.
     static func applyHighlightShoulder(_ r: Float, rKnee: Float = 0.36, rMax: Float = 10.0) -> Float {
+        guard rMax > rKnee + 1e-4 else { return r }
         if r <= rKnee {
             return r
         }
-        let delta = max(rMax - rKnee, 1e-4)
-        let p = (1.0 - rKnee) / delta
-        let t = simd_clamp((r - rKnee) / max(1.0 - rKnee, 1e-4), 0.0, 1.0)
-        return rKnee + delta * (1.0 - pow(max(1.0 - t, 0.0), p))
+        let delta = rMax - rKnee
+        let dr = 1.0 - rKnee
+        let s0 = dr / delta
+        let s1: Float = 2.0
+        let a = s1 + s0 - 2.0
+        let b = 3.0 - 2.0 * s0 - s1
+        let c = s0
+
+        let t = simd_clamp((r - rKnee) / max(dr, 1e-4), 0.0, 1.0)
+        let g = ((a * t + b) * t + c) * t
+        return rKnee + delta * g
     }
 
     static func apply(_ rgb: SIMD3<Float>, type: LogCurveType, headroomScale: Float = 1.0) -> SIMD3<Float> {

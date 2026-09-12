@@ -198,6 +198,9 @@ struct CameraPreviewView: UIViewRepresentable {
                 
                 var lut: Int32 = showDisplayLUT ? 1 : 0
                 renderEncoder.setFragmentBytes(&lut, length: MemoryLayout<Int32>.size, index: 5)
+
+                var curve: Int32 = Int32(metalPipeline.curveType.rawValue)
+                renderEncoder.setFragmentBytes(&curve, length: MemoryLayout<Int32>.size, index: 6)
                 
                 // Draw full-screen triangle
                 renderEncoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)

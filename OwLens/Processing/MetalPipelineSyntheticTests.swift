@@ -274,19 +274,39 @@ extension MetalPipeline {
             print("[HighlightShoulderTest] FAIL knee not identity: \(knee)")
             passed = false
         }
-        // 2. Sensor clipping (1.0) must reach rMax (10.0)
+
+        // 2. Monotonicity & Smooth Roll-off across intermediate highlight values
+        let sampleInputs: [Float] = [0.36, 0.50, 0.70, 0.90, 0.95, 0.99, 1.00]
+        var lastR: Float = 0.0
+        for r in sampleInputs {
+            let R = LogCurve.applyHighlightShoulder(r, rKnee: 0.36, rMax: 10.0)
+            if R <= lastR && r > 0.36 {
+                print("[HighlightShoulderTest] FAIL non-monotonic at r=\(r): R=\(R) <= lastR=\(lastR)")
+                passed = false
+            }
+            lastR = R
+        }
+
+        // 3. Verify no cliff at 0.99: R(0.99) should smoothly reach > 9.0 (not compressed to ~2.6)
+        let r99 = LogCurve.applyHighlightShoulder(0.99, rKnee: 0.36, rMax: 10.0)
+        if r99 < 9.0 {
+            print("[HighlightShoulderTest] FAIL highlight cliff at 0.99: got \(r99), expected > 9.0")
+            passed = false
+        }
+
+        // 4. Sensor clipping (1.0) must reach rMax (10.0)
         let maxVal = LogCurve.applyHighlightShoulder(1.0, rKnee: 0.36, rMax: 10.0)
         if abs(maxVal - 10.0) > 0.01 {
             print("[HighlightShoulderTest] FAIL max value: got \(maxVal), expected 10.0")
             passed = false
         }
-        // 3. Apple Log 2 encoded code value at sensor clipping must reach > 0.95
+        // 5. Apple Log 2 encoded code value at sensor clipping must reach > 0.95
         let codeAtClip = LogCurve.appleLog2Encode(maxVal)
         if codeAtClip < 0.95 {
             print("[HighlightShoulderTest] FAIL log code at clip too low: \(codeAtClip)")
             passed = false
         } else {
-            print("[HighlightShoulderTest] PASS: sensor clipping reaches Apple Log code \(codeAtClip)")
+            print("[HighlightShoulderTest] PASS: sensor clipping smoothly reaches Apple Log code \(codeAtClip) without cliffs")
         }
         return passed
     }
