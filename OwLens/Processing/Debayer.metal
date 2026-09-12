@@ -633,33 +633,33 @@ fragment float4 displayFragment(
     }
 
     // ── Cinema 3x3 Sobel Focus Peaking ──
-    // Uses resolution-adaptive multi-pixel sampling calibrated to display viewport,
-    // detecting sharp optical edges on in-focus subjects with crisp cinema neon green lines.
-    float3 peakColor = float3(0.0f, 1.0f, 0.2f); // Cinema Neon Green
+    // Minimal, ultra-precise cinema focus peaking that detects high-frequency optical
+    // edges on in-focus focal planes without flooding textures, surfaces, or noise.
+    float3 peakColor = float3(0.0f, 1.0f, 0.25f); // Cinema Neon Green
     float peakAlpha = 0.0f;
     if (showFocusPeaking > 0) {
-        // Step size calibrated to display pixels: spans ~3 screen pixels across the lens optical transition
-        float2 screenTexel = 1.0f / float2(destSize);
-        float2 rawTexel = 1.0f / float2(tex.get_width(), tex.get_height());
-        float2 stepSize = max(screenTexel * 1.5f, rawTexel * 2.0f);
+        // Tight single-pixel sampling at source texture resolution ensures
+        // only razor-sharp high spatial frequency transitions are captured.
+        float2 texel = 1.0f / float2(tex.get_width(), tex.get_height());
         constexpr float3 lumaW = float3(0.2126f, 0.7152f, 0.0722f);
 
-        float tl = dot(tex.sample(s, uv + float2(-stepSize.x, -stepSize.y)).rgb, lumaW);
-        float tc = dot(tex.sample(s, uv + float2( 0.0f,        -stepSize.y)).rgb, lumaW);
-        float tr = dot(tex.sample(s, uv + float2( stepSize.x,  -stepSize.y)).rgb, lumaW);
-        float ml = dot(tex.sample(s, uv + float2(-stepSize.x,   0.0f)).rgb,       lumaW);
-        float mr = dot(tex.sample(s, uv + float2( stepSize.x,   0.0f)).rgb,       lumaW);
-        float bl = dot(tex.sample(s, uv + float2(-stepSize.x,   stepSize.y)).rgb, lumaW);
-        float bc = dot(tex.sample(s, uv + float2( 0.0f,         stepSize.y)).rgb, lumaW);
-        float br = dot(tex.sample(s, uv + float2( stepSize.x,   stepSize.y)).rgb, lumaW);
+        float tl = dot(tex.sample(s, uv + float2(-texel.x, -texel.y)).rgb, lumaW);
+        float tc = dot(tex.sample(s, uv + float2( 0.0f,    -texel.y)).rgb, lumaW);
+        float tr = dot(tex.sample(s, uv + float2( texel.x, -texel.y)).rgb, lumaW);
+        float ml = dot(tex.sample(s, uv + float2(-texel.x,  0.0f)).rgb,    lumaW);
+        float mr = dot(tex.sample(s, uv + float2( texel.x,  0.0f)).rgb,    lumaW);
+        float bl = dot(tex.sample(s, uv + float2(-texel.x,  texel.y)).rgb, lumaW);
+        float bc = dot(tex.sample(s, uv + float2( 0.0f,     texel.y)).rgb, lumaW);
+        float br = dot(tex.sample(s, uv + float2( texel.x,  texel.y)).rgb, lumaW);
 
         float gx = (tr + 2.0f * mr + br) - (tl + 2.0f * ml + bl);
         float gy = (bl + 2.0f * bc + br) - (tl + 2.0f * tc + tr);
         float edgeMag = length(float2(gx, gy));
 
-        // Tuned for log-encoded scene contrast: rejects sensor noise while clearly outlining in-focus subjects
-        float peakStrength = smoothstep(0.028f, 0.080f, edgeMag);
-        peakAlpha = smoothstep(0.05f, 0.70f, peakStrength) * 0.95f;
+        // Minimalist threshold: rejects surfaces, soft gradients, and noise,
+        // delivering delicate hairline outlines strictly on critical focus edges.
+        float peakStrength = smoothstep(0.065f, 0.160f, edgeMag);
+        peakAlpha = peakStrength * peakStrength * 0.85f;
     }
 
     // If rendering ONLY HUD overlay graphics over the stock hardware camera preview:
