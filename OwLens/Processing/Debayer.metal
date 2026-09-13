@@ -27,18 +27,6 @@ struct WhiteBalanceParams {
 
 // (Removed unused sampleBayerValid)
 
-static inline float linearize(float raw, float black, float white) {
-    float denom = max(white - black, 1e-6);
-    return (raw - black) / denom; // Do NOT clamp negative noise here, let it average to zero during demosaic!
-}
-
-static inline float sampleBayerClamp(texture2d<float, access::read> tex, int x, int y, int dx, int dy, float black, float white) {
-    int nx = clamp(x + dx, 0, int(tex.get_width()) - 1);
-    int ny = clamp(y + dy, 0, int(tex.get_height()) - 1);
-    float v = tex.read(uint2(nx, ny)).r;
-    return linearize(v, black, white);
-}
-
 static inline float sampleBayerFast(texture2d<float, access::read> tex, int x, int y, int dx, int dy, float black, float invDenom) {
     int nx = clamp(x + dx, 0, int(tex.get_width()) - 1);
     int ny = clamp(y + dy, 0, int(tex.get_height()) - 1);
