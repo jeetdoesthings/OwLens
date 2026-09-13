@@ -263,50 +263,59 @@ extension MetalPipeline {
     /// Verifies that the highlight shoulder curve smoothly maps sensor clipping to full container headroom.
     static func runHighlightShoulderTest() -> Bool {
         var passed = true
-        // 1. Below knee (0.18 mid gray and 0.36 knee) must be strictly linear
-        let midGray = LogCurve.applyHighlightShoulder(0.18, rKnee: 0.36, rMax: 10.0)
-        if abs(midGray - 0.18) > 0.0001 {
-            print("[HighlightShoulderTest] FAIL mid gray not identity: \(midGray)")
+        let expGain: Float = 2.828427 // +1.5 EV baseline exposure compensation
+
+        // 1. Below knee (0.18 mid gray scene reflectance): mapped from sensor s = 0.18 / expGain
+        let sMidGray: Float = 0.18 / expGain
+        let rMidGray = LogCurve.applyHighlightShoulder(sMidGray, sKnee: 0.36, rMax: 12.0, exposureGain: expGain)
+        if abs(rMidGray - 0.18) > 0.0001 {
+            print("[HighlightShoulderTest] FAIL mid gray not mapped to 0.18: \(rMidGray)")
             passed = false
-        }
-        let knee = LogCurve.applyHighlightShoulder(0.36, rKnee: 0.36, rMax: 10.0)
-        if abs(knee - 0.36) > 0.0001 {
-            print("[HighlightShoulderTest] FAIL knee not identity: \(knee)")
-            passed = false
+        } else {
+            print("[HighlightShoulderTest] PASS mid gray: sensor \(sMidGray) -> R \(rMidGray)")
         }
 
-        // 2. Monotonicity & Smooth Roll-off across intermediate highlight values
+        // 2. Knee at s = 0.36 must equal 0.36 * expGain
+        let expectedKneeR = 0.36 * expGain
+        let rKnee = LogCurve.applyHighlightShoulder(0.36, sKnee: 0.36, rMax: 12.0, exposureGain: expGain)
+        if abs(rKnee - expectedKneeR) > 0.0001 {
+            print("[HighlightShoulderTest] FAIL knee not exact: got \(rKnee), expected \(expectedKneeR)")
+            passed = false
+        } else {
+            print("[HighlightShoulderTest] PASS knee: sensor 0.36 -> R \(rKnee)")
+        }
+
+        // 3. Monotonicity & Smooth Roll-off across intermediate highlight values
         let sampleInputs: [Float] = [0.36, 0.50, 0.70, 0.90, 0.95, 0.99, 1.00]
         var lastR: Float = 0.0
-        for r in sampleInputs {
-            let R = LogCurve.applyHighlightShoulder(r, rKnee: 0.36, rMax: 10.0)
-            if R <= lastR && r > 0.36 {
-                print("[HighlightShoulderTest] FAIL non-monotonic at r=\(r): R=\(R) <= lastR=\(lastR)")
+        for s in sampleInputs {
+            let R = LogCurve.applyHighlightShoulder(s, sKnee: 0.36, rMax: 12.0, exposureGain: expGain)
+            if R <= lastR && s > 0.36 {
+                print("[HighlightShoulderTest] FAIL non-monotonic at s=\(s): R=\(R) <= lastR=\(lastR)")
                 passed = false
             }
             lastR = R
         }
 
-        // 3. Verify no cliff at 0.99: R(0.99) should smoothly reach > 9.0 (not compressed to ~2.6)
-        let r99 = LogCurve.applyHighlightShoulder(0.99, rKnee: 0.36, rMax: 10.0)
-        if r99 < 9.0 {
-            print("[HighlightShoulderTest] FAIL highlight cliff at 0.99: got \(r99), expected > 9.0")
+        // 4. Sensor clipping (1.0) must reach rMax (12.0 for Apple Log, 10.0 for S-Log3)
+        let maxValApple = LogCurve.applyHighlightShoulder(1.0, sKnee: 0.36, rMax: 12.0, exposureGain: expGain)
+        if abs(maxValApple - 12.0) > 0.01 {
+            print("[HighlightShoulderTest] FAIL max value Apple Log: got \(maxValApple), expected 12.0")
+            passed = false
+        }
+        let maxValSLog = LogCurve.applyHighlightShoulder(1.0, sKnee: 0.36, rMax: 10.0, exposureGain: expGain)
+        if abs(maxValSLog - 10.0) > 0.01 {
+            print("[HighlightShoulderTest] FAIL max value S-Log3: got \(maxValSLog), expected 10.0")
             passed = false
         }
 
-        // 4. Sensor clipping (1.0) must reach rMax (10.0)
-        let maxVal = LogCurve.applyHighlightShoulder(1.0, rKnee: 0.36, rMax: 10.0)
-        if abs(maxVal - 10.0) > 0.01 {
-            print("[HighlightShoulderTest] FAIL max value: got \(maxVal), expected 10.0")
-            passed = false
-        }
-        // 5. Apple Log 2 encoded code value at sensor clipping must reach > 0.95
-        let codeAtClip = LogCurve.appleLog2Encode(maxVal)
-        if codeAtClip < 0.95 {
-            print("[HighlightShoulderTest] FAIL log code at clip too low: \(codeAtClip)")
+        // 5. Apple Log 2 encoded code value at sensor clipping must reach 1.0 (1023 code value)
+        let codeAtClip = LogCurve.appleLog2Encode(maxValApple)
+        if abs(codeAtClip - 1.0) > 0.001 {
+            print("[HighlightShoulderTest] FAIL log code at clip not 1.0: \(codeAtClip)")
             passed = false
         } else {
-            print("[HighlightShoulderTest] PASS: sensor clipping smoothly reaches Apple Log code \(codeAtClip) without cliffs")
+            print("[HighlightShoulderTest] PASS: sensor clipping smoothly reaches Apple Log code \(codeAtClip) (100% container capacity)")
         }
         return passed
     }

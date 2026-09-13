@@ -25,6 +25,7 @@ struct RawFrameData {
     let exposureDurationSeconds: Double
     let colorMatrix: simd_float3x3?
     let sgamutMatrix: simd_float3x3?
+    let baselineExposure: Float
 }
 
 final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
@@ -1201,7 +1202,8 @@ extension CaptureController: AVCapturePhotoCaptureDelegate {
             iso: currentISO,
             exposureDurationSeconds: device?.exposureDuration.seconds ?? 0,
             colorMatrix: colorMatrices.bt2020,
-            sgamutMatrix: colorMatrices.sgamut
+            sgamutMatrix: colorMatrices.sgamut,
+            baselineExposure: extractBaselineExposure(from: photo)
         )
 
         onRawFrameData?(frameData)
@@ -1365,6 +1367,21 @@ extension CaptureController: AVCapturePhotoCaptureDelegate {
             white = 16383.0 / fullScale
         }
         return (black, white)
+    }
+
+    private func extractBaselineExposure(from photo: AVCapturePhoto) -> Float {
+        let metadata = photo.metadata
+        if let dng = metadata["{DNG}"] as? [String: Any],
+           let be = Self.floatFromMetadata(dng["BaselineExposure"]) {
+            return be
+        }
+        if let tiff = metadata["{TIFF}"] as? [String: Any],
+           let be = Self.floatFromMetadata(tiff["BaselineExposure"]) {
+            return be
+        }
+        // Calibrated iPhone baseline exposure in .photo mode (+1.5 EV = 2.828x multiplier)
+        // Bridges the gap between stills Smart HDR highlight preservation and broadcast video mid-gray.
+        return 1.5
     }
 
     private static func floatFromMetadata(_ value: Any?) -> Float? {

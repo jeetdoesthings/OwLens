@@ -62,11 +62,13 @@ struct FusedParams {
     var lscCoefficients: SIMD4<Float>
     var greenBalance: Float
     var headroomScale: Float
+    var exposureGain: Float
 }
 
 struct LogOnlyParams {
     var curveType: Int32
     var headroomScale: Float
+    var exposureGain: Float
 }
 
 struct LSCParams {
@@ -214,11 +216,15 @@ final class MetalPipeline: @unchecked Sendable {
     private var pixelBufferPool: CVPixelBufferPool?
     private var pixelBufferPoolW: Int = 0
     private var pixelBufferPoolH: Int = 0
+    private var pixelBufferPoolPixelFormat: OSType = 0
 
     var curveType: LogCurveType = .sLog3Approx
-    /// Scene reflectance headroom multiplier (e.g. 10.0 for Apple Log 2 / S-Log3).
+    /// Scene reflectance headroom multiplier (e.g. 12.0 for Apple Log 2, 10.0 for S-Log3).
     /// Maps sensor clipping to the top of the log container with a filmic highlight shoulder.
-    var headroomScale: Float = 10.0
+    var headroomScale: Float = 12.0
+    /// Photometric baseline exposure compensation in EV (from DNG/TIFF metadata).
+    /// Typically +1.5 EV (2.828x multiplier) for iPhone camera in .photo capture mode.
+    var baselineExposure: Float = 1.5
     var wbParams: WhiteBalanceParams = .identity
     var bayerPattern: Int32 = 0
     var blackLevel: Float = 0
@@ -541,9 +547,10 @@ final class MetalPipeline: @unchecked Sendable {
     }
 
     private func getOrCreatePixelBuffer(width: Int, height: Int) -> CVPixelBuffer? {
-        if pixelBufferPool == nil || pixelBufferPoolW != width || pixelBufferPoolH != height {
+        let pixelFormat: OSType = (curveType == .linear) ? kCVPixelFormatType_32BGRA : kCVPixelFormatType_64RGBAHalf
+        if pixelBufferPool == nil || pixelBufferPoolW != width || pixelBufferPoolH != height || pixelBufferPoolPixelFormat != pixelFormat {
             let attrs: [String: Any] = [
-                kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+                kCVPixelBufferPixelFormatTypeKey as String: pixelFormat,
                 kCVPixelBufferWidthKey as String: width,
                 kCVPixelBufferHeightKey as String: height,
                 kCVPixelBufferMetalCompatibilityKey as String: true,
@@ -563,6 +570,7 @@ final class MetalPipeline: @unchecked Sendable {
             pixelBufferPool = pool
             pixelBufferPoolW = width
             pixelBufferPoolH = height
+            pixelBufferPoolPixelFormat = pixelFormat
         }
 
         guard let pixelBufferPool else { return nil }
@@ -680,6 +688,7 @@ final class MetalPipeline: @unchecked Sendable {
                 enc.setComputePipelineState(debayerFusedPipeline)
                 enc.setTexture(bayerIn, index: 0)
                 enc.setTexture(fusedOut, index: 1)
+                let exposureGain: Float = (curveType == .linear) ? 1.0 : pow(2.0, baselineExposure)
                 var params = FusedParams(
                     bayerPattern: bayerPattern,
                     blackLevel: blackLevel,
@@ -688,7 +697,8 @@ final class MetalPipeline: @unchecked Sendable {
                     wbGains: wbParams.gains,
                     lscCoefficients: lscCoefficients,
                     greenBalance: greenBalance,
-                    headroomScale: curveType == .linear ? 1.0 : headroomScale
+                    headroomScale: curveType == .linear ? 1.0 : headroomScale,
+                    exposureGain: exposureGain
                 )
                 enc.setBytes(&params, length: MemoryLayout<FusedParams>.stride, index: 0)
                 enc.setBytes(&lscParams, length: MemoryLayout<LSCParams>.stride, index: 1)
@@ -732,7 +742,8 @@ final class MetalPipeline: @unchecked Sendable {
                     wbGains: wbParams.gains,
                     lscCoefficients: lscCoefficients,
                     greenBalance: greenBalance,
-                    headroomScale: 1.0
+                    headroomScale: 1.0,
+                    exposureGain: 1.0
                 )
                 enc.setBytes(&params, length: MemoryLayout<FusedParams>.stride, index: 0)
                 enc.setBytes(&lscParams, length: MemoryLayout<LSCParams>.stride, index: 1)
@@ -914,9 +925,11 @@ final class MetalPipeline: @unchecked Sendable {
                 enc.setComputePipelineState(logOnlyPipeline)
                 enc.setTexture(postDenoiseTex, index: 0)
                 enc.setTexture(fusedOut, index: 1)
+                let exposureGain: Float = (curveType == .linear) ? 1.0 : pow(2.0, baselineExposure)
                 var logParams = LogOnlyParams(
                     curveType: Int32(curveType.rawValue),
-                    headroomScale: curveType == .linear ? 1.0 : headroomScale
+                    headroomScale: curveType == .linear ? 1.0 : headroomScale,
+                    exposureGain: exposureGain
                 )
                 enc.setBytes(&logParams, length: MemoryLayout<LogOnlyParams>.stride, index: 0)
                 dispatch(enc, width: bayerW, height: bayerH, state: logOnlyPipeline)
@@ -925,14 +938,15 @@ final class MetalPipeline: @unchecked Sendable {
             outputTex = fusedOut
         }
 
-        // BGRA pixel buffer for recording (AVAssetWriter expects 32BGRA)
+        // Frame pixel buffer for recording (64RGBAHalf for 10-bit HEVC, 32BGRA for 8-bit linear)
         var bgraOut: CVPixelBuffer?
         var bgraTex: MTLTexture?
         if encodeAsBGRA {
             bgraOut = getOrCreatePixelBuffer(width: encodeWidth, height: encodeHeight)
             if let bgraPB = bgraOut, let texCache = textureCache {
+                let mtlFormat: MTLPixelFormat = (curveType == .linear) ? .bgra8Unorm : .rgba16Float
                 var cvTexOut: CVMetalTexture?
-                CVMetalTextureCacheCreateTextureFromImage(nil, texCache, bgraPB, nil, .bgra8Unorm, encodeWidth, encodeHeight, 0, &cvTexOut)
+                CVMetalTextureCacheCreateTextureFromImage(nil, texCache, bgraPB, nil, mtlFormat, encodeWidth, encodeHeight, 0, &cvTexOut)
                 if let cvTex = cvTexOut {
                     bgraTex = CVMetalTextureGetTexture(cvTex)
                 }
@@ -1038,6 +1052,7 @@ final class MetalPipeline: @unchecked Sendable {
             enc.setComputePipelineState(debayerFusedPipeline)
             enc.setTexture(bayerIn, index: 0)
             enc.setTexture(logOut, index: 1)
+            let exposureGain: Float = (curveType == .linear) ? 1.0 : pow(2.0, baselineExposure)
             var params = FusedParams(
                 bayerPattern: bayerPattern,
                 blackLevel: blackLevel,
@@ -1046,7 +1061,8 @@ final class MetalPipeline: @unchecked Sendable {
                 wbGains: wbParams.gains,
                 lscCoefficients: lscCoefficients,
                 greenBalance: greenBalance,
-                headroomScale: curveType == .linear ? 1.0 : headroomScale
+                headroomScale: curveType == .linear ? 1.0 : headroomScale,
+                exposureGain: exposureGain
             )
             enc.setBytes(&params, length: MemoryLayout<FusedParams>.stride, index: 0)
             enc.setBytes(&lscParams, length: MemoryLayout<LSCParams>.stride, index: 1)
@@ -1069,14 +1085,15 @@ final class MetalPipeline: @unchecked Sendable {
             postLogTex = sharpenTex
         }
 
-        // BGRA output for recording (if requested)
+        // Frame pixel buffer for recording (if requested)
         var bgraOut: CVPixelBuffer?
         var bgraTex: MTLTexture?
         if encodeAsBGRA {
             bgraOut = getOrCreatePixelBuffer(width: encodeWidth, height: encodeHeight)
             if let bgraPB = bgraOut, let texCache = textureCache {
+                let mtlFormat: MTLPixelFormat = (curveType == .linear) ? .bgra8Unorm : .rgba16Float
                 var cvTexOut: CVMetalTexture?
-                CVMetalTextureCacheCreateTextureFromImage(nil, texCache, bgraPB, nil, .bgra8Unorm, encodeWidth, encodeHeight, 0, &cvTexOut)
+                CVMetalTextureCacheCreateTextureFromImage(nil, texCache, bgraPB, nil, mtlFormat, encodeWidth, encodeHeight, 0, &cvTexOut)
                 if let cvTex = cvTexOut {
                     bgraTex = CVMetalTextureGetTexture(cvTex)
                 }
@@ -1261,10 +1278,11 @@ final class MetalPipeline: @unchecked Sendable {
             return
         }
  
+        let mtlFormat: MTLPixelFormat = (curveType == .linear) ? .bgra8Unorm : .rgba16Float
         var cvTextureOut: CVMetalTexture?
         let cacheStatus = CVMetalTextureCacheCreateTextureFromImage(
             nil, textureCache, pb, nil,
-            .bgra8Unorm, width, height, 0, &cvTextureOut)
+            mtlFormat, width, height, 0, &cvTextureOut)
  
         guard cacheStatus == kCVReturnSuccess,
               let cvTex = cvTextureOut,

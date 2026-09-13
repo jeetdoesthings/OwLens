@@ -93,34 +93,37 @@ enum LogCurve {
     }
 
     /// Smooth filmic highlight shoulder mapping sensor linear [0, 1] to scene reflectance [0, rMax].
-    /// Perfectly preserves 100% linear calibration for midtones & shadows (r <= rKnee),
+    /// Perfectly preserves 100% linear calibration for midtones & shadows (s <= sKnee),
     /// while smoothly rolling off highlights up to the container ceiling.
-    static func applyHighlightShoulder(_ r: Float, rKnee: Float = 0.36, rMax: Float = 10.0) -> Float {
-        guard rMax > rKnee + 1e-4 else { return r }
-        if r <= rKnee {
-            return r
+    static func applyHighlightShoulder(_ s: Float, sKnee: Float = 0.36, rMax: Float = 10.0, exposureGain: Float = 1.0) -> Float {
+        let rKnee = sKnee * exposureGain
+        guard rMax > rKnee + 1e-4 else { return s * exposureGain }
+        if s <= sKnee {
+            return s * exposureGain
         }
-        let delta = rMax - rKnee
-        let dr = 1.0 - rKnee
-        let s0 = dr / delta
-        let s1: Float = 2.0
-        let a = s1 + s0 - 2.0
-        let b = 3.0 - 2.0 * s0 - s1
-        let c = s0
+        let deltaR = rMax - rKnee
+        let ds = 1.0 - sKnee
+        let m0 = (exposureGain * ds) / deltaR
+        let m1: Float = 0.0
+        let c3 = m0 + m1 - 2.0
+        let c2 = 3.0 - 2.0 * m0 - m1
+        let c1 = m0
 
-        let t = simd_clamp((r - rKnee) / max(dr, 1e-4), 0.0, 1.0)
-        let g = ((a * t + b) * t + c) * t
-        return rKnee + delta * g
+        let t = simd_clamp((s - sKnee) / max(ds, 1e-4), 0.0, 1.0)
+        let g = ((c3 * t + c2) * t + c1) * t
+        return rKnee + deltaR * g
     }
 
-    static func apply(_ rgb: SIMD3<Float>, type: LogCurveType, headroomScale: Float = 1.0) -> SIMD3<Float> {
+    static func apply(_ rgb: SIMD3<Float>, type: LogCurveType, headroomScale: Float = 1.0, exposureGain: Float = 1.0) -> SIMD3<Float> {
         var input = rgb
         if headroomScale > 1.0 && type != .linear {
             input = SIMD3(
-                applyHighlightShoulder(input.x, rMax: headroomScale),
-                applyHighlightShoulder(input.y, rMax: headroomScale),
-                applyHighlightShoulder(input.z, rMax: headroomScale)
+                applyHighlightShoulder(input.x, rMax: headroomScale, exposureGain: exposureGain),
+                applyHighlightShoulder(input.y, rMax: headroomScale, exposureGain: exposureGain),
+                applyHighlightShoulder(input.z, rMax: headroomScale, exposureGain: exposureGain)
             )
+        } else {
+            input *= exposureGain
         }
         switch type {
         case .linear:

@@ -32,6 +32,7 @@ final class VideoWriter: @unchecked Sendable {
     private var lastPixelBuffer: CVPixelBuffer?
     private var pendingAudioBuffers: [CMSampleBuffer] = []
     private let maxPendingAudioBuffers = 50
+    private var curveType: LogCurveType = .sLog3Approx
     private let lock = NSLock()
 
     var isRecording = false
@@ -65,6 +66,7 @@ final class VideoWriter: @unchecked Sendable {
         self.width = width
         self.height = height
         self.targetFPS = fps
+        self.curveType = curveType
 
         let profileLevel: String
         switch curveType {
@@ -83,38 +85,29 @@ final class VideoWriter: @unchecked Sendable {
             AVVideoAllowFrameReorderingKey: false as NSNumber
         ]
 
-        let colorProperties: [String: Any]
-        switch curveType {
-        case .linear:
-            colorProperties = [
-                AVVideoColorPrimariesKey: AVVideoColorPrimaries_ITU_R_709_2,
-                AVVideoTransferFunctionKey: AVVideoTransferFunction_ITU_R_709_2,
-                AVVideoYCbCrMatrixKey: AVVideoYCbCrMatrix_ITU_R_709_2
-            ]
-        case .appleLog2, .sLog3Approx:
-            colorProperties = [
-                AVVideoColorPrimariesKey: AVVideoColorPrimaries_ITU_R_2020,
-                AVVideoTransferFunctionKey: AVVideoTransferFunction_ITU_R_709_2,
-                AVVideoYCbCrMatrixKey: AVVideoYCbCrMatrix_ITU_R_2020
-            ]
-        }
-
         var videoSettings: [String: Any] = [
             AVVideoCodecKey: AVVideoCodecType.hevc,
             AVVideoWidthKey: width,
             AVVideoHeightKey: height,
-            AVVideoCompressionPropertiesKey: compression,
-            AVVideoColorPropertiesKey: colorProperties
+            AVVideoCompressionPropertiesKey: compression
         ]
+        if curveType == .linear {
+            videoSettings[AVVideoColorPropertiesKey] = [
+                AVVideoColorPrimariesKey: AVVideoColorPrimaries_ITU_R_709_2,
+                AVVideoTransferFunctionKey: AVVideoTransferFunction_ITU_R_709_2,
+                AVVideoYCbCrMatrixKey: AVVideoYCbCrMatrix_ITU_R_709_2
+            ]
+        }
 
         let vInput = AVAssetWriterInput(mediaType: .video, outputSettings: videoSettings)
         vInput.expectsMediaDataInRealTime = true
         vInput.mediaTimeScale = CMTimeScale(fps * 1000)
 
+        let pixelFormat: OSType = (curveType == .linear) ? kCVPixelFormatType_32BGRA : kCVPixelFormatType_64RGBAHalf
         let adaptor = AVAssetWriterInputPixelBufferAdaptor(
             assetWriterInput: vInput,
             sourcePixelBufferAttributes: [
-                kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+                kCVPixelBufferPixelFormatTypeKey as String: pixelFormat,
                 kCVPixelBufferWidthKey as String: width,
                 kCVPixelBufferHeightKey as String: height,
                 kCVPixelBufferMetalCompatibilityKey as String: true
@@ -210,6 +203,31 @@ final class VideoWriter: @unchecked Sendable {
         if pbW != width || pbH != height {
             droppedFrames += 1
             return false
+        }
+
+        // Attach color space & transfer characteristics to pixel buffer for VideoToolbox encoding
+        switch curveType {
+        case .appleLog2:
+            CVBufferSetAttachment(pixelBuffer, kCVImageBufferColorPrimariesKey, kCVImageBufferColorPrimaries_ITU_R_2020, .shouldPropagate)
+            CVBufferSetAttachment(pixelBuffer, kCVImageBufferYCbCrMatrixKey, kCVImageBufferYCbCrMatrix_ITU_R_2020, .shouldPropagate)
+            if #available(iOS 17.2, *) {
+                CVBufferSetAttachment(pixelBuffer, kCVImageBufferLogTransferFunctionKey, kCVImageBufferLogTransferFunction_AppleLog, .shouldPropagate)
+            } else {
+                CVBufferSetAttachment(pixelBuffer, "LogTransferFunction" as CFString, "com.apple.rec2020.apple-log" as CFString, .shouldPropagate)
+            }
+        case .sLog3Approx:
+            CVBufferSetAttachment(pixelBuffer, kCVImageBufferColorPrimariesKey, kCVImageBufferColorPrimaries_ITU_R_2020, .shouldPropagate)
+            CVBufferSetAttachment(pixelBuffer, kCVImageBufferYCbCrMatrixKey, kCVImageBufferYCbCrMatrix_ITU_R_2020, .shouldPropagate)
+            CVBufferRemoveAttachment(pixelBuffer, kCVImageBufferTransferFunctionKey)
+            if #available(iOS 17.2, *) {
+                CVBufferRemoveAttachment(pixelBuffer, kCVImageBufferLogTransferFunctionKey)
+            } else {
+                CVBufferRemoveAttachment(pixelBuffer, "LogTransferFunction" as CFString)
+            }
+        case .linear:
+            CVBufferSetAttachment(pixelBuffer, kCVImageBufferColorPrimariesKey, kCVImageBufferColorPrimaries_ITU_R_709_2, .shouldPropagate)
+            CVBufferSetAttachment(pixelBuffer, kCVImageBufferTransferFunctionKey, kCVImageBufferTransferFunction_ITU_R_709_2, .shouldPropagate)
+            CVBufferSetAttachment(pixelBuffer, kCVImageBufferYCbCrMatrixKey, kCVImageBufferYCbCrMatrix_ITU_R_709_2, .shouldPropagate)
         }
 
         let now = CACurrentMediaTime()

@@ -1363,6 +1363,7 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
         pipeline.bayerPattern = frameData.cfaPattern
         pipeline.blackLevel = frameData.blackLevel
         pipeline.whiteLevel = frameData.whiteLevel
+        pipeline.baselineExposure = frameData.baselineExposure
 
         // LSC: calibration > device table > frame default (live DNG).
         pipeline.lscParams = Self.simd4ToLSCParams(frameData.lscCoefficients)
@@ -1393,7 +1394,7 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
             pipeline.headroomScale = 1.0
         case .appleLog2:
             cMatrix = latestColorMatrix ?? WhiteBalanceParams.defaultSensorToBT2020
-            pipeline.headroomScale = 10.0
+            pipeline.headroomScale = 12.0
         case .sLog3Approx:
             cMatrix = latestSGamutMatrix ?? WhiteBalanceParams.defaultSensorToSGamut3Cine
             pipeline.headroomScale = 10.0

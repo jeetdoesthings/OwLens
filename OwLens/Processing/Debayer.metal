@@ -93,40 +93,43 @@ kernel void binBayerCFA(
 
 
 
-static inline float3 applyHighlightShoulder(float3 r, float rKnee, float rMax) {
-    if (rMax <= rKnee + 1e-4f) return r;
-    float delta = rMax - rKnee;
-    float dr = 1.0f - rKnee;
-    float s0 = dr / delta;
-    float s1 = 2.0f;
-    float a = s1 + s0 - 2.0f;
-    float b = 3.0f - 2.0f * s0 - s1;
-    float c = s0;
+static inline float3 applyHighlightShoulder(float3 s, float sKnee, float rMax, float exposureGain) {
+    float rKnee = sKnee * exposureGain;
+    if (rMax <= rKnee + 1e-4f) return s * exposureGain;
+    float deltaR = rMax - rKnee;
+    float ds = 1.0f - sKnee;
+    float m0 = (exposureGain * ds) / deltaR;
+    float m1 = 0.0f;
+    float c3 = m0 + m1 - 2.0f;
+    float c2 = 3.0f - 2.0f * m0 - m1;
+    float c1 = m0;
 
     float3 out;
     for (int i = 0; i < 3; i++) {
-        float val = r[i];
-        if (val <= rKnee) {
-            out[i] = val;
+        float val = s[i];
+        if (val <= sKnee) {
+            out[i] = val * exposureGain;
         } else {
-            float t = saturate((val - rKnee) / max(dr, 1e-4f));
-            float g = ((a * t + b) * t + c) * t;
-            out[i] = rKnee + delta * g;
+            float t = saturate((val - sKnee) / max(ds, 1e-4f));
+            float g = ((c3 * t + c2) * t + c1) * t;
+            out[i] = rKnee + deltaR * g;
         }
     }
     return out;
 }
 
-static inline float3 encodeLogCurve(float3 rgb, int curveType, float headroomScale = 1.0f) {
+static inline float3 encodeLogCurve(float3 rgb, int curveType, float headroomScale = 1.0f, float exposureGain = 1.0f) {
     if (curveType == 0) {
         return saturate(rgb);
     }
 
     // Apply filmic highlight shoulder when headroom expansion is active (e.g. headroomScale = 10.0–12.0)
-    // Preserves 100% linear calibration for midtones & shadows (r <= 0.36, 18% gray at 0.18)
-    // while smoothly rolling off highlights up to the container ceiling.
+    // Preserves 100% linear calibration for midtones & shadows (s <= 0.36, 18% gray at 0.18 scene reflectance)
+    // while smoothly rolling off highlights up to the container ceiling (R = headroomScale at sensor clipping s = 1.0).
     if (headroomScale > 1.0f) {
-        rgb = applyHighlightShoulder(rgb, 0.36f, headroomScale);
+        rgb = applyHighlightShoulder(rgb, 0.36f, headroomScale, exposureGain);
+    } else {
+        rgb *= exposureGain;
     }
 
     if (curveType == 3) {
@@ -172,6 +175,7 @@ static inline float3 encodeLogCurve(float3 rgb, int curveType, float headroomSca
 struct LogOnlyParams {
     int   curveType;
     float headroomScale;
+    float exposureGain;
 };
 
 kernel void applyLogOnly(
@@ -183,7 +187,7 @@ kernel void applyLogOnly(
     if (gid.x >= outTexture.get_width() || gid.y >= outTexture.get_height()) return;
 
     float4 pixel = inTexture.read(gid);
-    float3 result = encodeLogCurve(float3(pixel.r, pixel.g, pixel.b), params.curveType, params.headroomScale);
+    float3 result = encodeLogCurve(float3(pixel.r, pixel.g, pixel.b), params.curveType, params.headroomScale, params.exposureGain);
     outTexture.write(float4(result, pixel.a), gid);
 }
 
@@ -201,6 +205,7 @@ struct FusedParams {
     float4 lscCoefficients;
     float greenBalance;
     float headroomScale;  // Scene reflectance multiplier: sensor [0,1] → R [0, headroomScale]
+    float exposureGain;   // Photometric exposure calibration: 2^baselineExposure
 };
 
 struct LSCParams {
@@ -435,7 +440,7 @@ kernel void debayerFusedLog(
     float alpha = isClipped ? 0.0 : 1.0;
 
     // ── Direct Log OETF Encoding with Filmic Highlight Shoulder ──
-    float3 logRGB = encodeLogCurve(rgb, params.curveType, params.headroomScale);
+    float3 logRGB = encodeLogCurve(rgb, params.curveType, params.headroomScale, params.exposureGain);
 
     outTexture.write(float4(logRGB, alpha), gid);
 }
