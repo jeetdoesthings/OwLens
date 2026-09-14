@@ -2,6 +2,7 @@ import AVFoundation
 import CoreVideo
 import QuartzCore
 import simd
+import ImageIO
 
 /// Exposure metering modes supported by the camera pipeline.
 enum MeteringMode: String, CaseIterable, Identifiable, Sendable {
@@ -73,6 +74,8 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
     private var cachedISO: Float?
     private var cachedKelvin: Float?
     private var cachedColorMatrices: (bt2020: simd_float3x3?, sgamut: simd_float3x3?)?
+    private let dngLock = NSLock()
+    private var dngMetadataCache = [String: [String: Any]]()
 
     // MARK: - Session Configuration
 
@@ -1209,8 +1212,42 @@ extension CaptureController: AVCapturePhotoCaptureDelegate {
         onRawFrameData?(frameData)
     }
 
+    private func dngDictionary(for photo: AVCapturePhoto) -> [String: Any]? {
+        let deviceID = device?.uniqueID ?? "default"
+
+        if let direct = photo.metadata["{DNG}"] as? [String: Any] {
+            dngLock.lock()
+            dngMetadataCache[deviceID] = direct
+            dngLock.unlock()
+            return direct
+        }
+
+        dngLock.lock()
+        let cached = dngMetadataCache[deviceID]
+        dngLock.unlock()
+        if let cached { return cached }
+
+        guard let data = photo.fileDataRepresentation(),
+              let source = CGImageSourceCreateWithData(data as CFData, nil) else {
+            return nil
+        }
+        let idxProps = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [String: Any]
+        let topProps = CGImageSourceCopyProperties(source, nil) as? [String: Any]
+        guard let dng = (idxProps?["{DNG}"] as? [String: Any])
+                   ?? (topProps?["{DNG}"] as? [String: Any])
+                   ?? (idxProps?["DNG"] as? [String: Any]) else {
+            return nil
+        }
+
+        dngLock.lock()
+        dngMetadataCache[deviceID] = dng
+        dngLock.unlock()
+        print("[CaptureController] Successfully extracted DNG metadata for \(deviceID): keys=\(Array(dng.keys))")
+        return dng
+    }
+
     private func extractColorMatrices(from photo: AVCapturePhoto, kelvin: Float? = nil) -> (bt2020: simd_float3x3?, sgamut: simd_float3x3?) {
-        guard let dng = photo.metadata["{DNG}"] as? [String: Any] else { return (nil, nil) }
+        guard let dng = dngDictionary(for: photo) else { return (nil, nil) }
 
         // Standard CIE XYZ D50 to ITU-R BT.2020 (D65) matrix (CIE XYZ D65 -> BT.2020 * Bradford D50 -> D65):
         let mD50to2020 = simd_float3x3(
@@ -1342,8 +1379,7 @@ extension CaptureController: AVCapturePhotoCaptureDelegate {
             // But realistically, if DNG metadata exists, it overrides this anyway.
         }
 
-        let metadata = photo.metadata
-        if let dng = metadata["{DNG}"] as? [String: Any] {
+        if let dng = dngDictionary(for: photo) {
             if let bl = Self.floatFromMetadata(dng["BlackLevel"]) {
                 blackRaw = bl
             } else if let bls = dng["BlackLevel"] as? [Any], let first = Self.floatFromAny(bls.first) {
@@ -1356,6 +1392,7 @@ extension CaptureController: AVCapturePhotoCaptureDelegate {
             }
         }
 
+        let metadata = photo.metadata
         if blackRaw == 0, let tiff = metadata["{TIFF}"] as? [String: Any],
            let bl = Self.floatFromMetadata(tiff["BlackLevel"]) {
             blackRaw = bl
@@ -1370,11 +1407,11 @@ extension CaptureController: AVCapturePhotoCaptureDelegate {
     }
 
     private func extractBaselineExposure(from photo: AVCapturePhoto) -> Float {
-        let metadata = photo.metadata
-        if let dng = metadata["{DNG}"] as? [String: Any],
+        if let dng = dngDictionary(for: photo),
            let be = Self.floatFromMetadata(dng["BaselineExposure"]) {
             return be
         }
+        let metadata = photo.metadata
         if let tiff = metadata["{TIFF}"] as? [String: Any],
            let be = Self.floatFromMetadata(tiff["BaselineExposure"]) {
             return be
@@ -1409,8 +1446,9 @@ extension CaptureController: AVCapturePhotoCaptureDelegate {
 
     private func extractCFAPattern(from photo: AVCapturePhoto) -> Int32? {
         let metadata = photo.metadata
+        let dng = dngDictionary(for: photo)
         let cfaArray: [Int]? = {
-            if let dng = metadata["{DNG}"] as? [String: Any] { return Self.intArray(from: dng["CFAPattern"]) }
+            if let dng { return Self.intArray(from: dng["CFAPattern"]) }
             if let tiff = metadata["{TIFF}"] as? [String: Any] { return Self.intArray(from: tiff["CFAPattern"]) }
             if let exif = metadata["{Exif}"] as? [String: Any] { return Self.intArray(from: exif["CFAPattern"]) }
             return nil
