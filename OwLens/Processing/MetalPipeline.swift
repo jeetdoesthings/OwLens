@@ -133,6 +133,7 @@ final class MetalPipeline: @unchecked Sendable {
     private let logOnlyPipeline: MTLComputePipelineState
     private let debayerFusedPipeline: MTLComputePipelineState
     private let convertFormatPipeline: MTLComputePipelineState
+    private let convertYpCbCr10Pipeline: MTLComputePipelineState
     private let unsharpPipeline: MTLComputePipelineState
     private let lumaStatsPipeline: MTLComputePipelineState
     private let defectPixelPipeline: MTLComputePipelineState
@@ -214,11 +215,11 @@ final class MetalPipeline: @unchecked Sendable {
     private var pixelBufferPool: CVPixelBufferPool?
     private var pixelBufferPoolW: Int = 0
     private var pixelBufferPoolH: Int = 0
+    private var pixelBufferPoolFormat: OSType = 0
 
     var curveType: LogCurveType = .sLog3Approx
-    /// Scene reflectance headroom multiplier (e.g. 10.0 for Apple Log 2 / S-Log3).
-    /// Maps sensor clipping to the top of the log container with a filmic highlight shoulder.
-    var headroomScale: Float = 10.0
+    /// Scene reflectance headroom multiplier (1.0 for standard normalized scene reflectance [0, 1]).
+    var headroomScale: Float = 1.0
     var wbParams: WhiteBalanceParams = .identity
     var bayerPattern: Int32 = 0
     var blackLevel: Float = 0
@@ -272,6 +273,7 @@ final class MetalPipeline: @unchecked Sendable {
               let logOnlyFunc = library.makeFunction(name: "applyLogOnly"),
               let debayerFusedFunc = library.makeFunction(name: "debayerFusedLog"),
               let convertFormatFunc = library.makeFunction(name: "convertRgba16FloatToBgra8"),
+              let convertYpCbCr10Func = library.makeFunction(name: "convertRgbTo420YpCbCr10"),
               let lumaStatsFunc = library.makeFunction(name: "estimateLumaVariance"),
               let defectPixelFunc = library.makeFunction(name: "correctDefectPixelsBayer"),
               let storeLumaHistoryFunc = library.makeFunction(name: "storeLumaHistory"),
@@ -298,6 +300,7 @@ final class MetalPipeline: @unchecked Sendable {
             self.logOnlyPipeline = try device.makeComputePipelineState(function: logOnlyFunc)
             self.debayerFusedPipeline = try device.makeComputePipelineState(function: debayerFusedFunc)
             self.convertFormatPipeline = try device.makeComputePipelineState(function: convertFormatFunc)
+            self.convertYpCbCr10Pipeline = try device.makeComputePipelineState(function: convertYpCbCr10Func)
             self.lumaStatsPipeline = try device.makeComputePipelineState(function: lumaStatsFunc)
             self.defectPixelPipeline = try device.makeComputePipelineState(function: defectPixelFunc)
             self.storeLumaHistoryPipeline = try device.makeComputePipelineState(function: storeLumaHistoryFunc)
@@ -498,6 +501,11 @@ final class MetalPipeline: @unchecked Sendable {
         pooledRawW = 0
         pooledRawH = 0
 
+        pixelBufferPool = nil
+        pixelBufferPoolW = 0
+        pixelBufferPoolH = 0
+        pixelBufferPoolFormat = 0
+
         if let cache = textureCache {
             CVMetalTextureCacheFlush(cache, 0)
         }
@@ -540,10 +548,10 @@ final class MetalPipeline: @unchecked Sendable {
         return tex
     }
 
-    private func getOrCreatePixelBuffer(width: Int, height: Int) -> CVPixelBuffer? {
-        if pixelBufferPool == nil || pixelBufferPoolW != width || pixelBufferPoolH != height {
+    private func getOrCreatePixelBuffer(width: Int, height: Int, format: OSType = kCVPixelFormatType_32BGRA) -> CVPixelBuffer? {
+        if pixelBufferPool == nil || pixelBufferPoolW != width || pixelBufferPoolH != height || pixelBufferPoolFormat != format {
             let attrs: [String: Any] = [
-                kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+                kCVPixelBufferPixelFormatTypeKey as String: format,
                 kCVPixelBufferWidthKey as String: width,
                 kCVPixelBufferHeightKey as String: height,
                 kCVPixelBufferMetalCompatibilityKey as String: true,
@@ -563,6 +571,7 @@ final class MetalPipeline: @unchecked Sendable {
             pixelBufferPool = pool
             pixelBufferPoolW = width
             pixelBufferPoolH = height
+            pixelBufferPoolFormat = format
         }
 
         guard let pixelBufferPool else { return nil }
@@ -570,6 +579,98 @@ final class MetalPipeline: @unchecked Sendable {
         let status = CVPixelBufferPoolCreatePixelBuffer(nil, pixelBufferPool, &pixelBuffer)
         guard status == kCVReturnSuccess else { return nil }
         return pixelBuffer
+    }
+
+    /// Attaches standard NCLC color primaries, matrix, and transfer function metadata to pixel buffers.
+    static func attachColorMetadata(to pixelBuffer: CVPixelBuffer, curveType: LogCurveType) {
+        switch curveType {
+        case .linear:
+            CVBufferSetAttachment(pixelBuffer, kCVImageBufferColorPrimariesKey, kCVImageBufferColorPrimaries_ITU_R_709_2, .shouldPropagate)
+            CVBufferSetAttachment(pixelBuffer, kCVImageBufferTransferFunctionKey, kCVImageBufferTransferFunction_ITU_R_709_2, .shouldPropagate)
+            CVBufferSetAttachment(pixelBuffer, kCVImageBufferYCbCrMatrixKey, kCVImageBufferYCbCrMatrix_ITU_R_709_2, .shouldPropagate)
+        case .appleLog2:
+            CVBufferSetAttachment(pixelBuffer, kCVImageBufferColorPrimariesKey, kCVImageBufferColorPrimaries_ITU_R_2020, .shouldPropagate)
+            CVBufferSetAttachment(pixelBuffer, kCVImageBufferYCbCrMatrixKey, kCVImageBufferYCbCrMatrix_ITU_R_2020, .shouldPropagate)
+            CVBufferRemoveAttachment(pixelBuffer, kCVImageBufferTransferFunctionKey)
+            if #available(iOS 17.2, *) {
+                CVBufferSetAttachment(pixelBuffer, kCVImageBufferLogTransferFunctionKey, kCVImageBufferLogTransferFunction_AppleLog, .shouldPropagate)
+            } else {
+                CVBufferSetAttachment(pixelBuffer, "LogTransferFunction" as CFString, "com.apple.rec2020.apple-log" as CFString, .shouldPropagate)
+            }
+        case .sLog3Approx:
+            CVBufferSetAttachment(pixelBuffer, kCVImageBufferColorPrimariesKey, kCVImageBufferColorPrimaries_ITU_R_2020, .shouldPropagate)
+            CVBufferSetAttachment(pixelBuffer, kCVImageBufferYCbCrMatrixKey, kCVImageBufferYCbCrMatrix_ITU_R_2020, .shouldPropagate)
+            CVBufferRemoveAttachment(pixelBuffer, kCVImageBufferTransferFunctionKey)
+        }
+    }
+
+    /// Encodes an RGB texture into a recording CVPixelBuffer.
+    /// For Linear: encodes to 8-bit BGRA (`kCVPixelFormatType_32BGRA`).
+    /// For Apple Log 2 / S-Log3: encodes to true 10-bit Video Range BT.2020 YCbCr 4:2:0
+    /// (`kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange`) via direct Metal kernel dispatch.
+    /// Returns the pixel buffer along with CVMetalTextures that must be retained until GPU completion.
+    private func encodeOutputPixelBuffer(
+        from sourceTexture: MTLTexture,
+        encodeWidth: Int,
+        encodeHeight: Int,
+        cb: MTLCommandBuffer
+    ) -> (CVPixelBuffer?, [Any]) {
+        guard let texCache = textureCache else { return (nil, []) }
+
+        if curveType == .linear {
+            guard let pb = getOrCreatePixelBuffer(width: encodeWidth, height: encodeHeight, format: kCVPixelFormatType_32BGRA) else {
+                return (nil, [])
+            }
+            var cvTexOut: CVMetalTexture?
+            let status = CVMetalTextureCacheCreateTextureFromImage(
+                nil, texCache, pb, nil, .bgra8Unorm, encodeWidth, encodeHeight, 0, &cvTexOut)
+            guard status == kCVReturnSuccess, let cvTex = cvTexOut,
+                  let bgraTex = CVMetalTextureGetTexture(cvTex),
+                  let enc = cb.makeComputeCommandEncoder() else {
+                return (nil, [])
+            }
+            enc.setComputePipelineState(convertFormatPipeline)
+            enc.setTexture(sourceTexture, index: 0)
+            enc.setTexture(bgraTex, index: 1)
+            dispatch(enc, width: encodeWidth, height: encodeHeight, state: convertFormatPipeline)
+            enc.endEncoding()
+
+            Self.attachColorMetadata(to: pb, curveType: curveType)
+            return (pb, [cvTex])
+        } else {
+            guard let pb = getOrCreatePixelBuffer(width: encodeWidth, height: encodeHeight, format: kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange) else {
+                return (nil, [])
+            }
+            let yW = CVPixelBufferGetWidthOfPlane(pb, 0)
+            let yH = CVPixelBufferGetHeightOfPlane(pb, 0)
+            let uvW = CVPixelBufferGetWidthOfPlane(pb, 1)
+            let uvH = CVPixelBufferGetHeightOfPlane(pb, 1)
+
+            var cvYOut: CVMetalTexture?
+            let statusY = CVMetalTextureCacheCreateTextureFromImage(
+                nil, texCache, pb, nil, .r16Unorm, yW, yH, 0, &cvYOut)
+
+            var cvUVOut: CVMetalTexture?
+            let statusUV = CVMetalTextureCacheCreateTextureFromImage(
+                nil, texCache, pb, nil, .rg16Unorm, uvW, uvH, 1, &cvUVOut)
+
+            guard statusY == kCVReturnSuccess, statusUV == kCVReturnSuccess,
+                  let cvY = cvYOut, let yTex = CVMetalTextureGetTexture(cvY),
+                  let cvUV = cvUVOut, let uvTex = CVMetalTextureGetTexture(cvUV),
+                  let enc = cb.makeComputeCommandEncoder() else {
+                return (nil, [])
+            }
+
+            enc.setComputePipelineState(convertYpCbCr10Pipeline)
+            enc.setTexture(sourceTexture, index: 0)
+            enc.setTexture(yTex, index: 1)
+            enc.setTexture(uvTex, index: 2)
+            dispatch(enc, width: uvW, height: uvH, state: convertYpCbCr10Pipeline)
+            enc.endEncoding()
+
+            Self.attachColorMetadata(to: pb, curveType: curveType)
+            return (pb, [cvY, cvUV])
+        }
     }
 
     // MARK: - Main process (linear denoise path)
@@ -925,33 +1026,34 @@ final class MetalPipeline: @unchecked Sendable {
             outputTex = fusedOut
         }
 
-        // BGRA pixel buffer for recording (AVAssetWriter expects 32BGRA)
-        var bgraOut: CVPixelBuffer?
-        var bgraTex: MTLTexture?
-        if encodeAsBGRA {
-            bgraOut = getOrCreatePixelBuffer(width: encodeWidth, height: encodeHeight)
-            if let bgraPB = bgraOut, let texCache = textureCache {
-                var cvTexOut: CVMetalTexture?
-                CVMetalTextureCacheCreateTextureFromImage(nil, texCache, bgraPB, nil, .bgra8Unorm, encodeWidth, encodeHeight, 0, &cvTexOut)
-                if let cvTex = cvTexOut {
-                    bgraTex = CVMetalTextureGetTexture(cvTex)
-                }
-            }
-        }
-
-        // Final crop and scale directly into target texture (eliminating redundant 2nd Lanczos pass!)
+        // Final crop and scale into target aspect ratio & resolution
         let finalTex = cropToAspectAndScale(
             outputTex,
             targetWidth: encodeWidth,
             targetHeight: encodeHeight,
-            destinationTexture: bgraTex,
+            destinationTexture: nil,
             cb: commandBuffer
-        ) ?? bgraTex ?? outputTex
+        ) ?? outputTex
+
+        var outputPB: CVPixelBuffer?
+        var retainedCVTextures: [Any] = []
+        if encodeAsBGRA {
+            let encoded = encodeOutputPixelBuffer(
+                from: finalTex,
+                encodeWidth: encodeWidth,
+                encodeHeight: encodeHeight,
+                cb: commandBuffer
+            )
+            outputPB = encoded.0
+            retainedCVTextures = encoded.1
+        }
 
         let finalTexBox = SendableBox(value: finalTex)
-        let bgraOutBox = SendableBox(value: bgraOut)
+        let outputPBBox = SendableBox(value: outputPB)
+        let retainedTexturesBox = SendableBox(value: retainedCVTextures)
         let completionBox = SendableBox(value: completion)
         commandBuffer.addCompletedHandler { cb in
+            _ = retainedTexturesBox.value
 #if DEBUG
             let ms = (CACurrentMediaTime() - t0) * 1000.0
             print("[MetalPipeline] frame time: \(String(format: "%.2f", ms)) ms")
@@ -959,7 +1061,7 @@ final class MetalPipeline: @unchecked Sendable {
             if let error = cb.error {
                 print("[MetalPipeline] ERROR: Command buffer failed: \(error.localizedDescription)")
             }
-            completionBox.value(finalTexBox.value, bgraOutBox.value)
+            completionBox.value(finalTexBox.value, outputPBBox.value)
         }
         commandBuffer.commit()
     }
@@ -1069,37 +1171,38 @@ final class MetalPipeline: @unchecked Sendable {
             postLogTex = sharpenTex
         }
 
-        // BGRA output for recording (if requested)
-        var bgraOut: CVPixelBuffer?
-        var bgraTex: MTLTexture?
-        if encodeAsBGRA {
-            bgraOut = getOrCreatePixelBuffer(width: encodeWidth, height: encodeHeight)
-            if let bgraPB = bgraOut, let texCache = textureCache {
-                var cvTexOut: CVMetalTexture?
-                CVMetalTextureCacheCreateTextureFromImage(nil, texCache, bgraPB, nil, .bgra8Unorm, encodeWidth, encodeHeight, 0, &cvTexOut)
-                if let cvTex = cvTexOut {
-                    bgraTex = CVMetalTextureGetTexture(cvTex)
-                }
-            }
-        }
-
         let finalTex = cropToAspectAndScale(
             postLogTex,
             targetWidth: encodeWidth,
             targetHeight: encodeHeight,
-            destinationTexture: bgraTex,
+            destinationTexture: nil,
             cb: commandBuffer
-        ) ?? bgraTex ?? postLogTex
+        ) ?? postLogTex
+
+        var outputPB: CVPixelBuffer?
+        var retainedCVTextures: [Any] = []
+        if encodeAsBGRA {
+            let encoded = encodeOutputPixelBuffer(
+                from: finalTex,
+                encodeWidth: encodeWidth,
+                encodeHeight: encodeHeight,
+                cb: commandBuffer
+            )
+            outputPB = encoded.0
+            retainedCVTextures = encoded.1
+        }
 
         let finalTexBox = SendableBox(value: finalTex)
-        let bgraOutBox = SendableBox(value: bgraOut)
+        let outputPBBox = SendableBox(value: outputPB)
+        let retainedTexturesBox = SendableBox(value: retainedCVTextures)
         let completionBox = SendableBox(value: completion)
         commandBuffer.addCompletedHandler { _ in
+            _ = retainedTexturesBox.value
 #if DEBUG
             let ms = (CACurrentMediaTime() - t0) * 1000.0
             print("[MetalPipeline] preview frame time: \(String(format: "%.2f", ms)) ms")
 #endif
-            completionBox.value(finalTexBox.value, bgraOutBox.value)
+            completionBox.value(finalTexBox.value, outputPBBox.value)
         }
         commandBuffer.commit()
     }

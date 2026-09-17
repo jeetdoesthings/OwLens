@@ -114,14 +114,7 @@ enum LogCurve {
     }
 
     static func apply(_ rgb: SIMD3<Float>, type: LogCurveType, headroomScale: Float = 1.0) -> SIMD3<Float> {
-        var input = rgb
-        if headroomScale > 1.0 && type != .linear {
-            input = SIMD3(
-                applyHighlightShoulder(input.x, rMax: headroomScale),
-                applyHighlightShoulder(input.y, rMax: headroomScale),
-                applyHighlightShoulder(input.z, rMax: headroomScale)
-            )
-        }
+        let input = rgb
         switch type {
         case .linear:
             return simd_clamp(input, SIMD3(0,0,0), SIMD3(1,1,1))

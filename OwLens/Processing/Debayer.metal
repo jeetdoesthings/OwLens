@@ -27,17 +27,7 @@ struct WhiteBalanceParams {
 
 // (Removed unused sampleBayerValid)
 
-static inline float linearize(float raw, float black, float white) {
-    float denom = max(white - black, 1e-6);
-    return (raw - black) / denom; // Do NOT clamp negative noise here, let it average to zero during demosaic!
-}
 
-static inline float sampleBayerClamp(texture2d<float, access::read> tex, int x, int y, int dx, int dy, float black, float white) {
-    int nx = clamp(x + dx, 0, int(tex.get_width()) - 1);
-    int ny = clamp(y + dy, 0, int(tex.get_height()) - 1);
-    float v = tex.read(uint2(nx, ny)).r;
-    return linearize(v, black, white);
-}
 
 static inline float sampleBayerFast(texture2d<float, access::read> tex, int x, int y, int dx, int dy, float black, float invDenom) {
     int nx = clamp(x + dx, 0, int(tex.get_width()) - 1);
@@ -85,8 +75,8 @@ kernel void correctDefectPixelsBayer(
     dst.write(float4(out, 0.0f, 0.0f, 1.0f), gid);
 }
 
-// CFA-preserving half-res bin: out(x,y) = in(2x+(x&1), 2y+(y&1))
-// Keeps RGGB/GRBG/… phase. DO NOT use out=in(2x,2y) — that is all one color (pink).
+// True 2x2 CFA-preserving binning: preserves RGGB/GRBG/GBRG/BGGR phase
+// by averaging 2x2 subpixels of the exact same color in each 4x4 block.
 kernel void binBayerCFA(
     texture2d<float, access::read> src [[texture(0)]],
     texture2d<float, access::write> dst [[texture(1)]],
@@ -95,50 +85,28 @@ kernel void binBayerCFA(
     if (gid.x >= dst.get_width() || gid.y >= dst.get_height()) return;
     int x = int(gid.x);
     int y = int(gid.y);
-    int sx = 2 * x + (x & 1);
-    int sy = 2 * y + (y & 1);
-    sx = min(sx, int(src.get_width()) - 1);
-    sy = min(sy, int(src.get_height()) - 1);
-    float v = src.read(uint2(sx, sy)).r;
-    dst.write(float4(v, 0.0, 0.0, 1.0), gid);
+
+    int w = int(src.get_width()) - 1;
+    int h = int(src.get_height()) - 1;
+
+    int sx0 = min(2 * x - (x & 1), w);
+    int sx1 = min(sx0 + 2, w);
+    int sy0 = min(2 * y - (y & 1), h);
+    int sy1 = min(sy0 + 2, h);
+
+    float s00 = src.read(uint2(sx0, sy0)).r;
+    float s10 = src.read(uint2(sx1, sy0)).r;
+    float s01 = src.read(uint2(sx0, sy1)).r;
+    float s11 = src.read(uint2(sx1, sy1)).r;
+
+    float v = 0.25f * (s00 + s10 + s01 + s11);
+    dst.write(float4(v, 0.0f, 0.0f, 1.0f), gid);
 }
 
-
-
-static inline float3 applyHighlightShoulder(float3 r, float rKnee, float rMax) {
-    if (rMax <= rKnee + 1e-4f) return r;
-    float delta = rMax - rKnee;
-    float dr = 1.0f - rKnee;
-    float s0 = dr / delta;
-    float s1 = 2.0f;
-    float a = s1 + s0 - 2.0f;
-    float b = 3.0f - 2.0f * s0 - s1;
-    float c = s0;
-
-    float3 out;
-    for (int i = 0; i < 3; i++) {
-        float val = r[i];
-        if (val <= rKnee) {
-            out[i] = val;
-        } else {
-            float t = saturate((val - rKnee) / max(dr, 1e-4f));
-            float g = ((a * t + b) * t + c) * t;
-            out[i] = rKnee + delta * g;
-        }
-    }
-    return out;
-}
 
 static inline float3 encodeLogCurve(float3 rgb, int curveType, float headroomScale = 1.0f) {
     if (curveType == 0) {
         return saturate(rgb);
-    }
-
-    // Apply filmic highlight shoulder when headroom expansion is active (e.g. headroomScale = 10.0–12.0)
-    // Preserves 100% linear calibration for midtones & shadows (r <= 0.36, 18% gray at 0.18)
-    // while smoothly rolling off highlights up to the container ceiling.
-    if (headroomScale > 1.0f) {
-        rgb = applyHighlightShoulder(rgb, 0.36f, headroomScale);
     }
 
     if (curveType == 3) {
@@ -172,10 +140,10 @@ static inline float3 encodeLogCurve(float3 rgb, int curveType, float headroomSca
     float3 clamped = max(rgb, float3(0.0));
     for (int i = 0; i < 3; i++) {
         float lin = clamped[i];
-        if (lin >= 0.01125) {
-            result[i] = (420.0 + log10((lin + 0.01) / (0.18 + 0.01)) * 261.5) / 1023.0;
+        if (lin >= 0.01125f) {
+            result[i] = (420.0f + metal::log10((lin + 0.01f) / (0.18f + 0.01f)) * 261.5f) / 1023.0f;
         } else {
-            result[i] = (lin * (171.2102946929 - 95.0) / 0.01125 + 95.0) / 1023.0;
+            result[i] = (lin * (171.2102946929f - 95.0f) / 0.01125f + 95.0f) / 1023.0f;
         }
     }
     return saturate(result);
@@ -318,12 +286,11 @@ kernel void debayerWBLinear(
     // ── Highlight Desaturation & Reconstruction ──
     // When raw sensor channels clip (typically green first on Bayer sensors),
     // WB gains multiply red/blue channels to ~2x while green stays pinned at 1.0,
-    // causing severe magenta/pink highlights. Smoothly desaturate chroma towards
-    // peak highlight luminance as raw levels approach clipping (> 0.88), rolling off
-    // into clean, neutral white highlights.
+    // causing severe magenta/pink highlights. Desaturate chroma only as channels
+    // approach true sensor saturation (> 0.96), preserving rich sunset/neon colors.
     float maxRaw = max(r, max(g, b));
-    if (maxRaw > 0.88f) {
-        float desat = smoothstep(0.88f, 0.98f, maxRaw);
+    if (maxRaw > 0.96f) {
+        float desat = smoothstep(0.96f, 0.995f, maxRaw);
         float peakVal = max(rgb.r, max(rgb.g, rgb.b));
         rgb = mix(rgb, float3(peakVal), desat);
     }
@@ -429,11 +396,11 @@ kernel void debayerFusedLog(
     rgb = max(rgb, float3(0.0));
 
     // ── Highlight Desaturation & Reconstruction ──
-    // Smoothly desaturate chroma towards peak highlight luminance as raw levels approach
-    // clipping (> 0.88), preventing pink/magenta cast on clipped highlights.
+    // Desaturate chroma only as channels approach true sensor saturation (> 0.96),
+    // preventing pink/magenta cast on clipped highlights while preserving color in bright areas.
     float maxRaw = max(r, max(g, b));
-    if (maxRaw > 0.88f) {
-        float desat = smoothstep(0.88f, 0.98f, maxRaw);
+    if (maxRaw > 0.96f) {
+        float desat = smoothstep(0.96f, 0.995f, maxRaw);
         float peakVal = max(rgb.r, max(rgb.g, rgb.b));
         rgb = mix(rgb, float3(peakVal), desat);
     }
@@ -446,7 +413,7 @@ kernel void debayerFusedLog(
     bool isClipped = (r >= 0.98 || g >= 0.98 || b >= 0.98);
     float alpha = isClipped ? 0.0 : 1.0;
 
-    // ── Direct Log OETF Encoding with Filmic Highlight Shoulder ──
+    // ── Direct Log OETF Encoding ──
     float3 logRGB = encodeLogCurve(rgb, params.curveType, params.headroomScale);
 
     outTexture.write(float4(logRGB, alpha), gid);
@@ -454,9 +421,7 @@ kernel void debayerFusedLog(
 
 // ──────────────────────────────────────────────────────────────────────
 // ULTRA-FAST 1-TAP FORMAT CONVERSION: rgba16Float -> bgra8Unorm.
-// 1 vectorized load + 1 vectorized store per pixel (<1ms at 4K).
-// Used instead of expensive multi-tap Lanczos sinc filtering when
-// resolution already matches target framing.
+// Used strictly for the live screen viewfinder (MTKView).
 // ──────────────────────────────────────────────────────────────────────
 kernel void convertRgba16FloatToBgra8(
     texture2d<float, access::read>  src [[texture(0)]],
@@ -465,6 +430,82 @@ kernel void convertRgba16FloatToBgra8(
 {
     if (gid.x >= dst.get_width() || gid.y >= dst.get_height()) return;
     dst.write(src.read(gid), gid);
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// 10-BIT YCBCR 4:2:0 ENCODING: rgba16Float -> 420YpCbCr10BiPlanar
+// Converts linear or log RGB directly to ITU-R BT.2020 10-bit Video Range:
+//   Plane 0 (Y):  .r16Unorm, width x height
+//   Plane 1 (UV): .rg16Unorm, (width/2) x (height/2)
+// Dispatched over (width/2) x (height/2) grid:
+//   1 thread per 2x2 block -> writes 4 luma pixels and 1 interleaved chroma pixel.
+// ──────────────────────────────────────────────────────────────────────
+kernel void convertRgbTo420YpCbCr10(
+    texture2d<float, access::read>  srcRGB  [[texture(0)]],
+    texture2d<float, access::write> dstY    [[texture(1)]],
+    texture2d<float, access::write> dstUV   [[texture(2)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    uint uvW = dstUV.get_width();
+    uint uvH = dstUV.get_height();
+    if (gid.x >= uvW || gid.y >= uvH) return;
+
+    uint baseX = gid.x * 2u;
+    uint baseY = gid.y * 2u;
+    uint srcW = srcRGB.get_width();
+    uint srcH = srcRGB.get_height();
+
+    // Sample 2x2 block with edge clamping
+    float3 p00 = srcRGB.read(uint2(min(baseX,      srcW - 1u), min(baseY,      srcH - 1u))).rgb;
+    float3 p10 = srcRGB.read(uint2(min(baseX + 1u, srcW - 1u), min(baseY,      srcH - 1u))).rgb;
+    float3 p01 = srcRGB.read(uint2(min(baseX,      srcW - 1u), min(baseY + 1u, srcH - 1u))).rgb;
+    float3 p11 = srcRGB.read(uint2(min(baseX + 1u, srcW - 1u), min(baseY + 1u, srcH - 1u))).rgb;
+
+    // ITU-R BT.2020 non-constant luminance luma:
+    constexpr float3 wY = float3(0.2627f, 0.6780f, 0.0593f);
+    float y00 = dot(p00, wY);
+    float y10 = dot(p10, wY);
+    float y01 = dot(p01, wY);
+    float y11 = dot(p11, wY);
+
+    // 10-bit Video Range quantization (SMPTE / ITU standard):
+    // Y: 64 to 940 (range = 876)
+    // Cb, Cr: 64 to 960 (range = 896, center = 512)
+    // CoreVideo 'x420' stores 10-bit code values in the 10 MSBs (bits 6..15) of uint16.
+    // Writing to .r16Unorm / .rg16Unorm scales [0..1] by 65535.
+    // Normalized float = (codeValue10 * 64.0) / 65535.0.
+    constexpr float kNormScale = 64.0f / 65535.0f;
+
+    float normY00 = clamp(64.0f + 876.0f * y00, 64.0f, 940.0f) * kNormScale;
+    float normY10 = clamp(64.0f + 876.0f * y10, 64.0f, 940.0f) * kNormScale;
+    float normY01 = clamp(64.0f + 876.0f * y01, 64.0f, 940.0f) * kNormScale;
+    float normY11 = clamp(64.0f + 876.0f * y11, 64.0f, 940.0f) * kNormScale;
+
+    uint dstYW = dstY.get_width();
+    uint dstYH = dstY.get_height();
+    if (baseX < dstYW && baseY < dstYH) {
+        dstY.write(float4(normY00, 0.0f, 0.0f, 1.0f), uint2(baseX, baseY));
+    }
+    if (baseX + 1u < dstYW && baseY < dstYH) {
+        dstY.write(float4(normY10, 0.0f, 0.0f, 1.0f), uint2(baseX + 1u, baseY));
+    }
+    if (baseX < dstYW && baseY + 1u < dstYH) {
+        dstY.write(float4(normY01, 0.0f, 0.0f, 1.0f), uint2(baseX, baseY + 1u));
+    }
+    if (baseX + 1u < dstYW && baseY + 1u < dstYH) {
+        dstY.write(float4(normY11, 0.0f, 0.0f, 1.0f), uint2(baseX + 1u, baseY + 1u));
+    }
+
+    // 4:2:0 Box-filtered chroma:
+    float3 avgRGB = 0.25f * (p00 + p10 + p01 + p11);
+    float avgY = dot(avgRGB, wY);
+    float cb = (avgRGB.b - avgY) / 1.8814f;
+    float cr = (avgRGB.r - avgY) / 1.4746f;
+
+    float normCb = clamp(512.0f + 896.0f * cb, 64.0f, 960.0f) * kNormScale;
+    float normCr = clamp(512.0f + 896.0f * cr, 64.0f, 960.0f) * kNormScale;
+
+    dstUV.write(float4(normCb, normCr, 0.0f, 1.0f), gid);
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -694,19 +735,19 @@ fragment float4 displayFragment(
 // ──────────────────────────────────────────────────────────────────────
 
 static inline float3 rgb2yuv(float3 rgb) {
-    float y  = dot(rgb, float3(0.2126, 0.7152, 0.0722));
-    float u  = dot(rgb, float3(-0.1146, -0.3854, 0.5)) + 0.5;
-    float v  = dot(rgb, float3(0.5, -0.4542, -0.0458)) + 0.5;
+    float y  = dot(rgb, float3(0.2627f, 0.6780f, 0.0593f));
+    float u  = (rgb.b - y) / 1.8814f + 0.5f;
+    float v  = (rgb.r - y) / 1.4746f + 0.5f;
     return float3(y, u, v);
 }
 
 static inline float3 yuv2rgb(float3 yuv) {
     float y  = yuv.x;
-    float u  = yuv.y - 0.5;
-    float v  = yuv.z - 0.5;
-    float r  = y + 1.5748 * v;
-    float g  = y - 0.1873 * u - 0.4681 * v;
-    float b  = y + 1.8556 * u;
+    float u  = yuv.y - 0.5f;
+    float v  = yuv.z - 0.5f;
+    float r  = y + 1.4746f * v;
+    float b  = y + 1.8814f * u;
+    float g  = (y - 0.2627f * r - 0.0593f * b) / 0.6780f;
     return float3(r, g, b);
 }
 
@@ -1204,6 +1245,6 @@ kernel void storeLumaHistory(
 {
     if (gid.x >= lumaArray.get_width() || gid.y >= lumaArray.get_height()) return;
     float4 px = fullResRGB.read(gid);
-    float y = dot(px.rgb, float3(0.2126, 0.7152, 0.0722));
+    float y = dot(px.rgb, float3(0.2627f, 0.6780f, 0.0593f));
     lumaArray.write(float4(y, 0.0, 0.0, 1.0), gid, params.slice);
 }

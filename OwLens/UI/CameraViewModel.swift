@@ -61,6 +61,12 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
             refreshStatusLine()
         }
     }
+    @Published var selectedCodec: VideoCodecOption = .hevc {
+        didSet {
+            guard !isRecording else { return }
+            refreshStatusLine()
+        }
+    }
     @Published private(set) var selectedSaveDestination: VideoSaveDestination = .photos
     @Published var audioSources: [AudioSourceOption] = [.none]
     @Published var selectedAudioSource: AudioSourceOption = .none {
@@ -315,7 +321,8 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
                 _ = pipeline.runSyntheticHotPixelTest()
                 _ = MetalPipeline.runAppleLog2AccuracyTest()
                 _ = MetalPipeline.runColorMatrixValidationTest()
-                _ = MetalPipeline.runHighlightShoulderTest()
+                _ = MetalPipeline.runLogCurvesStandardComplianceTest()
+                _ = MetalPipeline.run10BitYCbCrEncodingTest()
                 _ = pipeline.runPipelineThroughputBenchmark()
                 _ = CameraViewModel.runFileNameGenerationTest()
             }
@@ -989,7 +996,8 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
                 bitrate: effectiveBitrate,
                 targetFPS: selectedFPS.rawValue,
                 includeAudio: includeAudio,
-                curveType: selectedCurve
+                curveType: selectedCurve,
+                codec: selectedCodec
             )
             isRecording = true
             isRecordingUnsafe = true
@@ -1004,9 +1012,9 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
                     self?.updateRecordingDuration()
                 }
             }
-            statusText = "REC · \(selectedFormat.shortLabel) · \(selectedFPS.label)fps · HEVC"
+            statusText = "REC · \(selectedFormat.shortLabel) · \(selectedFPS.label)fps · \(selectedCodec.displayName)"
             let capsLine = capabilities?.diagnosticSummary ?? ""
-            print("[CameraViewModel] Recording start \(selectedFormat.width)x\(selectedFormat.height) CFR \(selectedFPS.label) HEVC\n\(capsLine)")
+            print("[CameraViewModel] Recording start \(selectedFormat.width)x\(selectedFormat.height) CFR \(selectedFPS.label) \(selectedCodec.displayName)\n\(capsLine)")
         } catch {
             errorMessage = "Record failed: \(error.localizedDescription)"
             print("[CameraViewModel] Failed to start recording: \(error)")
@@ -1393,10 +1401,10 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
             pipeline.headroomScale = 1.0
         case .appleLog2:
             cMatrix = latestColorMatrix ?? WhiteBalanceParams.defaultSensorToBT2020
-            pipeline.headroomScale = 10.0
+            pipeline.headroomScale = 1.0
         case .sLog3Approx:
             cMatrix = latestSGamutMatrix ?? WhiteBalanceParams.defaultSensorToSGamut3Cine
-            pipeline.headroomScale = 10.0
+            pipeline.headroomScale = 1.0
         }
 
         if pipeline.isAutoWBEnabled, let gains = frameData.whiteBalanceGains {

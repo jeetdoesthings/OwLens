@@ -36,12 +36,24 @@ enum BayerPatternID: Int32, CaseIterable {
 /// Output codec choice
 enum VideoCodecOption: String, CaseIterable, Identifiable {
     case hevc = "hevc"
+    case proRes422 = "proRes422"
+    case proRes422HQ = "proRes422HQ"
 
     var id: String { rawValue }
 
     var displayName: String {
         switch self {
-        case .hevc: return "HEVC"
+        case .hevc: return "HEVC 10-bit"
+        case .proRes422: return "ProRes 422"
+        case .proRes422HQ: return "ProRes 422 HQ"
+        }
+    }
+
+    var avCodecType: AVVideoCodecType {
+        switch self {
+        case .hevc: return .hevc
+        case .proRes422: return .proRes422
+        case .proRes422HQ: return .proRes422HQ
         }
     }
 }

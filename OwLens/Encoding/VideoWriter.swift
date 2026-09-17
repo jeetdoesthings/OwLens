@@ -53,7 +53,8 @@ final class VideoWriter: @unchecked Sendable {
         bitrate: Int = 100_000_000,
         targetFPS: Double = 24,
         includeAudio: Bool = true,
-        curveType: LogCurveType = .sLog3Approx
+        curveType: LogCurveType = .sLog3Approx,
+        codec: VideoCodecOption = .hevc
     ) throws {
         lock.lock()
         defer { lock.unlock() }
@@ -68,29 +69,33 @@ final class VideoWriter: @unchecked Sendable {
         self.targetFPS = fps
         self.curveType = curveType
 
-        let profileLevel: String
-        switch curveType {
-        case .linear:
-            profileLevel = kVTProfileLevel_HEVC_Main_AutoLevel as String
-        case .appleLog2, .sLog3Approx:
-            profileLevel = kVTProfileLevel_HEVC_Main10_AutoLevel as String
-        }
-
-        let compression: [String: Any] = [
-            AVVideoAverageBitRateKey: bitrate,
-            kVTCompressionPropertyKey_ProfileLevel as String: profileLevel,
-            AVVideoExpectedSourceFrameRateKey: Int(fps),
-            AVVideoAverageNonDroppableFrameRateKey: Int(fps),
-            AVVideoMaxKeyFrameIntervalKey: Int(fps),
-            AVVideoAllowFrameReorderingKey: false as NSNumber
-        ]
-
         var videoSettings: [String: Any] = [
-            AVVideoCodecKey: AVVideoCodecType.hevc,
             AVVideoWidthKey: width,
-            AVVideoHeightKey: height,
-            AVVideoCompressionPropertiesKey: compression
+            AVVideoHeightKey: height
         ]
+
+        if codec == .proRes422 || codec == .proRes422HQ {
+            videoSettings[AVVideoCodecKey] = codec.avCodecType
+        } else {
+            let profileLevel: String
+            switch curveType {
+            case .linear:
+                profileLevel = kVTProfileLevel_HEVC_Main_AutoLevel as String
+            case .appleLog2, .sLog3Approx:
+                profileLevel = kVTProfileLevel_HEVC_Main10_AutoLevel as String
+            }
+
+            let compression: [String: Any] = [
+                AVVideoAverageBitRateKey: bitrate,
+                kVTCompressionPropertyKey_ProfileLevel as String: profileLevel,
+                AVVideoExpectedSourceFrameRateKey: Int(fps),
+                AVVideoAverageNonDroppableFrameRateKey: Int(fps),
+                AVVideoMaxKeyFrameIntervalKey: Int(fps),
+                AVVideoAllowFrameReorderingKey: false as NSNumber
+            ]
+            videoSettings[AVVideoCodecKey] = AVVideoCodecType.hevc
+            videoSettings[AVVideoCompressionPropertiesKey] = compression
+        }
 
         switch curveType {
         case .linear:
@@ -99,15 +104,12 @@ final class VideoWriter: @unchecked Sendable {
                 AVVideoTransferFunctionKey: AVVideoTransferFunction_ITU_R_709_2,
                 AVVideoYCbCrMatrixKey: AVVideoYCbCrMatrix_ITU_R_709_2
             ]
-        case .sLog3Approx:
-            videoSettings[AVVideoColorPropertiesKey] = [
-                AVVideoColorPrimariesKey: AVVideoColorPrimaries_ITU_R_2020,
-                AVVideoTransferFunctionKey: AVVideoTransferFunction_ITU_R_709_2,
-                AVVideoYCbCrMatrixKey: AVVideoYCbCrMatrix_ITU_R_2020
-            ]
-        case .appleLog2:
-            // For Apple Log 2, omitting explicit AVVideoColorPropertiesKey allows VideoToolbox
-            // to derive native Apple Log track tagging from buffer attachments (kCVImageBufferLogTransferFunction_AppleLog).
+        case .sLog3Approx, .appleLog2:
+            // For log curves (Apple Log and S-Log3 in BT.2020 container), omitting explicit
+            // AVVideoColorPropertiesKey from outputSettings allows VideoToolbox to derive
+            // the exact 10-bit track tagging (BT.2020 primaries + matrix, plus Apple Log transfer
+            // function where applicable) directly from the CVPixelBuffer attachments.
+            // This prevents S-Log3 from being falsely tagged with Rec.709 transfer function.
             break
         }
 
@@ -115,17 +117,22 @@ final class VideoWriter: @unchecked Sendable {
         vInput.expectsMediaDataInRealTime = true
         vInput.mediaTimeScale = CMTimeScale(fps * 1000)
 
+        // Use 10-bit bi-planar YCbCr for accurate LOG gradient recording.
+        let pixelFormatType: OSType = (curveType == .linear)
+            ? kCVPixelFormatType_32BGRA
+            : kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
+
         let adaptor = AVAssetWriterInputPixelBufferAdaptor(
             assetWriterInput: vInput,
             sourcePixelBufferAttributes: [
-                kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+                kCVPixelBufferPixelFormatTypeKey as String: pixelFormatType,
                 kCVPixelBufferWidthKey as String: width,
                 kCVPixelBufferHeightKey as String: height,
                 kCVPixelBufferMetalCompatibilityKey as String: true
             ])
 
         guard writer.canAdd(vInput) else {
-            throw NSError(domain: "RawLogCam", code: 10, userInfo: [NSLocalizedDescriptionKey: "Cannot add video input (HEVC)"])
+            throw NSError(domain: "RawLogCam", code: 10, userInfo: [NSLocalizedDescriptionKey: "Cannot add video input (\(codec.displayName))"])
         }
         writer.add(vInput)
 

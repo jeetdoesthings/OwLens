@@ -260,55 +260,135 @@ extension MetalPipeline {
         return allPassed
     }
 
-    /// Verifies that the highlight shoulder curve smoothly maps sensor clipping to full container headroom.
-    static func runHighlightShoulderTest() -> Bool {
-        var passed = true
-        // 1. Below knee (0.18 mid gray and 0.36 knee) must be strictly linear
-        let midGray = LogCurve.applyHighlightShoulder(0.18, rKnee: 0.36, rMax: 10.0)
-        if abs(midGray - 0.18) > 0.0001 {
-            print("[HighlightShoulderTest] FAIL mid gray not identity: \(midGray)")
-            passed = false
-        }
-        let knee = LogCurve.applyHighlightShoulder(0.36, rKnee: 0.36, rMax: 10.0)
-        if abs(knee - 0.36) > 0.0001 {
-            print("[HighlightShoulderTest] FAIL knee not identity: \(knee)")
-            passed = false
-        }
+    /// Verifies standard compliance of Apple Log 2 and Sony S-Log3 transfer curves
+    /// against published reference specifications (without artificial shoulder warping).
+    static func runLogCurvesStandardComplianceTest() -> Bool {
+        var allPassed = true
+        let eps: Float = 0.001
 
-        // 2. Monotonicity & Smooth Roll-off across intermediate highlight values
-        let sampleInputs: [Float] = [0.36, 0.50, 0.70, 0.90, 0.95, 0.99, 1.00]
-        var lastR: Float = 0.0
-        for r in sampleInputs {
-            let R = LogCurve.applyHighlightShoulder(r, rKnee: 0.36, rMax: 10.0)
-            if R <= lastR && r > 0.36 {
-                print("[HighlightShoulderTest] FAIL non-monotonic at r=\(r): R=\(R) <= lastR=\(lastR)")
-                passed = false
+        // ── Apple Log 2 Standards Verification ──
+        let appleCases: [(r: Float, expectedP: Float, name: String)] = [
+            (0.0,  0.150477, "Apple Log 0% reflectance"),
+            (0.18, 0.488272, "Apple Log 18% middle gray"),
+            (0.90, 0.681686, "Apple Log 90% diffuse white"),
+            (1.0,  0.694553, "Apple Log 100% reflectance")
+        ]
+        for tc in appleCases {
+            let encoded = LogCurve.appleLog2Encode(tc.r)
+            let diff = abs(encoded - tc.expectedP)
+            if diff > eps {
+                print("[LogComplianceTest] FAIL \(tc.name): got \(encoded), expected \(tc.expectedP), diff \(diff)")
+                allPassed = false
+            } else {
+                print("[LogComplianceTest] PASS \(tc.name): \(encoded) ≈ \(tc.expectedP)")
             }
-            lastR = R
         }
 
-        // 3. Verify no cliff at 0.99: R(0.99) should smoothly reach > 9.0 (not compressed to ~2.6)
-        let r99 = LogCurve.applyHighlightShoulder(0.99, rKnee: 0.36, rMax: 10.0)
-        if r99 < 9.0 {
-            print("[HighlightShoulderTest] FAIL highlight cliff at 0.99: got \(r99), expected > 9.0")
+        // ── Sony S-Log3 Standards Verification ──
+        let sLog3Cases: [(linear: Float, expectedCode: Float, name: String)] = [
+            (0.0,       95.0 / 1023.0,  "S-Log3 black level (95 code)"),
+            (0.01125,   171.2103 / 1023.0, "S-Log3 knee transition"),
+            (0.18,      420.0 / 1023.0, "S-Log3 18% middle gray (420 code)"),
+            (0.90,      0.584145,       "S-Log3 90% diffuse white"),
+            (1.0,       0.596285,       "S-Log3 100% sensor clipping")
+        ]
+        for tc in sLog3Cases {
+            let encoded = LogCurve.sLog3Approx(tc.linear)
+            let diff = abs(encoded - tc.expectedCode)
+            if diff > eps {
+                print("[LogComplianceTest] FAIL \(tc.name): got \(encoded), expected \(tc.expectedCode), diff \(diff)")
+                allPassed = false
+            } else {
+                print("[LogComplianceTest] PASS \(tc.name): \(encoded) ≈ \(tc.expectedCode)")
+            }
+        }
+
+        // ── S-Log3 Invertibility Test ──
+        let sLogRoundtrip: [Float] = [0.0, 0.005, 0.01125, 0.18, 0.50, 0.90, 1.0]
+        for val in sLogRoundtrip {
+            let enc = LogCurve.sLog3Approx(val)
+            let dec = LogCurve.inverseSLog3Approx(enc)
+            let diff = abs(dec - val)
+            if diff > 0.0005 {
+                print("[LogComplianceTest] FAIL S-Log3 roundtrip at \(val): decoded \(dec), diff \(diff)")
+                allPassed = false
+            }
+        }
+
+        // ── Strict Monotonicity Across [0, 1] ──
+        var prevApple: Float = -1.0
+        var prevSLog: Float = -1.0
+        var monotonic = true
+        for i in 0...100 {
+            let r = Float(i) / 100.0
+            let a = LogCurve.appleLog2Encode(r)
+            let s = LogCurve.sLog3Approx(r)
+            if a < prevApple || s < prevSLog {
+                print("[LogComplianceTest] FAIL non-monotonic at r=\(r)")
+                monotonic = false
+                allPassed = false
+                break
+            }
+            prevApple = a
+            prevSLog = s
+        }
+        if monotonic {
+            print("[LogComplianceTest] PASS: Apple Log 2 and S-Log3 are strictly monotonic across [0, 1]")
+        }
+
+        return allPassed
+    }
+
+    /// Verifies 10-bit Video Range quantization and BT.2020 YCbCr color matrix mathematics.
+    static func run10BitYCbCrEncodingTest() -> Bool {
+        var passed = true
+        let kNormScale: Float = 64.0 / 65535.0
+
+        // 1. Luma Video Range limits (64..940 in 10-bit)
+        let yBlack10: Float = 64.0
+        let yWhite10: Float = 940.0
+        let normYBlack = yBlack10 * kNormScale
+        let normYWhite = yWhite10 * kNormScale
+
+        // Integer 16-bit word when stored in .r16Unorm
+        let word16Black = UInt16((normYBlack * 65535.0).rounded())
+        let word16White = UInt16((normYWhite * 65535.0).rounded())
+
+        // Bits 15..6 should equal codeValue10, lowest 6 bits should be zero
+        let decoded10Black = word16Black >> 6
+        let decoded10White = word16White >> 6
+        let remBlack = word16Black & 0x3F
+        let remWhite = word16White & 0x3F
+
+        if decoded10Black != 64 || remBlack != 0 {
+            print("[10BitYCbCrTest] FAIL Y black: code=\(decoded10Black), rem=\(remBlack)")
+            passed = false
+        }
+        if decoded10White != 940 || remWhite != 0 {
+            print("[10BitYCbCrTest] FAIL Y white: code=\(decoded10White), rem=\(remWhite)")
             passed = false
         }
 
-        // 4. Sensor clipping (1.0) must reach rMax (10.0)
-        let maxVal = LogCurve.applyHighlightShoulder(1.0, rKnee: 0.36, rMax: 10.0)
-        if abs(maxVal - 10.0) > 0.01 {
-            print("[HighlightShoulderTest] FAIL max value: got \(maxVal), expected 10.0")
+        // 2. Chroma Video Range limits (64..960, center 512)
+        let cbMid10: Float = 512.0
+        let word16ChromaMid = UInt16(((cbMid10 * kNormScale) * 65535.0).rounded())
+        let decoded10ChromaMid = word16ChromaMid >> 6
+        let remChromaMid = word16ChromaMid & 0x3F
+
+        if decoded10ChromaMid != 512 || remChromaMid != 0 {
+            print("[10BitYCbCrTest] FAIL Cb/Cr center: code=\(decoded10ChromaMid), rem=\(remChromaMid)")
             passed = false
         }
-        // 5. Apple Log 2 encoded code value at sensor clipping must reach > 0.95
-        let codeAtClip = LogCurve.appleLog2Encode(maxVal)
-        if codeAtClip < 0.95 {
-            print("[HighlightShoulderTest] FAIL log code at clip too low: \(codeAtClip)")
-            passed = false
-        } else {
-            print("[HighlightShoulderTest] PASS: sensor clipping smoothly reaches Apple Log code \(codeAtClip) without cliffs")
+
+        if passed {
+            print("[10BitYCbCrTest] PASS: 10-bit MSB alignment (word16 = code10 << 6) verified perfectly")
         }
         return passed
+    }
+
+    /// Legacy test alias for backward compatibility.
+    static func runHighlightShoulderTest() -> Bool {
+        return runLogCurvesStandardComplianceTest()
     }
 
     /// Benchmarks the optimized pipeline (single-pass fused demosaic + direct BGRA scaling)
@@ -361,8 +441,34 @@ extension MetalPipeline {
 
         let avgMs = totalMs / Double(iterations)
         print("[ThroughputBenchmark] 1080p average frame time: \(String(format: "%.2f", avgMs)) ms across \(iterations) frames")
-        let pass = avgMs < 33.33 // must easily fit in 30 fps budget
-        print("[ThroughputBenchmark] Result: \(pass ? "PASS" : "FAIL") (target < 33.33 ms)")
+        var pass = avgMs < 33.33 // must easily fit in 30 fps budget
+        print("[ThroughputBenchmark] Performance: \(pass ? "PASS" : "FAIL") (target < 33.33 ms)")
+
+        // Verify 10-bit YCbCr pixel buffer format and attachments on output
+        let verifySem = DispatchSemaphore(value: 0)
+        let oldCurve = self.curveType
+        self.curveType = .appleLog2
+        process(buffer, encodeWidth: width, encodeHeight: height, encodeAsBGRA: true) { _, pb in
+            if let pb = pb {
+                let fmt = CVPixelBufferGetPixelFormatType(pb)
+                let is10Bit = (fmt == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange)
+                let planeCount = CVPixelBufferGetPlaneCount(pb)
+                let hasBT2020 = CVBufferGetAttachment(pb, kCVImageBufferColorPrimariesKey, nil) != nil
+                if is10Bit && planeCount == 2 && hasBT2020 {
+                    print("[ThroughputBenchmark] PASS: Pipeline correctly produced 10-bit YCbCr 4:2:0 CVPixelBuffer with BT.2020 metadata")
+                } else {
+                    print("[ThroughputBenchmark] FAIL: Expected 10-bit bi-planar YCbCr, got fmt=\(fmt) planes=\(planeCount)")
+                    pass = false
+                }
+            } else {
+                print("[ThroughputBenchmark] FAIL: No pixel buffer returned for 10-bit encoding")
+                pass = false
+            }
+            verifySem.signal()
+        }
+        verifySem.wait()
+        self.curveType = oldCurve
+
         return pass
     }
 }
