@@ -53,7 +53,7 @@ struct ControlsView: View {
     }
 
     private var isTopLocked: Bool {
-        viewModel.controlsLocked || viewModel.isRecording || viewModel.isDeviceUnsupportedForLog
+        viewModel.controlsLocked || viewModel.isRecording || viewModel.isSaving || viewModel.isDeviceUnsupportedForLog
     }
 
     private var leftStatusGroup: some View {
@@ -1239,11 +1239,12 @@ struct ControlsView: View {
                     .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-            .disabled(viewModel.isRecording)
-            .opacity(viewModel.isRecording ? 0.3 : 1.0)
+            .disabled(viewModel.isRecording || viewModel.isSaving)
+            .opacity(viewModel.isRecording || viewModel.isSaving ? 0.3 : 1.0)
 
             // Shutter / Record Trigger
             Button {
+                guard !viewModel.isSaving else { return }
                 if viewModel.isRecording {
                     Haptics.notification(.success)
                     viewModel.stopRecording()
@@ -1264,7 +1265,11 @@ struct ControlsView: View {
                         .frame(width: 64, height: 64)
                         .shadow(color: viewModel.isRecording ? OwLensTheme.recordingRed.opacity(0.6) : Color.clear, radius: 8)
 
-                    if viewModel.isRecording {
+                    if viewModel.isSaving {
+                        ProgressView()
+                            .progressViewStyle(CircularProgressViewStyle(tint: .white))
+                            .scaleEffect(1.2)
+                    } else if viewModel.isRecording {
                         // Red Stop Square
                         RoundedRectangle(cornerRadius: 5, style: .continuous)
                             .fill(OwLensTheme.recordingRed)
@@ -1284,7 +1289,7 @@ struct ControlsView: View {
                 .contentShape(Circle())
             }
             .buttonStyle(.plain)
-            .disabled(viewModel.isDeviceUnsupportedForLog)
+            .disabled(viewModel.isDeviceUnsupportedForLog || viewModel.isSaving)
         }
         .frame(width: 84)
         .overlay(alignment: .topTrailing) {

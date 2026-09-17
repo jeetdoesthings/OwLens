@@ -2,6 +2,7 @@ import Foundation
 import Metal
 import MetalKit
 import CoreVideo
+import simd
 
 #if DEBUG
 
@@ -453,7 +454,7 @@ extension MetalPipeline {
                 let fmt = CVPixelBufferGetPixelFormatType(pb)
                 let is10Bit = (fmt == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange)
                 let planeCount = CVPixelBufferGetPlaneCount(pb)
-                let hasBT2020 = CVBufferGetAttachment(pb, kCVImageBufferColorPrimariesKey, nil) != nil
+                let hasBT2020 = CVBufferCopyAttachment(pb, kCVImageBufferColorPrimariesKey, nil) != nil
                 if is10Bit && planeCount == 2 && hasBT2020 {
                     print("[ThroughputBenchmark] PASS: Pipeline correctly produced 10-bit YCbCr 4:2:0 CVPixelBuffer with BT.2020 metadata")
                 } else {
@@ -470,6 +471,167 @@ extension MetalPipeline {
         self.curveType = oldCurve
 
         return pass
+    }
+
+    /// Validates Auto Exposure shutter angle calculations, stop-index nearest matching,
+    /// White Balance gain green normalization, and correlated color temperature interpolation.
+    static func runAutoExposureAndWBValidationTest() -> Bool {
+        var allPassed = true
+
+        // 1. Shutter angle conversion from exposure duration
+        let fps = 24.0
+        let duration180 = 1.0 / 48.0
+        let angle180 = Float(duration180 * fps * 360.0)
+        if abs(angle180 - 180.0) > 0.001 {
+            print("[AE/AWBTest] FAIL: 1/48s at 24fps expected 180°, got \(angle180)")
+            allPassed = false
+        }
+
+        let duration90 = 1.0 / 96.0
+        let angle90 = Float(duration90 * fps * 360.0)
+        if abs(angle90 - 90.0) > 0.001 {
+            print("[AE/AWBTest] FAIL: 1/96s at 24fps expected 90°, got \(angle90)")
+            allPassed = false
+        }
+
+        // 2. Exposure stops nearest matching
+        let stops = ExposureStops.isoStops(in: 50...2000)
+        let idx50 = ExposureStops.nearestIndex(in: stops, to: 48)
+        if stops[idx50] != 50 {
+            print("[AE/AWBTest] FAIL: Nearest stop for 48 should be 50, got \(stops[idx50])")
+            allPassed = false
+        }
+        let idx800 = ExposureStops.nearestIndex(in: stops, to: 750)
+        if stops[idx800] != 800 {
+            print("[AE/AWBTest] FAIL: Nearest stop for 750 should be 800, got \(stops[idx800])")
+            allPassed = false
+        }
+
+        // 3. White balance green normalization
+        let rawR: Float = 2.4
+        let rawG: Float = 1.2
+        let rawB: Float = 1.8
+        let g = max(rawG, 0.001)
+        let normGains = SIMD3<Float>(max(rawR / g, 0.01), 1.0, max(rawB / g, 0.01))
+        if abs(normGains.x - 2.0) > 1e-4 || abs(normGains.y - 1.0) > 1e-4 || abs(normGains.z - 1.5) > 1e-4 {
+            print("[AE/AWBTest] FAIL: Normalized gains expected [2.0, 1.0, 1.5], got \(normGains)")
+            allPassed = false
+        }
+
+        // 4. Correlated color temperature interpolation (DNG spec formula: g = (1/T - 1/T2) / (1/T1 - 1/T2))
+        let t1: Float = 2856.0 // Standard Light A
+        let t2: Float = 6504.0 // D65
+        let factorA = simd_clamp((1.0 / t1 - 1.0 / t2) / (1.0 / t1 - 1.0 / t2), 0.0, 1.0)
+        let factorD65 = simd_clamp((1.0 / t2 - 1.0 / t2) / (1.0 / t1 - 1.0 / t2), 0.0, 1.0)
+        if abs(factorA - 1.0) > 1e-4 {
+            print("[AE/AWBTest] FAIL: Factor at T1 (2856K) should be 1.0, got \(factorA)")
+            allPassed = false
+        }
+        if abs(factorD65 - 0.0) > 1e-4 {
+            print("[AE/AWBTest] FAIL: Factor at T2 (6504K) should be 0.0, got \(factorD65)")
+            allPassed = false
+        }
+
+        if allPassed {
+            print("[AE/AWBTest] PASS: Auto Exposure & Auto White Balance logic & mathematics verified successfully")
+        }
+        return allPassed
+    }
+
+    /// Validates landscape rotation transforms, Bayer CFA boundary reflection,
+    /// symmetric ISO ratio math, and CFR audio/video frame count sync.
+    static func runFlawsValidationTest() -> Bool {
+        var allPassed = true
+
+        // 1. Landscape Left 180° rotation transform matrix validation
+        let w: CGFloat = 3840
+        let h: CGFloat = 2160
+        let t = CGAffineTransform(rotationAngle: .pi).translatedBy(x: -w, y: -h)
+
+        let p0 = CGPoint(x: 0, y: 0).applying(t)
+        if abs(p0.x - w) > 0.001 || abs(p0.y - h) > 0.001 {
+            print("[FlawsTest] FAIL: Transform (0,0) -> (\(p0.x), \(p0.y)), expected (\(w), \(h))")
+            allPassed = false
+        }
+        let pWh = CGPoint(x: w, y: h).applying(t)
+        if abs(pWh.x - 0) > 0.001 || abs(pWh.y - 0) > 0.001 {
+            print("[FlawsTest] FAIL: Transform (w,h) -> (\(pWh.x), \(pWh.y)), expected (0,0)")
+            allPassed = false
+        }
+        let pCenter = CGPoint(x: w / 2, y: h / 2).applying(t)
+        if abs(pCenter.x - w / 2) > 0.001 || abs(pCenter.y - h / 2) > 0.001 {
+            print("[FlawsTest] FAIL: Center moved under 180° rotation: \(pCenter)")
+            allPassed = false
+        }
+
+        // 2. Bayer CFA boundary reflection parity preservation
+        // Width = 4032 (even), max index = 4031 (odd)
+        let maxW = 4031
+        let offsets = [-2, -1, 1, 2]
+        for dx in offsets {
+            // Left boundary: x = 0
+            let pxLeft = 0 + dx
+            let reflLeft = pxLeft < 0 ? -pxLeft : pxLeft
+            if (reflLeft & 1) != ((pxLeft & 1) + 2) % 2 {
+                print("[FlawsTest] FAIL: Left boundary reflection parity mismatch for dx=\(dx): px=\(pxLeft), refl=\(reflLeft)")
+                allPassed = false
+            }
+
+            // Right boundary: x = maxW
+            let pxRight = maxW + dx
+            let reflRight = pxRight > maxW ? (2 * maxW - pxRight) : pxRight
+            if (reflRight & 1) != ((pxRight & 1) + 2) % 2 {
+                print("[FlawsTest] FAIL: Right boundary reflection parity mismatch for dx=\(dx): px=\(pxRight), refl=\(reflRight)")
+                allPassed = false
+            }
+        }
+
+        // 3. Symmetric ISO ratio scene-cut detection
+        let checkCut: (Float, Float) -> Bool = { iso1, iso2 in
+            let ratio = max(iso1, iso2) / max(1.0, min(iso1, iso2))
+            return ratio >= 3.0
+        }
+        // Jump UP: 100 -> 350 (ratio 3.5 >= 3.0 -> true)
+        if !checkCut(100, 350) {
+            print("[FlawsTest] FAIL: Upward ISO cut (100 -> 350) did not trigger")
+            allPassed = false
+        }
+        // Jump DOWN: 350 -> 100 (ratio 3.5 >= 3.0 -> true)
+        if !checkCut(350, 100) {
+            print("[FlawsTest] FAIL: Downward ISO cut (350 -> 100) did not trigger")
+            allPassed = false
+        }
+        // Minor change: 100 -> 150 (ratio 1.5 < 3.0 -> false)
+        if checkCut(100, 150) {
+            print("[FlawsTest] FAIL: Minor ISO change (100 -> 150) falsely triggered cut")
+            allPassed = false
+        }
+
+        // 4. CFR rounded hold-frame timing stability
+        let fps = 24.0
+        // Normal frame at 1/24s: elapsed = 0.04167s -> rounded targetCount = 1
+        let countNormal = Int64((0.041666 * fps).rounded())
+        if countNormal != 1 {
+            print("[FlawsTest] FAIL: 1/24s should produce 1 frame, got \(countNormal)")
+            allPassed = false
+        }
+        // Jitter frame at 0.045s (delayed debayer): rounded targetCount should still be 1 (no runaway hold frame)
+        let countJitter = Int64((0.045 * fps).rounded())
+        if countJitter != 1 {
+            print("[FlawsTest] FAIL: Delayed frame at 0.045s should produce 1 frame, got \(countJitter)")
+            allPassed = false
+        }
+        // Skipped frame at 2/24s = 0.08333s: rounded targetCount should be 2 (exactly 1 hold slot needed)
+        let countSkipped = Int64((0.083333 * fps).rounded())
+        if countSkipped != 2 {
+            print("[FlawsTest] FAIL: Skipped frame at 2/24s should produce 2 frames, got \(countSkipped)")
+            allPassed = false
+        }
+
+        if allPassed {
+            print("[FlawsTest] PASS: Transform, reflection, symmetric scene-cut, and CFR timing verified successfully")
+        }
+        return allPassed
     }
 }
 

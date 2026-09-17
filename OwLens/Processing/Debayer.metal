@@ -30,9 +30,17 @@ struct WhiteBalanceParams {
 
 
 static inline float sampleBayerFast(texture2d<float, access::read> tex, int x, int y, int dx, int dy, float black, float invDenom) {
-    int nx = clamp(x + dx, 0, int(tex.get_width()) - 1);
-    int ny = clamp(y + dy, 0, int(tex.get_height()) - 1);
-    float v = tex.read(uint2(nx, ny)).r;
+    int w = int(tex.get_width()) - 1;
+    int h = int(tex.get_height()) - 1;
+    int px = x + dx;
+    int py = y + dy;
+    // Bayer CFA phase preservation: reflect odd/even coordinates across boundaries
+    // so color channels (R/Gr/Gb/B) remain aligned with sensor parity at edges.
+    if (px < 0) px = -px;
+    else if (px > w) px = 2 * w - px;
+    if (py < 0) py = -py;
+    else if (py > h) py = 2 * h - py;
+    float v = tex.read(uint2(clamp(px, 0, w), clamp(py, 0, h))).r;
     return (v - black) * invDenom;
 }
 

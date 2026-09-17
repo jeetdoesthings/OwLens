@@ -25,6 +25,7 @@ struct RawFrameData {
     let exposureDurationSeconds: Double
     let colorMatrix: simd_float3x3?
     let sgamutMatrix: simd_float3x3?
+    let timestamp: CMTime
 }
 
 final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
@@ -1202,7 +1203,8 @@ extension CaptureController: AVCapturePhotoCaptureDelegate {
             iso: currentISO,
             exposureDurationSeconds: device?.exposureDuration.seconds ?? 0,
             colorMatrix: colorMatrices.bt2020,
-            sgamutMatrix: colorMatrices.sgamut
+            sgamutMatrix: colorMatrices.sgamut,
+            timestamp: photo.timestamp
         )
 
         onRawFrameData?(frameData)

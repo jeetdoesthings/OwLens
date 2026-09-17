@@ -1,6 +1,7 @@
 import AVFoundation
 import VideoToolbox
 import QuartzCore
+import UIKit
 
 /// Wraps a non-Sendable reference so it can be captured by a `@Sendable` closure
 /// (e.g. `AVAssetWriter.finishWriting`'s callback). `AVAssetWriter` is not
@@ -28,6 +29,7 @@ final class VideoWriter: @unchecked Sendable {
     private var targetFPS: Double = 24
     private var startHostTime: CFTimeInterval = 0
     private var audioReferenceTime: CMTime = .invalid
+    private var sessionStartTime: CMTime = .invalid
     private var hasStartedSession = false
     private var lastPixelBuffer: CVPixelBuffer?
     private var pendingAudioBuffers: [CMSampleBuffer] = []
@@ -35,6 +37,7 @@ final class VideoWriter: @unchecked Sendable {
     private var curveType: LogCurveType = .sLog3Approx
     private let lock = NSLock()
 
+    var onLowDiskSpace: (@Sendable () -> Void)?
     var isRecording = false
     private(set) var droppedFrames: Int = 0
 
@@ -54,7 +57,8 @@ final class VideoWriter: @unchecked Sendable {
         targetFPS: Double = 24,
         includeAudio: Bool = true,
         curveType: LogCurveType = .sLog3Approx,
-        codec: VideoCodecOption = .hevc
+        codec: VideoCodecOption = .hevc,
+        orientation: UIInterfaceOrientation = .landscapeRight
     ) throws {
         lock.lock()
         defer { lock.unlock() }
@@ -117,6 +121,14 @@ final class VideoWriter: @unchecked Sendable {
         vInput.expectsMediaDataInRealTime = true
         vInput.mediaTimeScale = CMTimeScale(fps * 1000)
 
+        // If shooting in Landscape Left, rotate video track by 180° so video plays upright
+        // in standard players (QuickTime, DaVinci Resolve, FCP) without upside-down playback.
+        if orientation == .landscapeLeft {
+            vInput.transform = CGAffineTransform(rotationAngle: .pi).translatedBy(x: -CGFloat(width), y: -CGFloat(height))
+        } else {
+            vInput.transform = .identity
+        }
+
         // Use 10-bit bi-planar YCbCr for accurate LOG gradient recording.
         let pixelFormatType: OSType = (curveType == .linear)
             ? kCVPixelFormatType_32BGRA
@@ -165,13 +177,14 @@ final class VideoWriter: @unchecked Sendable {
         self.realFrameCount = 0
         self.droppedFrames = 0
         self.startHostTime = CACurrentMediaTime()
+        self.sessionStartTime = .invalid
         self.hasStartedSession = true
         self.lastPixelBuffer = nil
         self.audioReferenceTime = .invalid
         self.pendingAudioBuffers.removeAll()
         self.isRecording = true
 
-        print("[VideoWriter] CFR \(Int(fps))fps \(width)x\(height) codec=HEVC bitrate=\(bitrate)")
+        print("[VideoWriter] CFR \(Int(fps))fps \(width)x\(height) codec=\(codec.displayName) bitrate=\(bitrate) orientation=\(orientation.rawValue)")
     }
 
     private func drainPendingAudioBuffersLocked() {
@@ -195,8 +208,12 @@ final class VideoWriter: @unchecked Sendable {
         do {
             let values = try outputURL.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
             if let available = values.volumeAvailableCapacityForImportantUsage {
-                // If less than 500 MB left, refuse frames to allow safe finalization
-                return available > 500 * 1024 * 1024
+                // If less than 500 MB left, notify handler to stop recording safely and refuse further frames
+                if available <= 500 * 1024 * 1024 {
+                    onLowDiskSpace?()
+                    return false
+                }
+                return true
             }
         } catch {}
         return true
@@ -204,7 +221,7 @@ final class VideoWriter: @unchecked Sendable {
 
     /// Append a real camera frame. Fills any missing CFR slots by holding last frame.
     @discardableResult
-    func appendFrame(pixelBuffer: CVPixelBuffer) -> Bool {
+    func appendFrame(pixelBuffer: CVPixelBuffer, captureTime: CMTime? = nil) -> Bool {
         lock.lock()
         defer { lock.unlock() }
 
@@ -253,14 +270,22 @@ final class VideoWriter: @unchecked Sendable {
 
         if !hasStartedSession {
             startHostTime = now
+            if let captureTime = captureTime, captureTime.isValid {
+                sessionStartTime = captureTime
+            }
             assetWriter?.startSession(atSourceTime: .zero)
             hasStartedSession = true
         }
 
-        let elapsed = max(0, now - startHostTime)
-        // How many CFR frames should exist by this wall time (0-based next index)
-        // e.g. at t=1.0s @ 24fps -> need frames 0..23 written (count 24) -> targetCount = 24
-        let wallTargetCount = Int64(floor(elapsed * targetFPS + 1e-9)) + 1
+        let elapsedSeconds: Double
+        if let captureTime = captureTime, captureTime.isValid, sessionStartTime.isValid {
+            elapsedSeconds = max(0, CMTimeSubtract(captureTime, sessionStartTime).seconds)
+        } else {
+            elapsedSeconds = max(0, now - startHostTime)
+        }
+
+        // How many CFR frames should exist by this capture time (rounded to nearest frame to avoid drift)
+        let wallTargetCount = Int64((elapsedSeconds * targetFPS).rounded()) + 1
         // Always advance at least one slot for this real frame
         let targetCount = max(frameCount + 1, wallTargetCount)
 
@@ -338,16 +363,24 @@ final class VideoWriter: @unchecked Sendable {
         ), count: timingCount)
         CMSampleBufferGetSampleTimingInfoArray(sampleBuffer, entryCount: timingCount, arrayToFill: &timings, entriesNeededOut: &timingCount)
 
-        // Use the first audio sample's PTS as reference to keep all retiming
-        // in the audio clock domain (not host time / CACurrentMediaTime).
-        // This prevents drift from mismatched clock domains.
-        let firstPTS = timings[0].presentationTimeStamp
-        if CMTimeCompare(audioReferenceTime, .invalid) == 0 {
-            audioReferenceTime = firstPTS
+        // Anchor audio timeline to the first optical frame's capture time (sessionStartTime)
+        // or fallback to first audio PTS. This ensures microsecond lip-sync alignment with video.
+        let baseTime = sessionStartTime.isValid ? sessionStartTime : audioReferenceTime
+        if !baseTime.isValid {
+            audioReferenceTime = timings[0].presentationTimeStamp
+        }
+        let refTime = sessionStartTime.isValid ? sessionStartTime : audioReferenceTime
+
+        // If this audio buffer finished completely before session start, skip pre-roll
+        if sessionStartTime.isValid, timings[0].duration.isValid {
+            let bufferEnd = CMTimeAdd(timings[0].presentationTimeStamp, timings[0].duration)
+            if CMTimeCompare(bufferEnd, refTime) <= 0 {
+                return true
+            }
         }
 
         for i in 0..<timings.count {
-            var pts = CMTimeSubtract(timings[i].presentationTimeStamp, audioReferenceTime)
+            var pts = CMTimeSubtract(timings[i].presentationTimeStamp, refTime)
             if CMTimeCompare(pts, .zero) < 0 {
                 pts = .zero
             }
@@ -413,6 +446,7 @@ final class VideoWriter: @unchecked Sendable {
         let url = assetWriter?.outputURL
         isRecording = false
         audioReferenceTime = .invalid
+        sessionStartTime = .invalid
         hasStartedSession = false
         lastPixelBuffer = nil
         let writer = assetWriter
