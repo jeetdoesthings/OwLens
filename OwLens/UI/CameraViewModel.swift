@@ -507,14 +507,17 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
         captureController.bayerPatternOverride = caps.bayerPatternOverride?.rawValue
 
         do {
-            try AVAudioSession.sharedInstance().setCategory(
+            let audioSession = AVAudioSession.sharedInstance()
+            try audioSession.setCategory(
                 .playAndRecord,
                 mode: .videoRecording,
                 options: [.defaultToSpeaker, .allowBluetoothHFP, .allowBluetoothA2DP, .mixWithOthers]
             )
-            try AVAudioSession.sharedInstance().setPreferredSampleRate(48_000)
-            try AVAudioSession.sharedInstance().setPreferredIOBufferDuration(0.02)
-            try AVAudioSession.sharedInstance().setActive(true)
+            try audioSession.setPreferredSampleRate(48_000)
+            try audioSession.setPreferredIOBufferDuration(0.02)
+            DispatchQueue.global(qos: .userInitiated).async {
+                try? audioSession.setActive(true)
+            }
         } catch {
             print("[CameraViewModel] Audio session: \(error)")
         }
@@ -553,7 +556,9 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
         levelMonitor.stop()
         captureController.stopSession()
         frameBuffer.flush()
-        try? AVAudioSession.sharedInstance().setActive(false)
+        DispatchQueue.global(qos: .userInitiated).async {
+            try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+        }
     }
 
     func togglePanel(_ panel: ControlPanel) {

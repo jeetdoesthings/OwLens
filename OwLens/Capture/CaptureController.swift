@@ -87,7 +87,9 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
             )
             try audioSession.setPreferredSampleRate(48_000)
             try audioSession.setPreferredIOBufferDuration(0.02)
-            try audioSession.setActive(true)
+            DispatchQueue.global(qos: .userInitiated).async {
+                try? audioSession.setActive(true)
+            }
         } catch {
             print("[CaptureController] Audio session configure failed (non-fatal): \(error)")
         }
@@ -668,7 +670,6 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
     func availableAudioSources() -> [AudioSourceOption] {
         var options: [AudioSourceOption] = []
         let audioSession = AVAudioSession.sharedInstance()
-        try? audioSession.setActive(true, options: [])
 
         var seen = Set<String>()
         for port in audioSession.availableInputs ?? [] {
