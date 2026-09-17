@@ -241,6 +241,16 @@ struct ControlsView: View {
             }
 
             monitoringToolButton(
+                text: "709",
+                isActive: viewModel.showDisplayLUT
+            ) {
+                if viewModel.previewDisplayMode != .log {
+                    viewModel.previewDisplayMode = .log
+                }
+                viewModel.toggleDisplayLUT()
+            }
+
+            monitoringToolButton(
                 systemName: "grid",
                 isActive: viewModel.showGrid
             ) {
@@ -281,7 +291,8 @@ struct ControlsView: View {
     }
 
     private func monitoringToolButton(
-        systemName: String,
+        systemName: String? = nil,
+        text: String? = nil,
         isActive: Bool,
         action: @escaping () -> Void
     ) -> some View {
@@ -289,15 +300,22 @@ struct ControlsView: View {
             Haptics.selection()
             action()
         } label: {
-            Image(systemName: systemName)
-                .font(.system(size: 13, weight: .medium))
-                .foregroundColor(isActive ? .black : OwLensTheme.textSecondary)
-                .frame(width: 34, height: 34)
-                .background(
-                    RoundedRectangle(cornerRadius: OwLensTheme.radiusCard, style: .continuous)
-                        .fill(isActive ? OwLensTheme.glassActive : Color.clear)
-                )
-                .contentShape(Rectangle())
+            Group {
+                if let text {
+                    Text(text)
+                        .font(.system(size: 10, weight: .bold, design: .monospaced))
+                } else if let systemName {
+                    Image(systemName: systemName)
+                        .font(.system(size: 13, weight: .medium))
+                }
+            }
+            .foregroundColor(isActive ? .black : OwLensTheme.textSecondary)
+            .frame(width: 34, height: 34)
+            .background(
+                RoundedRectangle(cornerRadius: OwLensTheme.radiusCard, style: .continuous)
+                    .fill(isActive ? OwLensTheme.glassActive : Color.clear)
+            )
+            .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
     }
