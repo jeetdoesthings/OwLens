@@ -313,6 +313,16 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
     // MARK: - Init
 
     override init() {
+        print("""
+
+        ================================================================
+          🎬 OwLens — Accurate 10-Bit LOG Pipeline Active
+          🌿 Git Branch: fix/accurate-log-color-pipeline
+          🎯 Format: 10-Bit Video Range YCbCr (x420) · BT.2020
+          📐 Headroom: 1.0 (Unwarped Scene Reflectance OETF)
+        ================================================================
+
+        """)
         metalPipeline = MetalPipeline()
         super.init()
 #if DEBUG

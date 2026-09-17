@@ -128,17 +128,30 @@ struct ControlsView: View {
                 Haptics.selection()
                 viewModel.togglePanel(.log)
             } label: {
-                Text(shortCurveName(viewModel.selectedCurve))
-                    .font(.geist(.semiBold, size: 10))
-                    .foregroundColor(isTopLocked ? OwLensTheme.textDisabled : OwLensTheme.textPrimary)
-                    .padding(.horizontal, 9)
-                    .frame(height: 30)
-                    .glassPanel(
-                        cornerRadius: OwLensTheme.radiusCard,
-                        border: viewModel.activePanel == .log ? OwLensTheme.glassBorderActive : OwLensTheme.glassBorder,
-                        background: viewModel.activePanel == .log ? OwLensTheme.glassActiveBg : OwLensTheme.glassBase
-                    )
-                    .contentShape(Rectangle())
+                HStack(spacing: 5) {
+                    Text(shortCurveName(viewModel.selectedCurve))
+                        .font(.geist(.semiBold, size: 10))
+                        .foregroundColor(isTopLocked ? OwLensTheme.textDisabled : OwLensTheme.textPrimary)
+                    if viewModel.selectedCurve != .linear {
+                        Text("10-BIT")
+                            .font(.geistMono(.bold, size: 8))
+                            .foregroundColor(isTopLocked ? OwLensTheme.textDisabled : .white)
+                            .padding(.horizontal, 4)
+                            .padding(.vertical, 1.5)
+                            .background(
+                                RoundedRectangle(cornerRadius: 3, style: .continuous)
+                                    .fill(Color.white.opacity(0.18))
+                            )
+                    }
+                }
+                .padding(.horizontal, 8)
+                .frame(height: 30)
+                .glassPanel(
+                    cornerRadius: OwLensTheme.radiusCard,
+                    border: viewModel.activePanel == .log ? OwLensTheme.glassBorderActive : OwLensTheme.glassBorder,
+                    background: viewModel.activePanel == .log ? OwLensTheme.glassActiveBg : OwLensTheme.glassBase
+                )
+                .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
             .disabled(isTopLocked)
@@ -1351,9 +1364,9 @@ struct ControlsView: View {
 
     private func curveDescription(_ curve: LogCurveType) -> String {
         switch curve {
-        case .linear: return "Linear sensor transform"
-        case .sLog3Approx: return "High dynamic range log"
-        case .appleLog2: return "Apple Log 2 encoding"
+        case .linear: return "8-bit Linear sRGB"
+        case .sLog3Approx: return "10-bit Sony S-Log3 · BT.2020"
+        case .appleLog2: return "10-bit Apple Log · BT.2020"
         }
     }
 }
