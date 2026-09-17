@@ -1287,12 +1287,12 @@ struct ControlsView: View {
             .disabled(viewModel.isDeviceUnsupportedForLog)
         }
         .frame(width: 84)
-        .overlay(alignment: .top) {
+        .overlay(alignment: .topTrailing) {
             // Scopes Overlay (Histogram & Waveform) docked under record button
-            // Anchored in overlay so toggling scopes never shifts the record or lock buttons
+            // Anchored with topTrailing so it aligns cleanly with the right grip rail
             if viewModel.showScopes {
                 ScopesOverlay(data: viewModel.scopeData)
-                    .offset(y: 122) // lock height (36) + spacing (12) + shutter height (64) + gap (10) = 122
+                    .offset(y: 118) // lock height (36) + spacing (12) + shutter height (64) + gap (6) = 118
                     .transition(.opacity.combined(with: .scale(scale: 0.95)))
             }
         }

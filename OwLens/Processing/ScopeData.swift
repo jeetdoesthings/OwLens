@@ -20,9 +20,9 @@ struct ScopeData: Equatable {
         histogramRed: Array(repeating: 0, count: 64),
         histogramGreen: Array(repeating: 0, count: 64),
         histogramBlue: Array(repeating: 0, count: 64),
-        waveform: Array(repeating: 0, count: 64 * 32),
+        waveform: Array(repeating: 0, count: 64 * 48),
         waveformColumns: 64,
-        waveformRows: 32
+        waveformRows: 48
     )
 
     static func make(
@@ -31,7 +31,7 @@ struct ScopeData: Equatable {
         height: Int,
         histogramBins: Int = 64,
         waveformColumns: Int = 64,
-        waveformRows: Int = 32
+        waveformRows: Int = 48
     ) -> ScopeData {
         guard width > 0, height > 0, pixels.count >= width * height * 4 else {
             return .empty
