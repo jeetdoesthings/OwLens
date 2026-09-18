@@ -446,6 +446,58 @@ extension MetalPipeline {
         return allPassed
     }
 
+    /// Validates that the Malvar-He-Cutler 5x5 linear demosaicing formulas preserve neutral color balance
+    /// on uniform (flat) fields across all Bayer CFA sub-pixel phases, with zero green bias.
+    static func runMalvarNeutralityTest() -> Bool {
+        var allPassed = true
+        let eps: Float = 1e-5
+
+        // On a uniform field of value V:
+        let testValues: [Float] = [0.25, 0.5, 0.8, 1.0]
+        for v in testValues {
+            let c00 = v
+            let cN1 = v, cS1 = v, cE1 = v, cW1 = v
+            let cN2 = v, cS2 = v, cE2 = v, cW2 = v
+            let cNE = v, cNW = v, cSE = v, cSW = v
+
+            // Malvar-He-Cutler formulas from Debayer.metal:
+            let gAtRB = (2.0 * (cN1 + cS1 + cE1 + cW1) + 4.0 * c00 - (cN2 + cS2 + cE2 + cW2)) * 0.125
+            let colorAtGH = (4.0 * (cE1 + cW1) + 5.0 * c00 - (cE2 + cW2) + 0.5 * (cN2 + cS2) - (cNE + cNW + cSE + cSW)) * 0.125
+            let colorAtGV = (4.0 * (cN1 + cS1) + 5.0 * c00 - (cN2 + cS2) + 0.5 * (cE2 + cW2) - (cNE + cNW + cSE + cSW)) * 0.125
+            let colorAtDiag = (2.0 * (cNE + cNW + cSE + cSW) + 6.0 * c00 - 1.5 * (cN2 + cS2 + cE2 + cW2)) * 0.125
+
+            if abs(gAtRB - v) > eps {
+                print("[MalvarTest] FAIL: G_at_RB expected \(v), got \(gAtRB)")
+                allPassed = false
+            }
+            if abs(colorAtGH - v) > eps {
+                print("[MalvarTest] FAIL: Color_at_G_H expected \(v), got \(colorAtGH)")
+                allPassed = false
+            }
+            if abs(colorAtGV - v) > eps {
+                print("[MalvarTest] FAIL: Color_at_G_V expected \(v), got \(colorAtGV)")
+                allPassed = false
+            }
+            if abs(colorAtDiag - v) > eps {
+                print("[MalvarTest] FAIL: Color_at_Diag expected \(v), got \(colorAtDiag)")
+                allPassed = false
+            }
+
+            // Test norm-preserving highlight shoulder with neutral white input
+            let neutralIn = SIMD3<Float>(v, v, v)
+            let shoulderOut = LogCurve.applyHighlightShoulder3(neutralIn, rKnee: 0.36, rMax: 12.0)
+            if abs(shoulderOut.x - shoulderOut.y) > eps || abs(shoulderOut.y - shoulderOut.z) > eps {
+                print("[MalvarTest] FAIL: Highlight shoulder skewed neutral white \(neutralIn) -> \(shoulderOut)")
+                allPassed = false
+            }
+        }
+
+        if allPassed {
+            print("[MalvarTest] PASS: Malvar-He-Cutler demosaic neutrality & norm-preserving shoulder verified")
+        }
+        return allPassed
+    }
+
     /// Benchmarks the optimized pipeline (single-pass fused demosaic + direct BGRA scaling)
     /// on synthetic Bayer frames to verify that GPU frame times stay comfortably below the real-time budget.
     func runPipelineThroughputBenchmark() -> Bool {

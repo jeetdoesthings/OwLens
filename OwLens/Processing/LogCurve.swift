@@ -125,14 +125,24 @@ enum LogCurve {
         return rKnee + delta * g
     }
 
+    static func applyHighlightShoulder3(_ rgb: SIMD3<Float>, rKnee: Float = 0.36, rMax: Float = 12.0) -> SIMD3<Float> {
+        let peak = max(rgb.x, max(rgb.y, rgb.z))
+        guard rMax > rKnee + 1e-4, peak > rKnee else { return rgb }
+        let peakShoulder = applyHighlightShoulder(peak, rKnee: rKnee, rMax: rMax)
+        let scale = peakShoulder / max(peak, 1e-6)
+        let scaled = rgb * scale
+
+        // Filmic highlight rolloff to clean neutral white as intensity approaches peak saturation
+        let t = simd_clamp((peak - rKnee) / max(1.0 - rKnee, 1e-4), 0.0, 1.0)
+        let desat = t * t * 0.75
+        let target = SIMD3<Float>(repeating: peakShoulder)
+        return simd_mix(scaled, target, SIMD3<Float>(repeating: desat))
+    }
+
     static func apply(_ rgb: SIMD3<Float>, type: LogCurveType, headroomScale: Float = 1.0) -> SIMD3<Float> {
         var input = rgb
         if headroomScale > 1.0 {
-            input = SIMD3<Float>(
-                applyHighlightShoulder(input.x, rKnee: 0.36, rMax: headroomScale),
-                applyHighlightShoulder(input.y, rKnee: 0.36, rMax: headroomScale),
-                applyHighlightShoulder(input.z, rKnee: 0.36, rMax: headroomScale)
-            )
+            input = applyHighlightShoulder3(input, rKnee: 0.36, rMax: headroomScale)
         }
         switch type {
         case .linear:

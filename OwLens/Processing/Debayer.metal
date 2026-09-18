@@ -133,11 +133,17 @@ static inline float applyHighlightShoulderMetal(float r, float rKnee, float rMax
 }
 
 static inline float3 applyHighlightShoulder3(float3 rgb, float rKnee, float rMax) {
-    return float3(
-        applyHighlightShoulderMetal(rgb.r, rKnee, rMax),
-        applyHighlightShoulderMetal(rgb.g, rKnee, rMax),
-        applyHighlightShoulderMetal(rgb.b, rKnee, rMax)
-    );
+    float peak = max(rgb.r, max(rgb.g, rgb.b));
+    if (rMax <= rKnee + 1e-4f || peak <= rKnee) return rgb;
+
+    float peakShoulder = applyHighlightShoulderMetal(peak, rKnee, rMax);
+    float scale = peakShoulder / max(peak, 1e-6f);
+    float3 scaled = rgb * scale;
+
+    // Filmic highlight rolloff to clean neutral white as intensity approaches peak saturation
+    float t = clamp((peak - rKnee) / max(1.0f - rKnee, 1e-4f), 0.0f, 1.0f);
+    float desat = t * t * 0.75f;
+    return mix(scaled, float3(peakShoulder), desat);
 }
 
 static inline float3 encodeLogCurve(float3 rgb, int curveType, float headroomScale = 1.0f) {
@@ -284,8 +290,8 @@ kernel void debayerWBLinear(
     float cSW = sampleBayerFast(rawTexture, x, y, -1, 1, black, invDenom);
 
     float G_at_RB = (2*(cN1 + cS1 + cE1 + cW1) + 4*c00 - (cN2 + cS2 + cE2 + cW2)) * 0.125f;
-    float Color_at_G_H = (4*(cE1 + cW1) + 5*c00 - (cE2 + cW2) - 0.5f*(cN2 + cS2) - (cNE + cNW + cSE + cSW)) * 0.125f;
-    float Color_at_G_V = (4*(cN1 + cS1) + 5*c00 - (cN2 + cS2) - 0.5f*(cE2 + cW2) - (cNE + cNW + cSE + cSW)) * 0.125f;
+    float Color_at_G_H = (4*(cE1 + cW1) + 5*c00 - (cE2 + cW2) + 0.5f*(cN2 + cS2) - (cNE + cNW + cSE + cSW)) * 0.125f;
+    float Color_at_G_V = (4*(cN1 + cS1) + 5*c00 - (cN2 + cS2) + 0.5f*(cE2 + cW2) - (cNE + cNW + cSE + cSW)) * 0.125f;
     float Color_at_Diag = (2*(cNE + cNW + cSE + cSW) + 6*c00 - 1.5f*(cN2 + cS2 + cE2 + cW2)) * 0.125f;
 
     float r, g, b;
@@ -324,13 +330,11 @@ kernel void debayerWBLinear(
     rgb = max(rgb, float3(0.0));
 
     // ── Highlight Desaturation & Reconstruction ──
-    // When raw sensor channels clip (typically green first on Bayer sensors),
-    // WB gains multiply red/blue channels to ~2x while green stays pinned at 1.0,
-    // causing severe magenta/pink highlights. Desaturate chroma only as channels
-    // approach true sensor saturation (> 0.96), preserving rich sunset/neon colors.
+    // Desaturate chroma smoothly as raw channels approach analog sensor saturation (>= 0.92),
+    // preventing tint shifts on clipped highlights while preserving rich natural highlights.
     float maxRaw = max(r, max(g, b));
-    if (maxRaw > 0.96f) {
-        float desat = smoothstep(0.96f, 0.995f, maxRaw);
+    if (maxRaw > 0.92f) {
+        float desat = smoothstep(0.92f, 0.985f, maxRaw);
         float peakVal = max(rgb.r, max(rgb.g, rgb.b));
         rgb = mix(rgb, float3(peakVal), desat);
     }
@@ -396,8 +400,8 @@ kernel void debayerFusedLog(
     float cSW = sampleBayerFast(rawTexture, x, y, -1, 1, black, invDenom);
 
     float G_at_RB = (2*(cN1 + cS1 + cE1 + cW1) + 4*c00 - (cN2 + cS2 + cE2 + cW2)) * 0.125f;
-    float Color_at_G_H = (4*(cE1 + cW1) + 5*c00 - (cE2 + cW2) - 0.5f*(cN2 + cS2) - (cNE + cNW + cSE + cSW)) * 0.125f;
-    float Color_at_G_V = (4*(cN1 + cS1) + 5*c00 - (cN2 + cS2) - 0.5f*(cE2 + cW2) - (cNE + cNW + cSE + cSW)) * 0.125f;
+    float Color_at_G_H = (4*(cE1 + cW1) + 5*c00 - (cE2 + cW2) + 0.5f*(cN2 + cS2) - (cNE + cNW + cSE + cSW)) * 0.125f;
+    float Color_at_G_V = (4*(cN1 + cS1) + 5*c00 - (cN2 + cS2) + 0.5f*(cE2 + cW2) - (cNE + cNW + cSE + cSW)) * 0.125f;
     float Color_at_Diag = (2*(cNE + cNW + cSE + cSW) + 6*c00 - 1.5f*(cN2 + cS2 + cE2 + cW2)) * 0.125f;
 
     float r, g, b;
@@ -436,11 +440,11 @@ kernel void debayerFusedLog(
     rgb = max(rgb, float3(0.0));
 
     // ── Highlight Desaturation & Reconstruction ──
-    // Desaturate chroma only as channels approach true sensor saturation (> 0.96),
-    // preventing pink/magenta cast on clipped highlights while preserving color in bright areas.
+    // Desaturate chroma smoothly as raw channels approach analog sensor saturation (>= 0.92),
+    // preventing tint shifts on clipped highlights while preserving rich natural highlights.
     float maxRaw = max(r, max(g, b));
-    if (maxRaw > 0.96f) {
-        float desat = smoothstep(0.96f, 0.995f, maxRaw);
+    if (maxRaw > 0.92f) {
+        float desat = smoothstep(0.92f, 0.985f, maxRaw);
         float peakVal = max(rgb.r, max(rgb.g, rgb.b));
         rgb = mix(rgb, float3(peakVal), desat);
     }

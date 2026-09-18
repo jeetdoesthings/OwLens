@@ -327,7 +327,7 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
 
         ================================================================
           🎬 OwLens — Accurate 10-Bit LOG Pipeline Active
-          🌿 Git Branch: fix/true-log-color-and-scopes
+          🌿 Git Branch: fix/highlight-green-tint-and-demosaic
           🎯 Format: 10-Bit Video Range YCbCr (x420) · BT.2020
           📐 Headroom: C1 Filmic Highlight Shoulder (Rmax=12.0 Apple Log, 10.0 S-Log3)
         ================================================================
@@ -343,6 +343,7 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
                 _ = MetalPipeline.runColorMatrixValidationTest()
                 _ = MetalPipeline.runLogCurvesStandardComplianceTest()
                 _ = MetalPipeline.runHighlightShoulderTest()
+                _ = MetalPipeline.runMalvarNeutralityTest()
                 _ = MetalPipeline.runScopeDataBT2020Test()
                 _ = MetalPipeline.run10BitYCbCrEncodingTest()
                 _ = MetalPipeline.runAutoExposureAndWBValidationTest()
