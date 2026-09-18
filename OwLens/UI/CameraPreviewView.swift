@@ -57,6 +57,16 @@ struct CameraPreviewView: UIViewRepresentable {
         Coordinator(metalPipeline: metalPipeline)
     }
  
+    struct DisplayUniforms {
+        var destOffset: SIMD2<Int32>
+        var destSize: SIMD2<Int32>
+        var showClipping: Int32
+        var showFocusPeaking: Int32
+        var overlayOnly: Int32
+        var showDisplayLUT: Int32
+        var curveType: Int32
+    }
+
     final class Coordinator: NSObject, MTKViewDelegate {
         let metalPipeline: MetalPipeline
         var currentTexture: MTLTexture?
@@ -181,26 +191,16 @@ struct CameraPreviewView: UIViewRepresentable {
                 renderEncoder.setRenderPipelineState(renderPipeline)
                 renderEncoder.setFragmentTexture(texture, index: 0)
                 
-                var offset = SIMD2<Int32>(Int32(originX), Int32(originY))
-                renderEncoder.setFragmentBytes(&offset, length: MemoryLayout<SIMD2<Int32>>.size, index: 0)
-                
-                var size = SIMD2<Int32>(Int32(fitW), Int32(fitH))
-                renderEncoder.setFragmentBytes(&size, length: MemoryLayout<SIMD2<Int32>>.size, index: 1)
-                
-                var clipping: Int32 = showClipping ? 1 : 0
-                renderEncoder.setFragmentBytes(&clipping, length: MemoryLayout<Int32>.size, index: 2)
-                
-                var peaking: Int32 = showFocusPeaking ? 1 : 0
-                renderEncoder.setFragmentBytes(&peaking, length: MemoryLayout<Int32>.size, index: 3)
-                
-                var overlay: Int32 = overlayOnly ? 1 : 0
-                renderEncoder.setFragmentBytes(&overlay, length: MemoryLayout<Int32>.size, index: 4)
-                
-                var lut: Int32 = showDisplayLUT ? 1 : 0
-                renderEncoder.setFragmentBytes(&lut, length: MemoryLayout<Int32>.size, index: 5)
-
-                var curve: Int32 = Int32(metalPipeline.curveType.rawValue)
-                renderEncoder.setFragmentBytes(&curve, length: MemoryLayout<Int32>.size, index: 6)
+                var uniforms = DisplayUniforms(
+                    destOffset: SIMD2<Int32>(Int32(originX), Int32(originY)),
+                    destSize: SIMD2<Int32>(Int32(fitW), Int32(fitH)),
+                    showClipping: showClipping ? 1 : 0,
+                    showFocusPeaking: showFocusPeaking ? 1 : 0,
+                    overlayOnly: overlayOnly ? 1 : 0,
+                    showDisplayLUT: showDisplayLUT ? 1 : 0,
+                    curveType: Int32(metalPipeline.curveType.rawValue)
+                )
+                renderEncoder.setFragmentBytes(&uniforms, length: MemoryLayout<DisplayUniforms>.stride, index: 0)
                 
                 // Draw full-screen triangle
                 renderEncoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)

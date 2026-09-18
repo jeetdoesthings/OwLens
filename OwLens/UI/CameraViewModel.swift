@@ -1079,7 +1079,7 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
     }
 #endif
 
-    static func cleanStaleTemporaryRecordings() {
+    nonisolated static func cleanStaleTemporaryRecordings() {
         let fileManager = FileManager.default
         let tempDir = fileManager.temporaryDirectory
         guard let contents = try? fileManager.contentsOfDirectory(at: tempDir, includingPropertiesForKeys: [.creationDateKey]) else { return }
@@ -1103,8 +1103,10 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
         }
         guard controlsLocked, !isRecording, !isSaving else { return }
 
-        // Clean stale temporary recordings from previous interrupted sessions
-        Self.cleanStaleTemporaryRecordings()
+        // Clean stale temporary recordings from previous interrupted sessions in background
+        Task.detached(priority: .utility) {
+            Self.cleanStaleTemporaryRecordings()
+        }
 
         activeEncodeWidth = selectedFormat.width
         activeEncodeHeight = selectedFormat.height
@@ -1113,6 +1115,7 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
         updateDenoiseStrength()
         metalPipeline?.curveType = selectedCurve
         metalPipeline?.clearTemporalHistory()
+        metalPipeline?.prewarm(width: selectedFormat.width, height: selectedFormat.height, curveType: selectedCurve)
         frameBuffer.flush()
         captureController.setRecordingMode(true)
         let effectiveBitrate = min(selectedBitrate.bitsPerSecond, selectedFormat.maxBitratePreset.bitsPerSecond)
@@ -1185,13 +1188,21 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
     private func lockAutoModesForRecording() {
         guard let device = captureController.activeDevice else { return }
 
+        // If exposure, white balance, and focus are already locked (e.g. via lockControls()),
+        // skip locking hardware configuration to avoid stalling the capture pipeline.
+        let needsExposureOrWB = isAutoExposureEnabled || isAutoWhiteBalanceEnabled
+        let needsFocus = isAutoFocus
+        guard needsExposureOrWB || needsFocus else { return }
+
         do {
             try device.lockForConfiguration()
 
-            freezeAutoExposureAndWB(on: device)
+            if needsExposureOrWB {
+                freezeAutoExposureAndWB(on: device)
+            }
 
             // Lock focus at current position without calling setFocusModeLocked with invalid lensPosition.
-            if isAutoFocus {
+            if needsFocus {
                 let pos = device.lensPosition
                 if pos >= 0.0 && pos <= 1.0 {
                     focusLensPosition = pos
@@ -1204,7 +1215,9 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
             }
 
             device.unlockForConfiguration()
-            updateWBParams(from: device)
+            if needsExposureOrWB {
+                updateWBParams(from: device)
+            }
         } catch {
             print("[CameraViewModel] lockAutoModesForRecording failed: \(error)")
         }
@@ -1238,7 +1251,7 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
             guard let url else {
                 Task { @MainActor [weak self] in
                     self?.statusText = "Save failed"
-                    self?.errorMessage = "No output file"
+                    self?.errorMessage = "Recording ended with no frames"
                     self?.endSaveTask()
                 }
                 return
@@ -1270,7 +1283,7 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
         // Validate the file before attempting any save
         guard validateVideoFile(at: url) else {
             statusText = "Save failed"
-            errorMessage = "Video file is corrupt — try a lower bitrate for 4K recordings"
+            errorMessage = "Video file is corrupt or empty"
             print("[CameraViewModel] File validation failed for \(url.lastPathComponent)")
             try? FileManager.default.removeItem(at: url)
             endSaveTask()
@@ -1310,15 +1323,20 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
         }
     }
 
-    /// Verify the output file exists and has reasonable size before handing to Photos.
+    /// Verify the output file exists, is non-empty, and contains a playable video track.
     private func validateVideoFile(at url: URL) -> Bool {
         guard let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
-              let size = attrs[.size] as? Int64 else {
-            print("[CameraViewModel] Cannot stat output file")
+              let size = attrs[.size] as? Int64,
+              size > 1024 else {
+            print("[CameraViewModel] Output file is missing or empty")
             return false
         }
-        // Must have at least 100KB to be a valid video
-        return size > 100_000
+        let asset = AVURLAsset(url: url)
+        guard let track = asset.tracks(withMediaType: .video).first else {
+            print("[CameraViewModel] Output file has no video track")
+            return false
+        }
+        return track.timeRange.duration.seconds > 0
     }
 
     private func presentFilesFolderPicker() {
@@ -1517,10 +1535,6 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
         }
     }
 
-    struct SendablePixelBuffer: @unchecked Sendable {
-        let buffer: CVPixelBuffer
-    }
-
     nonisolated private func processFrame(_ frameData: RawFrameData, completion: @escaping () -> Void) {
         guard isAppActive else { completion(); return }
         guard let pipeline = metalPipeline else { completion(); return }
@@ -1529,8 +1543,18 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
         pipeline.blackLevel = frameData.blackLevel
         pipeline.whiteLevel = frameData.whiteLevel
 
-        // LSC: calibration > device table > frame default (live DNG).
-        pipeline.lscParams = Self.simd4ToLSCParams(frameData.lscCoefficients)
+        // LSC: calibrated override > frame default > neutral
+        if let override = lscOverride {
+            pipeline.lscParams = override.asLSCParams
+        } else if frameData.lscCoefficients != .zero {
+            pipeline.lscParams = Self.simd4ToLSCParams(frameData.lscCoefficients)
+        } else {
+            pipeline.lscParams = LSCParams(
+                radialR: 0, radialG: 0, radialB: 0,
+                radial4R: 0, radial4G: 0, radial4B: 0,
+                azimuthR: 0, azimuthG: 0, azimuthB: 0
+            )
+        }
         pipeline.greenBalance = 1.0
         pipeline.iso = frameData.iso
 
@@ -1613,7 +1637,7 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
                 prevW = w
                 prevH = h
             }
-            pipeline.processPreviewOnly(frameData.pixelBuffer, encodeWidth: prevW, encodeHeight: prevH, encodeAsBGRA: false) { [weak self] framed, _ in
+            pipeline.processPreviewOnly(frameData.pixelBuffer, encodeWidth: prevW, encodeHeight: prevH) { [weak self] framed in
                 defer { completion() }
                 guard let self, let framed else { return }
 

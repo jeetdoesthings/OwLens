@@ -3,14 +3,6 @@ import VideoToolbox
 import QuartzCore
 import UIKit
 
-/// Wraps a non-Sendable reference so it can be captured by a `@Sendable` closure
-/// (e.g. `AVAssetWriter.finishWriting`'s callback). `AVAssetWriter` is not
-/// `Sendable`, but here it is retired before this callback runs and is not used
-/// concurrently elsewhere, so `@unchecked` isolation is sound.
-private final class SendableAssetWriter: @unchecked Sendable {
-    let value: AVAssetWriter
-    init(_ value: AVAssetWriter) { self.value = value }
-}
 
 /// AVAssetWriter — HEVC + optional AAC at **constant** 24 or 30 fps.
 ///
@@ -167,7 +159,6 @@ final class VideoWriter: @unchecked Sendable {
         guard writer.startWriting() else {
             throw writer.error ?? NSError(domain: "RawLogCam", code: 11, userInfo: [NSLocalizedDescriptionKey: "AVAssetWriter failed to start"])
         }
-        writer.startSession(atSourceTime: .zero)
 
         self.assetWriter = writer
         self.videoInput = vInput
@@ -176,9 +167,9 @@ final class VideoWriter: @unchecked Sendable {
         self.frameCount = 0
         self.realFrameCount = 0
         self.droppedFrames = 0
-        self.startHostTime = CACurrentMediaTime()
+        self.startHostTime = 0
         self.sessionStartTime = .invalid
-        self.hasStartedSession = true
+        self.hasStartedSession = false
         self.lastPixelBuffer = nil
         self.audioReferenceTime = .invalid
         self.pendingAudioBuffers.removeAll()
@@ -241,30 +232,7 @@ final class VideoWriter: @unchecked Sendable {
         }
 
         // Attach color space & transfer characteristics to pixel buffer for VideoToolbox encoding
-        switch curveType {
-        case .appleLog2:
-            CVBufferSetAttachment(pixelBuffer, kCVImageBufferColorPrimariesKey, kCVImageBufferColorPrimaries_ITU_R_2020, .shouldPropagate)
-            CVBufferSetAttachment(pixelBuffer, kCVImageBufferYCbCrMatrixKey, kCVImageBufferYCbCrMatrix_ITU_R_2020, .shouldPropagate)
-            CVBufferRemoveAttachment(pixelBuffer, kCVImageBufferTransferFunctionKey)
-            if #available(iOS 17.2, *) {
-                CVBufferSetAttachment(pixelBuffer, kCVImageBufferLogTransferFunctionKey, kCVImageBufferLogTransferFunction_AppleLog, .shouldPropagate)
-            } else {
-                CVBufferSetAttachment(pixelBuffer, "LogTransferFunction" as CFString, "com.apple.rec2020.apple-log" as CFString, .shouldPropagate)
-            }
-        case .sLog3Approx:
-            CVBufferSetAttachment(pixelBuffer, kCVImageBufferColorPrimariesKey, kCVImageBufferColorPrimaries_ITU_R_2020, .shouldPropagate)
-            CVBufferSetAttachment(pixelBuffer, kCVImageBufferYCbCrMatrixKey, kCVImageBufferYCbCrMatrix_ITU_R_2020, .shouldPropagate)
-            CVBufferRemoveAttachment(pixelBuffer, kCVImageBufferTransferFunctionKey)
-            if #available(iOS 17.2, *) {
-                CVBufferRemoveAttachment(pixelBuffer, kCVImageBufferLogTransferFunctionKey)
-            } else {
-                CVBufferRemoveAttachment(pixelBuffer, "LogTransferFunction" as CFString)
-            }
-        case .linear:
-            CVBufferSetAttachment(pixelBuffer, kCVImageBufferColorPrimariesKey, kCVImageBufferColorPrimaries_ITU_R_709_2, .shouldPropagate)
-            CVBufferSetAttachment(pixelBuffer, kCVImageBufferTransferFunctionKey, kCVImageBufferTransferFunction_ITU_R_709_2, .shouldPropagate)
-            CVBufferSetAttachment(pixelBuffer, kCVImageBufferYCbCrMatrixKey, kCVImageBufferYCbCrMatrix_ITU_R_709_2, .shouldPropagate)
-        }
+        MetalPipeline.attachColorMetadata(to: pixelBuffer, curveType: curveType)
 
         let now = CACurrentMediaTime()
 
@@ -277,11 +245,24 @@ final class VideoWriter: @unchecked Sendable {
             hasStartedSession = true
         }
 
-        let elapsedSeconds: Double
+        var elapsedSeconds: Double
         if let captureTime = captureTime, captureTime.isValid, sessionStartTime.isValid {
             elapsedSeconds = max(0, CMTimeSubtract(captureTime, sessionStartTime).seconds)
         } else {
             elapsedSeconds = max(0, now - startHostTime)
+        }
+
+        // Startup grace: If startup delays (pool allocation, camera mode lock, or initial pipeline spin-up)
+        // caused a gap after the very first frame or before the second frame, do NOT inject a flurry of hold frames!
+        // Hold frames are only for bridging mid-stream frame drops, not for startup stalls.
+        // If continuous motion has not been established yet (realFrameCount <= 1) and elapsedSeconds exceeds
+        // 1.5 frame durations, re-anchor sessionStartTime and startHostTime to this frame, resetting elapsedSeconds to 0.
+        if realFrameCount <= 1 && elapsedSeconds > (1.5 / targetFPS) {
+            if let captureTime = captureTime, captureTime.isValid {
+                sessionStartTime = captureTime
+            }
+            startHostTime = now
+            elapsedSeconds = 0.0
         }
 
         // How many CFR frames should exist by this capture time.
@@ -347,7 +328,8 @@ final class VideoWriter: @unchecked Sendable {
 
         guard isRecording,
               let input = audioInput,
-              hasStartedSession else {
+              hasStartedSession,
+              realFrameCount >= 2 else {
             return false
         }
         guard CMSampleBufferDataIsReady(sampleBuffer) else { return false }
@@ -472,7 +454,17 @@ final class VideoWriter: @unchecked Sendable {
             completion(nil)
             return
         }
-        let boxedWriter = SendableAssetWriter(writer)
+
+        if real == 0 {
+            print("[VideoWriter] No real frames were appended to the video timeline.")
+            writer.cancelWriting()
+            if let url {
+                try? FileManager.default.removeItem(at: url)
+            }
+            completion(nil)
+            return
+        }
+        let boxedWriter = SendableBox(value: writer)
         writer.finishWriting {
             let status = boxedWriter.value.status
             let duration = Double(total) / fps
@@ -484,12 +476,5 @@ final class VideoWriter: @unchecked Sendable {
                 completion(url)
             }
         }
-    }
-
-    var estimatedDuration: Double {
-        lock.lock()
-        defer { lock.unlock() }
-        guard startHostTime > 0 else { return 0 }
-        return CACurrentMediaTime() - startHostTime
     }
 }

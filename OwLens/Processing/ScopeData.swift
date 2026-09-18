@@ -8,13 +8,6 @@ struct ScopeData: Equatable {
     let waveformColumns: Int
     let waveformRows: Int
 
-    var histogram: [Float] {
-        var result = [Float](repeating: 0, count: histogramRed.count)
-        for i in 0..<histogramRed.count {
-            result[i] = max(histogramRed[i], histogramGreen[i], histogramBlue[i])
-        }
-        return result
-    }
 
     static let empty = ScopeData(
         histogramRed: Array(repeating: 0, count: 64),

@@ -115,7 +115,7 @@ enum LogCurve {
         let delta = rMax - rKnee
         let dr = 1.0 - rKnee
         let s0 = dr / delta
-        let s1: Float = 2.0
+        let s1: Float = 0.0
         let a = s1 + s0 - 2.0
         let b = 3.0 - 2.0 * s0 - s1
         let c = s0
@@ -130,13 +130,7 @@ enum LogCurve {
         guard rMax > rKnee + 1e-4, peak > rKnee else { return rgb }
         let peakShoulder = applyHighlightShoulder(peak, rKnee: rKnee, rMax: rMax)
         let scale = peakShoulder / max(peak, 1e-6)
-        let scaled = rgb * scale
-
-        // Filmic highlight rolloff to clean neutral white as intensity approaches peak saturation
-        let t = simd_clamp((peak - rKnee) / max(1.0 - rKnee, 1e-4), 0.0, 1.0)
-        let desat = t * t * 0.75
-        let target = SIMD3<Float>(repeating: peakShoulder)
-        return simd_mix(scaled, target, SIMD3<Float>(repeating: desat))
+        return rgb * scale
     }
 
     static func apply(_ rgb: SIMD3<Float>, type: LogCurveType, headroomScale: Float = 1.0) -> SIMD3<Float> {

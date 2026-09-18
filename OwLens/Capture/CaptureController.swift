@@ -72,6 +72,8 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
     private var cachedWhiteLevel: Float?
     private var cachedISO: Float?
     private var cachedKelvin: Float?
+    private var cachedFM1: [Float]?
+    private var cachedFM2: [Float]?
     private var cachedColorMatrices: (bt2020: simd_float3x3?, sgamut: simd_float3x3?)?
 
     // MARK: - Session Configuration
@@ -803,9 +805,6 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
     /// Optional per-device CFA override from DeviceCapabilities (nil = use live OSType/DNG).
     var bayerPatternOverride: Int32?
 
-    func currentWhiteBalanceGains() -> AVCaptureDevice.WhiteBalanceGains? {
-        device?.deviceWhiteBalanceGains
-    }
 
     var activeDevice: AVCaptureDevice? { device }
 
@@ -1162,18 +1161,18 @@ extension CaptureController: AVCapturePhotoCaptureDelegate {
         let black = levels.0
         let white = levels.1
 
-        // Radial Lens Shading Correction (LSC) to eliminate optical vignetting falloff:
-        // Wide (24mm): ~1.4x corner compensation (k1=0.65, k2=0.35)
-        // Ultra-wide (13mm): ~1.65x corner compensation (k1=0.85, k2=0.50)
-        // Telephoto (77mm+): ~1.2x corner compensation (k1=0.40, k2=0.20)
+        // Optical Lens Shading Correction (LSC) to counteract physical lens vignetting (cos⁴θ falloff):
+        // Wide (24-26mm f/1.5-f/1.8): ~3.42x corner compensation (alpha = 0.85, +1.78 EV)
+        // Ultra-wide (13-14mm f/2.2-f/2.4): ~4.62x corner compensation (alpha = 1.15, +2.21 EV)
+        // Telephoto (52-77mm+): ~1.69x corner compensation (alpha = 0.30, +0.76 EV)
         let lsc: SIMD4<Float>
         switch device?.deviceType {
         case .builtInUltraWideCamera:
-            lsc = SIMD4<Float>(0.85, 0.50, 0.0, 0.0)
+            lsc = SIMD4<Float>(1.15, 0.0, 0.0, 0.0)
         case .builtInTelephotoCamera:
-            lsc = SIMD4<Float>(0.40, 0.20, 0.0, 0.0)
+            lsc = SIMD4<Float>(0.30, 0.0, 0.0, 0.0)
         default:
-            lsc = SIMD4<Float>(0.65, 0.35, 0.0, 0.0)
+            lsc = SIMD4<Float>(0.85, 0.0, 0.0, 0.0)
         }
 
         let currentKelvin = device.map { dev -> Float in
@@ -1181,15 +1180,20 @@ extension CaptureController: AVCapturePhotoCaptureDelegate {
             return dev.temperatureAndTintValues(for: gains).temperature
         }
 
-        let colorMatrices: (bt2020: simd_float3x3?, sgamut: simd_float3x3?)
-        if let cached = cachedColorMatrices, let ck = cachedKelvin, let currentKelvin, abs(ck - currentKelvin) < 100.0 {
-            colorMatrices = cached
+        let smoothedKelvin: Float?
+        if let currentKelvin {
+            let prev = cachedKelvin ?? currentKelvin
+            // Exponential smoothing over consecutive frames eliminates discrete stepped matrix jumps
+            let smoothed = prev * 0.85 + currentKelvin * 0.15
+            cachedKelvin = smoothed
+            smoothedKelvin = smoothed
         } else {
-            colorMatrices = extractColorMatrices(from: photo, kelvin: currentKelvin)
-            if colorMatrices.bt2020 != nil {
-                cachedColorMatrices = colorMatrices
-                cachedKelvin = currentKelvin
-            }
+            smoothedKelvin = cachedKelvin
+        }
+
+        let colorMatrices = extractColorMatrices(from: photo, kelvin: smoothedKelvin)
+        if colorMatrices.bt2020 != nil {
+            cachedColorMatrices = colorMatrices
         }
 
         let frameData = RawFrameData(
@@ -1202,8 +1206,8 @@ extension CaptureController: AVCapturePhotoCaptureDelegate {
             lscCoefficients: lsc,
             iso: currentISO,
             exposureDurationSeconds: device?.exposureDuration.seconds ?? 0,
-            colorMatrix: colorMatrices.bt2020,
-            sgamutMatrix: colorMatrices.sgamut,
+            colorMatrix: colorMatrices.bt2020 ?? cachedColorMatrices?.bt2020,
+            sgamutMatrix: colorMatrices.sgamut ?? cachedColorMatrices?.sgamut,
             timestamp: photo.timestamp
         )
 
@@ -1211,7 +1215,9 @@ extension CaptureController: AVCapturePhotoCaptureDelegate {
     }
 
     private func extractColorMatrices(from photo: AVCapturePhoto, kelvin: Float? = nil) -> (bt2020: simd_float3x3?, sgamut: simd_float3x3?) {
-        guard let dng = photo.metadata["{DNG}"] as? [String: Any] else { return (nil, nil) }
+        guard let dng = photo.metadata["{DNG}"] as? [String: Any] else {
+            return cachedColorMatrices ?? (nil, nil)
+        }
 
         // Standard CIE XYZ D50 to ITU-R BT.2020 (D65) matrix (CIE XYZ D65 -> BT.2020 * Bradford D50 -> D65):
         let mD50to2020 = simd_float3x3(
@@ -1242,10 +1248,16 @@ extension CaptureController: AVCapturePhotoCaptureDelegate {
         )
 
         // Priority 1: DNG ForwardMatrix (Dual-Illuminant Interpolation between Standard Light A ~2856K and D65 ~6504K)
-        let fm1Raw = dng["ForwardMatrix1"] as? [Any]
-        let fm2Raw = dng["ForwardMatrix2"] as? [Any]
-        let fm1Vals = fm1Raw.flatMap(Self.parseMatrixFloats)
-        let fm2Vals = fm2Raw.flatMap(Self.parseMatrixFloats)
+        if cachedFM1 == nil {
+            let fm1Raw = dng["ForwardMatrix1"] as? [Any]
+            cachedFM1 = fm1Raw.flatMap(Self.parseMatrixFloats)
+        }
+        if cachedFM2 == nil {
+            let fm2Raw = dng["ForwardMatrix2"] as? [Any]
+            cachedFM2 = fm2Raw.flatMap(Self.parseMatrixFloats)
+        }
+        let fm1Vals = cachedFM1
+        let fm2Vals = cachedFM2
 
         var finalFMVals: [Float]? = nil
         if let fm1Vals, let fm2Vals, let kelvin {
@@ -1360,6 +1372,13 @@ extension CaptureController: AVCapturePhotoCaptureDelegate {
         if blackRaw == 0, let tiff = metadata["{TIFF}"] as? [String: Any],
            let bl = Self.floatFromMetadata(tiff["BlackLevel"]) {
             blackRaw = bl
+        }
+
+        if blackRaw == 0, let cb = cachedBlackLevel {
+            blackRaw = cb * fullScale
+        }
+        if whiteRaw == 16383, let cw = cachedWhiteLevel {
+            whiteRaw = cw * fullScale
         }
 
         let black = max(0, blackRaw / fullScale)

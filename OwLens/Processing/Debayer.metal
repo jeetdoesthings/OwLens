@@ -29,19 +29,15 @@ struct WhiteBalanceParams {
 
 
 
-static inline float sampleBayerFast(texture2d<float, access::read> tex, int x, int y, int dx, int dy, float black, float invDenom) {
-    int w = int(tex.get_width()) - 1;
-    int h = int(tex.get_height()) - 1;
+static inline float sampleBayerRaw(texture2d<float, access::read> tex, int maxW, int maxH, int x, int y, int dx, int dy) {
     int px = x + dx;
     int py = y + dy;
-    // Bayer CFA phase preservation: reflect odd/even coordinates across boundaries
-    // so color channels (R/Gr/Gb/B) remain aligned with sensor parity at edges.
+    // Bayer CFA phase preservation: reflect coordinates across boundaries
     if (px < 0) px = -px;
-    else if (px > w) px = 2 * w - px;
+    else if (px > maxW) px = 2 * maxW - px;
     if (py < 0) py = -py;
-    else if (py > h) py = 2 * h - py;
-    float v = tex.read(uint2(clamp(px, 0, w), clamp(py, 0, h))).r;
-    return (v - black) * invDenom;
+    else if (py > maxH) py = 2 * maxH - py;
+    return tex.read(uint2(px, py)).r;
 }
 
 kernel void correctDefectPixelsBayer(
@@ -122,7 +118,7 @@ static inline float applyHighlightShoulderMetal(float r, float rKnee, float rMax
     float delta = rMax - rKnee;
     float dr = 1.0f - rKnee;
     float s0 = dr / delta;
-    float s1 = 2.0f;
+    float s1 = 0.0f;
     float a = s1 + s0 - 2.0f;
     float b = 3.0f - 2.0f * s0 - s1;
     float c = s0;
@@ -138,12 +134,7 @@ static inline float3 applyHighlightShoulder3(float3 rgb, float rKnee, float rMax
 
     float peakShoulder = applyHighlightShoulderMetal(peak, rKnee, rMax);
     float scale = peakShoulder / max(peak, 1e-6f);
-    float3 scaled = rgb * scale;
-
-    // Filmic highlight rolloff to clean neutral white as intensity approaches peak saturation
-    float t = clamp((peak - rKnee) / max(1.0f - rKnee, 1e-4f), 0.0f, 1.0f);
-    float desat = t * t * 0.75f;
-    return mix(scaled, float3(peakShoulder), desat);
+    return rgb * scale;
 }
 
 static inline float3 encodeLogCurve(float3 rgb, int curveType, float headroomScale = 1.0f) {
@@ -181,15 +172,21 @@ static inline float3 encodeLogCurve(float3 rgb, int curveType, float headroomSca
     }
 
     // Sony S-Log3 published OETF on scene-linear (18% mid grey ≈ 0.18)
-    // Output code values roughly 0–1 (10-bit /1023).
+    // Pre-evaluated compile-time quotients map runtime divisions into single-cycle FMA.
+    constexpr float kScale = 261.5f / 1023.0f;
+    constexpr float kOffset = 420.0f / 1023.0f;
+    constexpr float kInv19 = 1.0f / 0.19f;
+    constexpr float kSlope = (171.2102946929f - 95.0f) / (0.01125f * 1023.0f);
+    constexpr float kPedestal = 95.0f / 1023.0f;
+
     float3 result;
     float3 clamped = max(rgb, float3(0.0));
     for (int i = 0; i < 3; i++) {
         float lin = clamped[i];
         if (lin >= 0.01125f) {
-            result[i] = (420.0f + metal::log10((lin + 0.01f) / (0.18f + 0.01f)) * 261.5f) / 1023.0f;
+            result[i] = metal::fma(metal::log10((lin + 0.01f) * kInv19), kScale, kOffset);
         } else {
-            result[i] = (lin * (171.2102946929f - 95.0f) / 0.01125f + 95.0f) / 1023.0f;
+            result[i] = metal::fma(lin, kSlope, kPedestal);
         }
     }
     return saturate(result);
@@ -260,34 +257,32 @@ kernel void debayerWBLinear(
     int x = int(gid.x);
     int y = int(gid.y);
 
-    bool xEven = (x % 2 == 0);
-    bool yEven = (y % 2 == 0);
-
     int pattern = params.bayerPattern;
-    if (pattern == 1) { xEven = !xEven; }
-    else if (pattern == 2) { yEven = !yEven; }
-    else if (pattern == 3) { xEven = !xEven; yEven = !yEven; }
+    bool xEven = ((x ^ pattern) & 1) == 0;
+    bool yEven = ((y ^ (pattern >> 1)) & 1) == 0;
 
     float black = params.blackLevel;
     float white = params.whiteLevel;
     float invDenom = 1.0f / max(white - black, 1e-6f);
+    int maxW = int(rawTexture.get_width()) - 1;
+    int maxH = int(rawTexture.get_height()) - 1;
 
-    // ── Directional Demosaic (Malvar-He-Cutler) with FMA linearize ──
-    float c00 = sampleBayerFast(rawTexture, x, y, 0, 0, black, invDenom);
-    float cN1 = sampleBayerFast(rawTexture, x, y, 0, -1, black, invDenom);
-    float cS1 = sampleBayerFast(rawTexture, x, y, 0, 1, black, invDenom);
-    float cE1 = sampleBayerFast(rawTexture, x, y, 1, 0, black, invDenom);
-    float cW1 = sampleBayerFast(rawTexture, x, y, -1, 0, black, invDenom);
+    // ── Directional Demosaic (Malvar-He-Cutler) on raw DNs ──
+    float c00 = sampleBayerRaw(rawTexture, maxW, maxH, x, y, 0, 0);
+    float cN1 = sampleBayerRaw(rawTexture, maxW, maxH, x, y, 0, -1);
+    float cS1 = sampleBayerRaw(rawTexture, maxW, maxH, x, y, 0, 1);
+    float cE1 = sampleBayerRaw(rawTexture, maxW, maxH, x, y, 1, 0);
+    float cW1 = sampleBayerRaw(rawTexture, maxW, maxH, x, y, -1, 0);
     
-    float cN2 = sampleBayerFast(rawTexture, x, y, 0, -2, black, invDenom);
-    float cS2 = sampleBayerFast(rawTexture, x, y, 0, 2, black, invDenom);
-    float cE2 = sampleBayerFast(rawTexture, x, y, 2, 0, black, invDenom);
-    float cW2 = sampleBayerFast(rawTexture, x, y, -2, 0, black, invDenom);
+    float cN2 = sampleBayerRaw(rawTexture, maxW, maxH, x, y, 0, -2);
+    float cS2 = sampleBayerRaw(rawTexture, maxW, maxH, x, y, 0, 2);
+    float cE2 = sampleBayerRaw(rawTexture, maxW, maxH, x, y, 2, 0);
+    float cW2 = sampleBayerRaw(rawTexture, maxW, maxH, x, y, -2, 0);
     
-    float cNE = sampleBayerFast(rawTexture, x, y, 1, -1, black, invDenom);
-    float cNW = sampleBayerFast(rawTexture, x, y, -1, -1, black, invDenom);
-    float cSE = sampleBayerFast(rawTexture, x, y, 1, 1, black, invDenom);
-    float cSW = sampleBayerFast(rawTexture, x, y, -1, 1, black, invDenom);
+    float cNE = sampleBayerRaw(rawTexture, maxW, maxH, x, y, 1, -1);
+    float cNW = sampleBayerRaw(rawTexture, maxW, maxH, x, y, -1, -1);
+    float cSE = sampleBayerRaw(rawTexture, maxW, maxH, x, y, 1, 1);
+    float cSW = sampleBayerRaw(rawTexture, maxW, maxH, x, y, -1, 1);
 
     float G_at_RB = (2*(cN1 + cS1 + cE1 + cW1) + 4*c00 - (cN2 + cS2 + cE2 + cW2)) * 0.125f;
     float Color_at_G_H = (4*(cE1 + cW1) + 5*c00 - (cE2 + cW2) + 0.5f*(cN2 + cS2) - (cNE + cNW + cSE + cSW)) * 0.125f;
@@ -304,23 +299,32 @@ kernel void debayerWBLinear(
     } else {
         b = c00; g = G_at_RB; r = Color_at_Diag;
     }
-    r = max(r, 0.0f);
-    g = max(g, 0.0f);
-    b = max(b, 0.0f);
+
+    // ── Single Post-Demosaic Linearization: (DN - black) * invDenom ──
+    r = max((r - black) * invDenom, 0.0f);
+    g = max((g - black) * invDenom, 0.0f);
+    b = max((b - black) * invDenom, 0.0f);
 
     // Gr/Gb green balance before LSC/WB.
     g *= params.greenBalance;
 
-    // Fast SIMD Lens Shading Correction (LSC): radial polynomial + algebraic azimuth
+    // Fast Lens Shading Correction (LSC): true cos⁴θ optical inverse model
     float outW = float(outTexture.get_width());
     float outH = float(outTexture.get_height());
-    float2 uv = (float2(float(x) + 0.5f, float(y) + 0.5f) / float2(outW, outH)) - 0.5f;
-    float r2 = dot(uv, uv);
-    float r4 = r2 * r2;
+    float dx = float(x) + 0.5f - 0.5f * outW;
+    float dy = float(y) + 0.5f - 0.5f * outH;
+    float invCornerDistSq = 4.0f / max(outW * outW + outH * outH, 1e-4f);
+    float rNormSq = (dx * dx + dy * dy) * invCornerDistSq;
 
-    float3 gain = float3(1.0f) + float3(lsc.radialR, lsc.radialG, lsc.radialB) * r2 + float3(lsc.radial4R, lsc.radial4G, lsc.radial4B) * r4;
+    // Exact cos⁴θ inverse gain: (1.0 + alpha * rNormSq)^2
+    float3 alphaGain = float3(lsc.radialR, lsc.radialG, lsc.radialB);
+    float3 baseGain = float3(1.0f) + alphaGain * rNormSq;
+    float3 gain = baseGain * baseGain;
+    if (lsc.radial4R != 0.0f || lsc.radial4G != 0.0f || lsc.radial4B != 0.0f) {
+        gain += float3(lsc.radial4R, lsc.radial4G, lsc.radial4B) * (rNormSq * rNormSq);
+    }
     if (lsc.azimuthR != 0.0f || lsc.azimuthG != 0.0f || lsc.azimuthB != 0.0f) {
-        float cos2Theta = (uv.x * uv.x - uv.y * uv.y) / max(r2, 1e-6f);
+        float cos2Theta = (dx * dx - dy * dy) / max(dx * dx + dy * dy, 1e-6f);
         gain += float3(lsc.azimuthR, lsc.azimuthG, lsc.azimuthB) * cos2Theta;
     }
     float3 rgb = min(float3(r, g, b) * gain, float3(8.0f));
@@ -328,16 +332,6 @@ kernel void debayerWBLinear(
     // ── White Balance ──
     rgb *= params.wbGains;
     rgb = max(rgb, float3(0.0));
-
-    // ── Highlight Desaturation & Reconstruction ──
-    // Desaturate chroma smoothly as raw channels approach analog sensor saturation (>= 0.92),
-    // preventing tint shifts on clipped highlights while preserving rich natural highlights.
-    float maxRaw = max(r, max(g, b));
-    if (maxRaw > 0.92f) {
-        float desat = smoothstep(0.92f, 0.985f, maxRaw);
-        float peakVal = max(rgb.r, max(rgb.g, rgb.b));
-        rgb = mix(rgb, float3(peakVal), desat);
-    }
 
     // ── Color Correction Matrix (Sensor Native → Target Gamut e.g. BT.2020) ──
     rgb = colorMatrix * rgb;
@@ -370,34 +364,32 @@ kernel void debayerFusedLog(
     int x = int(gid.x);
     int y = int(gid.y);
 
-    bool xEven = (x % 2 == 0);
-    bool yEven = (y % 2 == 0);
-
     int pattern = params.bayerPattern;
-    if (pattern == 1) { xEven = !xEven; }
-    else if (pattern == 2) { yEven = !yEven; }
-    else if (pattern == 3) { xEven = !xEven; yEven = !yEven; }
+    bool xEven = ((x ^ pattern) & 1) == 0;
+    bool yEven = ((y ^ (pattern >> 1)) & 1) == 0;
 
     float black = params.blackLevel;
     float white = params.whiteLevel;
     float invDenom = 1.0f / max(white - black, 1e-6f);
+    int maxW = int(rawTexture.get_width()) - 1;
+    int maxH = int(rawTexture.get_height()) - 1;
 
-    // ── Directional Demosaic (Malvar-He-Cutler) with FMA linearize ──
-    float c00 = sampleBayerFast(rawTexture, x, y, 0, 0, black, invDenom);
-    float cN1 = sampleBayerFast(rawTexture, x, y, 0, -1, black, invDenom);
-    float cS1 = sampleBayerFast(rawTexture, x, y, 0, 1, black, invDenom);
-    float cE1 = sampleBayerFast(rawTexture, x, y, 1, 0, black, invDenom);
-    float cW1 = sampleBayerFast(rawTexture, x, y, -1, 0, black, invDenom);
+    // ── Directional Demosaic (Malvar-He-Cutler) on raw DNs ──
+    float c00 = sampleBayerRaw(rawTexture, maxW, maxH, x, y, 0, 0);
+    float cN1 = sampleBayerRaw(rawTexture, maxW, maxH, x, y, 0, -1);
+    float cS1 = sampleBayerRaw(rawTexture, maxW, maxH, x, y, 0, 1);
+    float cE1 = sampleBayerRaw(rawTexture, maxW, maxH, x, y, 1, 0);
+    float cW1 = sampleBayerRaw(rawTexture, maxW, maxH, x, y, -1, 0);
     
-    float cN2 = sampleBayerFast(rawTexture, x, y, 0, -2, black, invDenom);
-    float cS2 = sampleBayerFast(rawTexture, x, y, 0, 2, black, invDenom);
-    float cE2 = sampleBayerFast(rawTexture, x, y, 2, 0, black, invDenom);
-    float cW2 = sampleBayerFast(rawTexture, x, y, -2, 0, black, invDenom);
+    float cN2 = sampleBayerRaw(rawTexture, maxW, maxH, x, y, 0, -2);
+    float cS2 = sampleBayerRaw(rawTexture, maxW, maxH, x, y, 0, 2);
+    float cE2 = sampleBayerRaw(rawTexture, maxW, maxH, x, y, 2, 0);
+    float cW2 = sampleBayerRaw(rawTexture, maxW, maxH, x, y, -2, 0);
     
-    float cNE = sampleBayerFast(rawTexture, x, y, 1, -1, black, invDenom);
-    float cNW = sampleBayerFast(rawTexture, x, y, -1, -1, black, invDenom);
-    float cSE = sampleBayerFast(rawTexture, x, y, 1, 1, black, invDenom);
-    float cSW = sampleBayerFast(rawTexture, x, y, -1, 1, black, invDenom);
+    float cNE = sampleBayerRaw(rawTexture, maxW, maxH, x, y, 1, -1);
+    float cNW = sampleBayerRaw(rawTexture, maxW, maxH, x, y, -1, -1);
+    float cSE = sampleBayerRaw(rawTexture, maxW, maxH, x, y, 1, 1);
+    float cSW = sampleBayerRaw(rawTexture, maxW, maxH, x, y, -1, 1);
 
     float G_at_RB = (2*(cN1 + cS1 + cE1 + cW1) + 4*c00 - (cN2 + cS2 + cE2 + cW2)) * 0.125f;
     float Color_at_G_H = (4*(cE1 + cW1) + 5*c00 - (cE2 + cW2) + 0.5f*(cN2 + cS2) - (cNE + cNW + cSE + cSW)) * 0.125f;
@@ -414,23 +406,32 @@ kernel void debayerFusedLog(
     } else {
         b = c00; g = G_at_RB; r = Color_at_Diag;
     }
-    r = max(r, 0.0f);
-    g = max(g, 0.0f);
-    b = max(b, 0.0f);
+
+    // ── Single Post-Demosaic Linearization: (DN - black) * invDenom ──
+    r = max((r - black) * invDenom, 0.0f);
+    g = max((g - black) * invDenom, 0.0f);
+    b = max((b - black) * invDenom, 0.0f);
 
     // Gr/Gb green balance before LSC/WB.
     g *= params.greenBalance;
 
-    // Fast SIMD Lens Shading Correction (LSC): radial polynomial + algebraic azimuth
+    // Fast Lens Shading Correction (LSC): true cos⁴θ optical inverse model
     float outW = float(outTexture.get_width());
     float outH = float(outTexture.get_height());
-    float2 uv = (float2(float(x) + 0.5f, float(y) + 0.5f) / float2(outW, outH)) - 0.5f;
-    float r2 = dot(uv, uv);
-    float r4 = r2 * r2;
+    float dx = float(x) + 0.5f - 0.5f * outW;
+    float dy = float(y) + 0.5f - 0.5f * outH;
+    float invCornerDistSq = 4.0f / max(outW * outW + outH * outH, 1e-4f);
+    float rNormSq = (dx * dx + dy * dy) * invCornerDistSq;
 
-    float3 gain = float3(1.0f) + float3(lsc.radialR, lsc.radialG, lsc.radialB) * r2 + float3(lsc.radial4R, lsc.radial4G, lsc.radial4B) * r4;
+    // Exact cos⁴θ inverse gain: (1.0 + alpha * rNormSq)^2
+    float3 alphaGain = float3(lsc.radialR, lsc.radialG, lsc.radialB);
+    float3 baseGain = float3(1.0f) + alphaGain * rNormSq;
+    float3 gain = baseGain * baseGain;
+    if (lsc.radial4R != 0.0f || lsc.radial4G != 0.0f || lsc.radial4B != 0.0f) {
+        gain += float3(lsc.radial4R, lsc.radial4G, lsc.radial4B) * (rNormSq * rNormSq);
+    }
     if (lsc.azimuthR != 0.0f || lsc.azimuthG != 0.0f || lsc.azimuthB != 0.0f) {
-        float cos2Theta = (uv.x * uv.x - uv.y * uv.y) / max(r2, 1e-6f);
+        float cos2Theta = (dx * dx - dy * dy) / max(dx * dx + dy * dy, 1e-6f);
         gain += float3(lsc.azimuthR, lsc.azimuthG, lsc.azimuthB) * cos2Theta;
     }
     float3 rgb = min(float3(r, g, b) * gain, float3(8.0f));
@@ -438,16 +439,6 @@ kernel void debayerFusedLog(
     // ── White Balance ──
     rgb *= params.wbGains;
     rgb = max(rgb, float3(0.0));
-
-    // ── Highlight Desaturation & Reconstruction ──
-    // Desaturate chroma smoothly as raw channels approach analog sensor saturation (>= 0.92),
-    // preventing tint shifts on clipped highlights while preserving rich natural highlights.
-    float maxRaw = max(r, max(g, b));
-    if (maxRaw > 0.92f) {
-        float desat = smoothstep(0.92f, 0.985f, maxRaw);
-        float peakVal = max(rgb.r, max(rgb.g, rgb.b));
-        rgb = mix(rgb, float3(peakVal), desat);
-    }
 
     // ── Color Correction Matrix (Sensor Native → Target Gamut e.g. BT.2020) ──
     rgb = colorMatrix * rgb;
@@ -513,41 +504,50 @@ kernel void convertRgbTo420YpCbCr10(
     float y11 = dot(p11, wY);
 
     // 10-bit Video Range quantization (SMPTE / ITU standard):
-    // Y: 64 to 940 (range = 876)
-    // Cb, Cr: 64 to 960 (range = 896, center = 512)
-    // CoreVideo 'x420' stores 10-bit code values in the 10 MSBs (bits 6..15) of uint16.
-    // Writing to .r16Unorm / .rg16Unorm scales [0..1] by 65535.
-    // Normalized float = (codeValue10 * 64.0) / 65535.0.
-    constexpr float kNormScale = 64.0f / 65535.0f;
+    // Y: 64 to 940 (range = 876) -> [64..940] / 65535 * 64
+    // Cb, Cr: 64 to 960 (range = 896, center = 512) -> [64..960] / 65535 * 64
+    constexpr float kScaleY = (876.0f * 64.0f) / 65535.0f;
+    constexpr float kOffsetY = (64.0f * 64.0f) / 65535.0f;
+    constexpr float kScaleC = (896.0f * 64.0f) / 65535.0f;
+    constexpr float kOffsetC = (512.0f * 64.0f) / 65535.0f;
+    constexpr float kInvChromaB = 1.0f / 1.8814f;
+    constexpr float kInvChromaR = 1.0f / 1.4746f;
 
-    float normY00 = clamp(64.0f + 876.0f * y00, 64.0f, 940.0f) * kNormScale;
-    float normY10 = clamp(64.0f + 876.0f * y10, 64.0f, 940.0f) * kNormScale;
-    float normY01 = clamp(64.0f + 876.0f * y01, 64.0f, 940.0f) * kNormScale;
-    float normY11 = clamp(64.0f + 876.0f * y11, 64.0f, 940.0f) * kNormScale;
+    float normY00 = metal::fma(saturate(y00), kScaleY, kOffsetY);
+    float normY10 = metal::fma(saturate(y10), kScaleY, kOffsetY);
+    float normY01 = metal::fma(saturate(y01), kScaleY, kOffsetY);
+    float normY11 = metal::fma(saturate(y11), kScaleY, kOffsetY);
 
     uint dstYW = dstY.get_width();
     uint dstYH = dstY.get_height();
-    if (baseX < dstYW && baseY < dstYH) {
-        dstY.write(float4(normY00, 0.0f, 0.0f, 1.0f), uint2(baseX, baseY));
-    }
-    if (baseX + 1u < dstYW && baseY < dstYH) {
-        dstY.write(float4(normY10, 0.0f, 0.0f, 1.0f), uint2(baseX + 1u, baseY));
-    }
-    if (baseX < dstYW && baseY + 1u < dstYH) {
-        dstY.write(float4(normY01, 0.0f, 0.0f, 1.0f), uint2(baseX, baseY + 1u));
-    }
     if (baseX + 1u < dstYW && baseY + 1u < dstYH) {
+        dstY.write(float4(normY00, 0.0f, 0.0f, 1.0f), uint2(baseX, baseY));
+        dstY.write(float4(normY10, 0.0f, 0.0f, 1.0f), uint2(baseX + 1u, baseY));
+        dstY.write(float4(normY01, 0.0f, 0.0f, 1.0f), uint2(baseX, baseY + 1u));
         dstY.write(float4(normY11, 0.0f, 0.0f, 1.0f), uint2(baseX + 1u, baseY + 1u));
+    } else {
+        if (baseX < dstYW && baseY < dstYH) {
+            dstY.write(float4(normY00, 0.0f, 0.0f, 1.0f), uint2(baseX, baseY));
+        }
+        if (baseX + 1u < dstYW && baseY < dstYH) {
+            dstY.write(float4(normY10, 0.0f, 0.0f, 1.0f), uint2(baseX + 1u, baseY));
+        }
+        if (baseX < dstYW && baseY + 1u < dstYH) {
+            dstY.write(float4(normY01, 0.0f, 0.0f, 1.0f), uint2(baseX, baseY + 1u));
+        }
+        if (baseX + 1u < dstYW && baseY + 1u < dstYH) {
+            dstY.write(float4(normY11, 0.0f, 0.0f, 1.0f), uint2(baseX + 1u, baseY + 1u));
+        }
     }
 
     // 4:2:0 Box-filtered chroma:
     float3 avgRGB = 0.25f * (p00 + p10 + p01 + p11);
-    float avgY = dot(avgRGB, wY);
-    float cb = (avgRGB.b - avgY) / 1.8814f;
-    float cr = (avgRGB.r - avgY) / 1.4746f;
+    float avgY = 0.25f * (y00 + y10 + y01 + y11);
+    float cb = (avgRGB.b - avgY) * kInvChromaB;
+    float cr = (avgRGB.r - avgY) * kInvChromaR;
 
-    float normCb = clamp(512.0f + 896.0f * cb, 64.0f, 960.0f) * kNormScale;
-    float normCr = clamp(512.0f + 896.0f * cr, 64.0f, 960.0f) * kNormScale;
+    float normCb = metal::fma(clamp(cb, -0.5f, 0.5f), kScaleC, kOffsetC);
+    float normCr = metal::fma(clamp(cr, -0.5f, 0.5f), kScaleC, kOffsetC);
 
     dstUV.write(float4(normCb, normCr, 0.0f, 1.0f), gid);
 }
@@ -617,27 +617,31 @@ vertex VertexOut fullscreenVertex(uint vertexID [[vertex_id]]) {
     return out;
 }
 
+struct DisplayUniforms {
+    int2 destOffset;
+    int2 destSize;
+    int  showClipping;
+    int  showFocusPeaking;
+    int  overlayOnly;
+    int  showDisplayLUT;
+    int  curveType;
+};
+
 fragment float4 displayFragment(
     VertexOut in [[stage_in]],
     texture2d<float> tex [[texture(0)]],
-    constant int2 &destOffset [[buffer(0)]],
-    constant int2 &destSize [[buffer(1)]],
-    constant int &showClipping [[buffer(2)]],
-    constant int &showFocusPeaking [[buffer(3)]],
-    constant int &overlayOnly [[buffer(4)]],
-    constant int &showDisplayLUT [[buffer(5)]],
-    constant int &curveType [[buffer(6)]]
+    constant DisplayUniforms &uniforms [[buffer(0)]]
 ) {
-    float2 uv = float2(in.position.x - destOffset.x, in.position.y - destOffset.y) / float2(destSize);
+    float2 uv = float2(in.position.x - uniforms.destOffset.x, in.position.y - uniforms.destOffset.y) / float2(uniforms.destSize);
     if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) {
-        return overlayOnly > 0 ? float4(0.0, 0.0, 0.0, 0.0) : float4(0.0, 0.0, 0.0, 1.0);
+        return uniforms.overlayOnly > 0 ? float4(0.0, 0.0, 0.0, 0.0) : float4(0.0, 0.0, 0.0, 1.0);
     }
     
     constexpr sampler s(coord::normalized, address::clamp_to_edge, filter::linear);
     float4 color = tex.sample(s, uv);
     
     float isClipped = step(color.a, 0.5);
-    float applyRed = (showClipping > 0) ? isClipped : 0.0;
+    float applyRed = (uniforms.showClipping > 0) ? isClipped : 0.0;
     
     float3 finalColor = color.rgb;
 
@@ -646,11 +650,11 @@ fragment float4 displayFragment(
     // applies color gamut mapping (BT.2020 or S-Gamut3.Cine -> BT.709),
     // filmic tone mapping, and sRGB gamma for natural on-screen monitoring.
     // The recorded file is NOT affected — this is display-only.
-    if (showDisplayLUT > 0 && applyRed < 0.5) {
+    if (uniforms.showDisplayLUT > 0) {
         float3 lin;
         float3 rgb709;
 
-        if (curveType == 2) {
+        if (uniforms.curveType == 2) {
             // Inverse Sony S-Log3 decode (code value -> scene-linear reflectance)
             for (int i = 0; i < 3; i++) {
                 float p = finalColor[i];
@@ -712,7 +716,7 @@ fragment float4 displayFragment(
     // ── Cinema Diagonal Zebra Stripes for Highlight Clipping ──
     float3 zebraColor = float3(1.0f, 0.15f, 0.15f);
     float zebraAlpha = 0.0f;
-    if (showClipping > 0 && isClipped > 0.5f) {
+    if (uniforms.showClipping > 0 && isClipped > 0.5f) {
         float stripe = step(0.5f, fract((in.position.x + in.position.y) / 14.0f));
         zebraAlpha = stripe * 0.85f;
     }
@@ -722,7 +726,7 @@ fragment float4 displayFragment(
     // edges on in-focus focal planes without flooding textures, surfaces, or noise.
     float3 peakColor = float3(0.0f, 1.0f, 0.25f); // Cinema Neon Green
     float peakAlpha = 0.0f;
-    if (showFocusPeaking > 0) {
+    if (uniforms.showFocusPeaking > 0) {
         // Tight single-pixel sampling at source texture resolution ensures
         // only razor-sharp high spatial frequency transitions are captured.
         float2 texel = 1.0f / float2(tex.get_width(), tex.get_height());
@@ -748,7 +752,7 @@ fragment float4 displayFragment(
     }
 
     // If rendering ONLY HUD overlay graphics over the stock hardware camera preview:
-    if (overlayOnly > 0) {
+    if (uniforms.overlayOnly > 0) {
         float3 overlayRGB = float3(0.0f);
         float overlayAlpha = 0.0f;
 
@@ -795,11 +799,6 @@ static inline float3 yuv2rgb(float3 yuv) {
     return float3(r, g, b);
 }
 
-struct BilateralParams {
-    float iso;
-};
-
-
 // ──────────────────────────────────────────────────────────────────────
 // SPATIAL DENOISING (Linear Space)
 // Bilateral filter on luma with ISO-adaptive strength.
@@ -812,13 +811,6 @@ struct DenoiseParams {
     float shotCoeff;
     float readCoeff;
     float strength;  // 0.0–1.0 adaptive boost from frame-time budget
-};
-
-struct TemporalParams {
-    float iso;
-    float maxBlend;
-    float shotCoeff;
-    float readCoeff;
 };
 
 struct RingTemporalParams {
@@ -1029,21 +1021,26 @@ kernel void estimateLumaVariance(
 {
     if (gid.x >= statsOut.get_width() || gid.y >= statsOut.get_height()) return;
 
-    float sum = 0.0, sum2 = 0.0, count = 0.0;
+    int maxW = int(lumaIn.get_width()) - 1;
+    int maxH = int(lumaIn.get_height()) - 1;
+    int gx = int(gid.x);
+    int gy = int(gid.y);
+
+    float sum = 0.0f, sum2 = 0.0f;
     for (int dy = -1; dy <= 1; dy++) {
+        int sy = clamp(gy + dy, 0, maxH);
         for (int dx = -1; dx <= 1; dx++) {
-            int sx = clamp(int(gid.x) + dx, 0, int(lumaIn.get_width())  - 1);
-            int sy = clamp(int(gid.y) + dy, 0, int(lumaIn.get_height()) - 1);
+            int sx = clamp(gx + dx, 0, maxW);
             float y = rgb2yuv(lumaIn.read(uint2(sx, sy)).rgb).x;
             sum  += y;
             sum2 += y * y;
-            count += 1.0;
         }
     }
-    float mean = sum / count;
-    float variance = max(sum2 / count - mean * mean, 0.0);
+    constexpr float kInv9 = 1.0f / 9.0f;
+    float mean = sum * kInv9;
+    float variance = max(sum2 * kInv9 - mean * mean, 0.0f);
     float sigma = sqrt(variance);
-    statsOut.write(float4(mean, sigma, 0.0, 1.0), gid);
+    statsOut.write(float4(mean, sigma, 0.0f, 1.0f), gid);
 }
 
 static inline float2 readChromaClamped(texture2d<float, access::read> chromaTexture, int x, int y) {
@@ -1291,4 +1288,33 @@ kernel void storeLumaHistory(
     float4 px = fullResRGB.read(gid);
     float y = dot(px.rgb, float3(0.2627f, 0.6780f, 0.0593f));
     lumaArray.write(float4(y, 0.0, 0.0, 1.0), gid, params.slice);
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// HARDWARE BILINEAR CROP AND RESAMPLE
+// Single-pass crop and hardware-filtered resample directly into destination.
+// Eliminates intermediate crop blit copies (~146 MB/frame bandwidth) and
+// replaces multi-tap sinc convolution with GPU texture unit filtering (TMUs).
+// ──────────────────────────────────────────────────────────────────────
+struct CropParams {
+    float scaleX;
+    float scaleY;
+    float startX;
+    float startY;
+};
+
+kernel void cropAndResampleBilinear(
+    texture2d<float, access::sample> src [[texture(0)]],
+    texture2d<float, access::write>  dst [[texture(1)]],
+    constant CropParams &crop            [[buffer(0)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    if (gid.x >= dst.get_width() || gid.y >= dst.get_height()) return;
+
+    constexpr sampler s(coord::pixel, address::clamp_to_edge, filter::linear);
+
+    float srcX = metal::fma(float(gid.x), crop.scaleX, crop.startX);
+    float srcY = metal::fma(float(gid.y), crop.scaleY, crop.startY);
+
+    dst.write(src.sample(s, float2(srcX, srcY)), gid);
 }

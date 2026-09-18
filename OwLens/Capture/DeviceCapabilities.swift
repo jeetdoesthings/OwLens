@@ -72,19 +72,6 @@ struct LSCCoefficients: Sendable {
     let azimuthG: Float
     let azimuthB: Float
 
-    /// Legacy initializer: radial-only coefficients, higher-order terms default to zero.
-    init(r: Float, g: Float, b: Float, avg: Float = 1.0) {
-        self.radialR = r - 1.0
-        self.radialG = g - 1.0
-        self.radialB = b - 1.0
-        self.radial4R = 0
-        self.radial4G = 0
-        self.radial4B = 0
-        self.azimuthR = 0
-        self.azimuthG = 0
-        self.azimuthB = 0
-    }
-
     /// Full 4-term initializer.
     init(
         radialR: Float, radialG: Float, radialB: Float,
@@ -276,11 +263,9 @@ struct DeviceCapabilities: Sendable {
 
     // MARK: - LSC override table
 
-    /// Per-device lens shading correction overrides from calibration. nil ⇒ use live DNG.
-    static let lscOverrideTable: [String: LSCCoefficients] = [
-        "iPhone13,3": LSCCoefficients(r: 1.028, g: 1.0, b: 0.974, avg: 1.0),
-        "iPhone13,4": LSCCoefficients(r: 1.032, g: 1.0, b: 0.971, avg: 1.0),
-    ]
+    /// Per-device lens shading correction overrides from calibration. nil ⇒ use live per-camera optical LSC.
+    static let lscOverrideTable: [String: LSCCoefficients] = [:]
+
 
     // MARK: - Noise profile table
 
