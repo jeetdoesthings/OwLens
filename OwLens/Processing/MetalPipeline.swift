@@ -217,9 +217,13 @@ final class MetalPipeline: @unchecked Sendable {
     private var pixelBufferPoolH: Int = 0
     private var pixelBufferPoolFormat: OSType = 0
 
-    var curveType: LogCurveType = .sLog3Approx
-    /// Scene reflectance headroom multiplier (1.0 for standard normalized scene reflectance [0, 1]).
-    var headroomScale: Float = 1.0
+    var curveType: LogCurveType = .sLog3Approx {
+        didSet {
+            headroomScale = LogCurve.defaultRMax(for: curveType)
+        }
+    }
+    /// Scene reflectance headroom multiplier (1.0 for linear, 12.0 for Apple Log 2, 10.0 for S-Log3).
+    var headroomScale: Float = LogCurve.defaultRMax(for: .sLog3Approx)
     var wbParams: WhiteBalanceParams = .identity
     var bayerPattern: Int32 = 0
     var blackLevel: Float = 0
@@ -771,16 +775,15 @@ final class MetalPipeline: @unchecked Sendable {
         let isThermalThrottled = thermalState.rawValue >= ProcessInfo.ThermalState.serious.rawValue
         let runDenoise = denoiseStrength >= 0.15 && !overRealtimeBudget && !isThermalCritical
 
-        guard let fusedOut = getOrCreateFusedTexture(width: bayerW, height: bayerH) else { completion(nil, nil); return }
-        var outputTex: MTLTexture = fusedOut
+        let postLinearTex: MTLTexture
 
         if !runDenoise {
-            // ── Ultra-Fast Fused Path: Demosaic + LSC + WB + CCM + Log OETF in ONE single kernel dispatch ──
-            // Eliminates 1 full pass and ~196 MB/frame of intermediate memory traffic.
+            // ── Linear Path: Demosaic + LSC + WB + CCM in scene-linear space ──
+            guard let linearOut = getOrCreateLinearTexture(width: bayerW, height: bayerH) else { completion(nil, nil); return }
             if let enc = commandBuffer.makeComputeCommandEncoder() {
-                enc.setComputePipelineState(debayerFusedPipeline)
+                enc.setComputePipelineState(linearPipeline)
                 enc.setTexture(bayerIn, index: 0)
-                enc.setTexture(fusedOut, index: 1)
+                enc.setTexture(linearOut, index: 1)
                 var params = FusedParams(
                     bayerPattern: bayerPattern,
                     blackLevel: blackLevel,
@@ -789,26 +792,28 @@ final class MetalPipeline: @unchecked Sendable {
                     wbGains: wbParams.gains,
                     lscCoefficients: lscCoefficients,
                     greenBalance: greenBalance,
-                    headroomScale: curveType == .linear ? 1.0 : headroomScale
+                    headroomScale: 1.0
                 )
                 enc.setBytes(&params, length: MemoryLayout<FusedParams>.stride, index: 0)
                 enc.setBytes(&lscParams, length: MemoryLayout<LSCParams>.stride, index: 1)
                 var cMatrix = wbParams.colorMatrix
                 enc.setBytes(&cMatrix, length: MemoryLayout<simd_float3x3>.stride, index: 2)
-                dispatch(enc, width: bayerW, height: bayerH, state: debayerFusedPipeline)
+                dispatch(enc, width: bayerW, height: bayerH, state: linearPipeline)
                 enc.endEncoding()
             }
 
             if sharpnessStrength > 0.001, let sharpenTex = getOrCreateSharpenTexture(width: bayerW, height: bayerH),
                let enc = commandBuffer.makeComputeCommandEncoder() {
                 enc.setComputePipelineState(unsharpPipeline)
-                enc.setTexture(fusedOut, index: 0)
+                enc.setTexture(linearOut, index: 0)
                 enc.setTexture(sharpenTex, index: 1)
                 var s = sharpnessStrength
                 enc.setBytes(&s, length: MemoryLayout<Float>.stride, index: 0)
                 dispatch(enc, width: bayerW, height: bayerH, state: unsharpPipeline)
                 enc.endEncoding()
-                outputTex = sharpenTex
+                postLinearTex = sharpenTex
+            } else {
+                postLinearTex = linearOut
             }
         } else {
             // ── Full Multi-Pass Denoise Path ──
@@ -996,8 +1001,7 @@ final class MetalPipeline: @unchecked Sendable {
                 }
             }
 
-            // Pass 5.5: Adaptive Unsharp Masking
-            var postDenoiseTex = temporalOut
+            // Pass 5.5: Adaptive Unsharp Masking in scene-linear space
             if sharpnessStrength > 0.001, let sharpenTex = getOrCreateSharpenTexture(width: bayerW, height: bayerH),
                let enc = commandBuffer.makeComputeCommandEncoder() {
                 enc.setComputePipelineState(unsharpPipeline)
@@ -1007,33 +1011,38 @@ final class MetalPipeline: @unchecked Sendable {
                 enc.setBytes(&s, length: MemoryLayout<Float>.stride, index: 0)
                 dispatch(enc, width: bayerW, height: bayerH, state: unsharpPipeline)
                 enc.endEncoding()
-                postDenoiseTex = sharpenTex
+                postLinearTex = sharpenTex
+            } else {
+                postLinearTex = temporalOut
             }
-
-            // Pass 6: Log OETF
-            if let enc = commandBuffer.makeComputeCommandEncoder() {
-                enc.setComputePipelineState(logOnlyPipeline)
-                enc.setTexture(postDenoiseTex, index: 0)
-                enc.setTexture(fusedOut, index: 1)
-                var logParams = LogOnlyParams(
-                    curveType: Int32(curveType.rawValue),
-                    headroomScale: curveType == .linear ? 1.0 : headroomScale
-                )
-                enc.setBytes(&logParams, length: MemoryLayout<LogOnlyParams>.stride, index: 0)
-                dispatch(enc, width: bayerW, height: bayerH, state: logOnlyPipeline)
-                enc.endEncoding()
-            }
-            outputTex = fusedOut
         }
 
-        // Final crop and scale into target aspect ratio & resolution
-        let finalTex = cropToAspectAndScale(
-            outputTex,
+        // Final crop and scale in scene-linear space into target aspect ratio & resolution
+        let scaledLinearTex = cropToAspectAndScale(
+            postLinearTex,
             targetWidth: encodeWidth,
             targetHeight: encodeHeight,
             destinationTexture: nil,
             cb: commandBuffer
-        ) ?? outputTex
+        ) ?? postLinearTex
+
+        // Apply Log OETF (with highlight shoulder) to the scaled scene-linear frame
+        let outW = scaledLinearTex.width
+        let outH = scaledLinearTex.height
+        guard let finalLogTex = getOrCreateFusedTexture(width: outW, height: outH) else { completion(nil, nil); return }
+        if let enc = commandBuffer.makeComputeCommandEncoder() {
+            enc.setComputePipelineState(logOnlyPipeline)
+            enc.setTexture(scaledLinearTex, index: 0)
+            enc.setTexture(finalLogTex, index: 1)
+            var logParams = LogOnlyParams(
+                curveType: Int32(curveType.rawValue),
+                headroomScale: curveType == .linear ? 1.0 : headroomScale
+            )
+            enc.setBytes(&logParams, length: MemoryLayout<LogOnlyParams>.stride, index: 0)
+            dispatch(enc, width: outW, height: outH, state: logOnlyPipeline)
+            enc.endEncoding()
+        }
+        let finalTex = finalLogTex
 
         var outputPB: CVPixelBuffer?
         var retainedCVTextures: [Any] = []
@@ -1134,12 +1143,12 @@ final class MetalPipeline: @unchecked Sendable {
             bayerIn = correctedBayerPass
         }
 
-        // Fused Demosaic + LSC + WB + CCM + Log OETF in ONE single pass
-        guard let logOut = getOrCreateFusedTexture(width: bayerW, height: bayerH) else { completion(nil, nil); return }
+        // ── Linear Demosaic + LSC + WB + CCM ──
+        guard let linearOut = getOrCreateLinearTexture(width: bayerW, height: bayerH) else { completion(nil, nil); return }
         if let enc = commandBuffer.makeComputeCommandEncoder() {
-            enc.setComputePipelineState(debayerFusedPipeline)
+            enc.setComputePipelineState(linearPipeline)
             enc.setTexture(bayerIn, index: 0)
-            enc.setTexture(logOut, index: 1)
+            enc.setTexture(linearOut, index: 1)
             var params = FusedParams(
                 bayerPattern: bayerPattern,
                 blackLevel: blackLevel,
@@ -1148,36 +1157,55 @@ final class MetalPipeline: @unchecked Sendable {
                 wbGains: wbParams.gains,
                 lscCoefficients: lscCoefficients,
                 greenBalance: greenBalance,
-                headroomScale: curveType == .linear ? 1.0 : headroomScale
+                headroomScale: 1.0
             )
             enc.setBytes(&params, length: MemoryLayout<FusedParams>.stride, index: 0)
             enc.setBytes(&lscParams, length: MemoryLayout<LSCParams>.stride, index: 1)
             var cMatrix = wbParams.colorMatrix
             enc.setBytes(&cMatrix, length: MemoryLayout<simd_float3x3>.stride, index: 2)
-            dispatch(enc, width: bayerW, height: bayerH, state: debayerFusedPipeline)
+            dispatch(enc, width: bayerW, height: bayerH, state: linearPipeline)
             enc.endEncoding()
         }
 
-        var postLogTex = logOut
+        var postLinearTex = linearOut
         if sharpnessStrength > 0.001, let sharpenTex = getOrCreateSharpenTexture(width: bayerW, height: bayerH),
            let enc = commandBuffer.makeComputeCommandEncoder() {
             enc.setComputePipelineState(unsharpPipeline)
-            enc.setTexture(logOut, index: 0)
+            enc.setTexture(linearOut, index: 0)
             enc.setTexture(sharpenTex, index: 1)
             var s = sharpnessStrength
             enc.setBytes(&s, length: MemoryLayout<Float>.stride, index: 0)
             dispatch(enc, width: bayerW, height: bayerH, state: unsharpPipeline)
             enc.endEncoding()
-            postLogTex = sharpenTex
+            postLinearTex = sharpenTex
         }
 
-        let finalTex = cropToAspectAndScale(
-            postLogTex,
+        // Final crop and scale in scene-linear space into target aspect ratio & resolution
+        let scaledLinearTex = cropToAspectAndScale(
+            postLinearTex,
             targetWidth: encodeWidth,
             targetHeight: encodeHeight,
             destinationTexture: nil,
             cb: commandBuffer
-        ) ?? postLogTex
+        ) ?? postLinearTex
+
+        // Apply Log OETF (with highlight shoulder) to the scaled scene-linear frame
+        let outW = scaledLinearTex.width
+        let outH = scaledLinearTex.height
+        guard let finalLogTex = getOrCreateFusedTexture(width: outW, height: outH) else { completion(nil, nil); return }
+        if let enc = commandBuffer.makeComputeCommandEncoder() {
+            enc.setComputePipelineState(logOnlyPipeline)
+            enc.setTexture(scaledLinearTex, index: 0)
+            enc.setTexture(finalLogTex, index: 1)
+            var logParams = LogOnlyParams(
+                curveType: Int32(curveType.rawValue),
+                headroomScale: curveType == .linear ? 1.0 : headroomScale
+            )
+            enc.setBytes(&logParams, length: MemoryLayout<LogOnlyParams>.stride, index: 0)
+            dispatch(enc, width: outW, height: outH, state: logOnlyPipeline)
+            enc.endEncoding()
+        }
+        let finalTex = finalLogTex
 
         var outputPB: CVPixelBuffer?
         var retainedCVTextures: [Any] = []

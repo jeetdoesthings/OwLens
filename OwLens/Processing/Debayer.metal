@@ -112,9 +112,41 @@ kernel void binBayerCFA(
 }
 
 
+// Smooth filmic highlight shoulder mapping sensor linear [0, 1] to scene reflectance [0, rMax].
+// Preserves 100% linear calibration for midtones & shadows (r <= rKnee),
+// with C1 continuity at rKnee.
+static inline float applyHighlightShoulderMetal(float r, float rKnee, float rMax) {
+    if (rMax <= rKnee + 1e-4f) return r;
+    if (r <= rKnee) return r;
+
+    float delta = rMax - rKnee;
+    float dr = 1.0f - rKnee;
+    float s0 = dr / delta;
+    float s1 = 2.0f;
+    float a = s1 + s0 - 2.0f;
+    float b = 3.0f - 2.0f * s0 - s1;
+    float c = s0;
+
+    float t = clamp((r - rKnee) / max(dr, 1e-4f), 0.0f, 1.0f);
+    float g = ((a * t + b) * t + c) * t;
+    return rKnee + delta * g;
+}
+
+static inline float3 applyHighlightShoulder3(float3 rgb, float rKnee, float rMax) {
+    return float3(
+        applyHighlightShoulderMetal(rgb.r, rKnee, rMax),
+        applyHighlightShoulderMetal(rgb.g, rKnee, rMax),
+        applyHighlightShoulderMetal(rgb.b, rKnee, rMax)
+    );
+}
+
 static inline float3 encodeLogCurve(float3 rgb, int curveType, float headroomScale = 1.0f) {
     if (curveType == 0) {
         return saturate(rgb);
+    }
+
+    if (headroomScale > 1.0f) {
+        rgb = applyHighlightShoulder3(rgb, 0.36f, headroomScale);
     }
 
     if (curveType == 3) {
@@ -627,7 +659,7 @@ fragment float4 displayFragment(
             }
             lin = max(lin, float3(0.0));
 
-            // S-Gamut3.Cine -> BT.709 color gamut mapping (row sums = 1.0)
+            // Sony S-Gamut3.Cine -> BT.709 color gamut mapping (row sums = 1.0)
             const float3x3 mSGamutto709 = float3x3(
                 float3( 1.6762f, -0.1839f, -0.0458f),
                 float3(-0.4827f,  1.2670f, -0.1751f),

@@ -66,7 +66,7 @@ struct ScopeData: Equatable {
                     let r = min(1.0, max(0.0, Float(r16)))
                     let g = min(1.0, max(0.0, Float(g16)))
                     let b = min(1.0, max(0.0, Float(b16)))
-                    let luma = min(1.0, max(0.0, 0.2126 * r + 0.7152 * g + 0.0722 * b))
+                    let luma = min(1.0, max(0.0, 0.2627 * r + 0.6780 * g + 0.0593 * b))
 
                     let rBin = min(maxHistBin, Int(r * histScale))
                     let gBin = min(maxHistBin, Int(g * histScale))

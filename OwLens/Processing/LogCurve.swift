@@ -92,10 +92,22 @@ enum LogCurve {
         }
     }
 
+    /// Target maximum scene reflectance Rmax mapped to sensor clipping (1.0).
+    /// - Apple Log 2: R = 12.0 maps to exactly 1.0 (code 1023 / 100% IRE).
+    /// - Sony S-Log3: R = 10.0 represents 1000% reflectance (standard Sony ceiling ~85% IRE).
+    /// - Linear: R = 1.0.
+    static func defaultRMax(for type: LogCurveType) -> Float {
+        switch type {
+        case .linear: return 1.0
+        case .appleLog2: return 12.0
+        case .sLog3Approx: return 10.0
+        }
+    }
+
     /// Smooth filmic highlight shoulder mapping sensor linear [0, 1] to scene reflectance [0, rMax].
     /// Perfectly preserves 100% linear calibration for midtones & shadows (r <= rKnee),
-    /// while smoothly rolling off highlights up to the container ceiling.
-    static func applyHighlightShoulder(_ r: Float, rKnee: Float = 0.36, rMax: Float = 10.0) -> Float {
+    /// while smoothly rolling off highlights up to the container ceiling with C1 continuity.
+    static func applyHighlightShoulder(_ r: Float, rKnee: Float = 0.36, rMax: Float = 12.0) -> Float {
         guard rMax > rKnee + 1e-4 else { return r }
         if r <= rKnee {
             return r
@@ -114,7 +126,14 @@ enum LogCurve {
     }
 
     static func apply(_ rgb: SIMD3<Float>, type: LogCurveType, headroomScale: Float = 1.0) -> SIMD3<Float> {
-        let input = rgb
+        var input = rgb
+        if headroomScale > 1.0 {
+            input = SIMD3<Float>(
+                applyHighlightShoulder(input.x, rKnee: 0.36, rMax: headroomScale),
+                applyHighlightShoulder(input.y, rKnee: 0.36, rMax: headroomScale),
+                applyHighlightShoulder(input.z, rKnee: 0.36, rMax: headroomScale)
+            )
+        }
         switch type {
         case .linear:
             return simd_clamp(input, SIMD3(0,0,0), SIMD3(1,1,1))

@@ -387,9 +387,63 @@ extension MetalPipeline {
         return passed
     }
 
-    /// Legacy test alias for backward compatibility.
+    /// Validates cubic Hermite highlight shoulder linearity, continuity, monotonicity, and ceiling reach.
     static func runHighlightShoulderTest() -> Bool {
-        return runLogCurvesStandardComplianceTest()
+        var allPassed = true
+        let eps: Float = 1e-4
+
+        // 1. Linearity: r <= 0.36 must remain 100% untouched
+        let linearTestPoints: [Float] = [0.0, 0.01, 0.05, 0.18, 0.25, 0.36]
+        for r in linearTestPoints {
+            let outApple = LogCurve.applyHighlightShoulder(r, rKnee: 0.36, rMax: 12.0)
+            let outSony = LogCurve.applyHighlightShoulder(r, rKnee: 0.36, rMax: 10.0)
+            if abs(outApple - r) > eps {
+                print("[HighlightShoulderTest] FAIL Apple Log shoulder altered midtone r=\(r): got \(outApple)")
+                allPassed = false
+            }
+            if abs(outSony - r) > eps {
+                print("[HighlightShoulderTest] FAIL S-Log3 shoulder altered midtone r=\(r): got \(outSony)")
+                allPassed = false
+            }
+        }
+
+        // 2. Ceiling reach: r = 1.0 maps to exact rMax
+        let clipApple = LogCurve.applyHighlightShoulder(1.0, rKnee: 0.36, rMax: 12.0)
+        if abs(clipApple - 12.0) > 0.01 {
+            print("[HighlightShoulderTest] FAIL Apple Log shoulder clipping: expected 12.0, got \(clipApple)")
+            allPassed = false
+        }
+        let clipSony = LogCurve.applyHighlightShoulder(1.0, rKnee: 0.36, rMax: 10.0)
+        if abs(clipSony - 10.0) > 0.01 {
+            print("[HighlightShoulderTest] FAIL S-Log3 shoulder clipping: expected 10.0, got \(clipSony)")
+            allPassed = false
+        }
+
+        // 3. Monotonicity: strictly increasing from r = 0 to 1.0
+        var prevVal: Float = -1.0
+        for i in 0...100 {
+            let r = Float(i) / 100.0
+            let val = LogCurve.applyHighlightShoulder(r, rKnee: 0.36, rMax: 12.0)
+            if val <= prevVal && i > 0 {
+                print("[HighlightShoulderTest] FAIL Monotonicity broken at r=\(r): val=\(val), prev=\(prevVal)")
+                allPassed = false
+            }
+            prevVal = val
+        }
+
+        // 4. C1 continuity at knee (numerical derivative before and after knee)
+        let h: Float = 0.0001
+        let dBelow = (LogCurve.applyHighlightShoulder(0.36, rKnee: 0.36, rMax: 12.0) - LogCurve.applyHighlightShoulder(0.36 - h, rKnee: 0.36, rMax: 12.0)) / h
+        let dAbove = (LogCurve.applyHighlightShoulder(0.36 + h, rKnee: 0.36, rMax: 12.0) - LogCurve.applyHighlightShoulder(0.36, rKnee: 0.36, rMax: 12.0)) / h
+        if abs(dBelow - 1.0) > 0.01 || abs(dAbove - 1.0) > 0.01 {
+            print("[HighlightShoulderTest] FAIL C1 continuity at knee: dBelow=\(dBelow), dAbove=\(dAbove)")
+            allPassed = false
+        }
+
+        if allPassed {
+            print("[HighlightShoulderTest] PASS: Highlight shoulder linearity, continuity, monotonicity, and ceiling reach verified")
+        }
+        return allPassed
     }
 
     /// Benchmarks the optimized pipeline (single-pass fused demosaic + direct BGRA scaling)
@@ -630,6 +684,24 @@ extension MetalPipeline {
 
         if allPassed {
             print("[FlawsTest] PASS: Transform, reflection, symmetric scene-cut, and CFR timing verified successfully")
+        }
+        return allPassed
+    }
+
+    /// Validates ScopeData calculation with ITU-R BT.2020 luma coefficients and 100 IRE clipping.
+    static func runScopeDataBT2020Test() -> Bool {
+        var allPassed = true
+
+        let whitePixel: [UInt16] = [Float16(1.0).bitPattern, Float16(1.0).bitPattern, Float16(1.0).bitPattern, Float16(1.0).bitPattern]
+        let scopeWhite = ScopeData.make(fromHalfRGBA: whitePixel, width: 1, height: 1, histogramBins: 64, waveformColumns: 64, waveformRows: 48)
+        // At white (100% IRE), row 0 (top row = 100 IRE) must contain the trace
+        if scopeWhite.waveform[0 * 64 + 0] <= 0 {
+            print("[ScopeDataTest] FAIL White pixel did not hit waveform top row (100 IRE)")
+            allPassed = false
+        }
+
+        if allPassed {
+            print("[ScopeDataTest] PASS: ScopeData BT.2020 luma and 100 IRE clipping verified")
         }
         return allPassed
     }

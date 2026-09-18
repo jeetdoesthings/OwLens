@@ -327,9 +327,9 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
 
         ================================================================
           🎬 OwLens — Accurate 10-Bit LOG Pipeline Active
-          🌿 Git Branch: fix/accurate-log-color-pipeline
+          🌿 Git Branch: fix/true-log-color-and-scopes
           🎯 Format: 10-Bit Video Range YCbCr (x420) · BT.2020
-          📐 Headroom: 1.0 (Unwarped Scene Reflectance OETF)
+          📐 Headroom: C1 Filmic Highlight Shoulder (Rmax=12.0 Apple Log, 10.0 S-Log3)
         ================================================================
 
         """)
@@ -342,6 +342,8 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
                 _ = MetalPipeline.runAppleLog2AccuracyTest()
                 _ = MetalPipeline.runColorMatrixValidationTest()
                 _ = MetalPipeline.runLogCurvesStandardComplianceTest()
+                _ = MetalPipeline.runHighlightShoulderTest()
+                _ = MetalPipeline.runScopeDataBT2020Test()
                 _ = MetalPipeline.run10BitYCbCrEncodingTest()
                 _ = MetalPipeline.runAutoExposureAndWBValidationTest()
                 _ = MetalPipeline.runFlawsValidationTest()
@@ -1009,6 +1011,7 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
         case .sLog3Approx:
             cMatrix = latestSGamutMatrix ?? WhiteBalanceParams.defaultSensorToSGamut3Cine
         }
+        metalPipeline?.headroomScale = LogCurve.defaultRMax(for: selectedCurve)
         metalPipeline?.wbParams = WhiteBalanceParams(
             gains: SIMD3<Float>(
                 max(gains.redGain / g, 0.01),
@@ -1557,10 +1560,10 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
             pipeline.headroomScale = 1.0
         case .appleLog2:
             cMatrix = latestColorMatrix ?? WhiteBalanceParams.defaultSensorToBT2020
-            pipeline.headroomScale = 1.0
+            pipeline.headroomScale = LogCurve.defaultRMax(for: .appleLog2)
         case .sLog3Approx:
             cMatrix = latestSGamutMatrix ?? WhiteBalanceParams.defaultSensorToSGamut3Cine
-            pipeline.headroomScale = 1.0
+            pipeline.headroomScale = LogCurve.defaultRMax(for: .sLog3Approx)
         }
 
         if pipeline.isAutoWBEnabled, let gains = frameData.whiteBalanceGains {
@@ -1622,17 +1625,7 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
                 default: cfaName = "?\(frameData.cfaPattern)"
                 }
                 let drops = frameBuffer.droppedCount
-                let scopeNow = CACurrentMediaTime()
-                if showScopesUnsafe && !isRecordingUnsafe && scopeNow - lastScopeUpdateTime >= 0.1 {
-                    lastScopeUpdateTime = scopeNow
-                    pipeline.makeScopeData(from: framed) { [weak self] scope in
-                        guard let self, let scope else { return }
-                        Task { @MainActor [weak self] in
-                            guard let self else { return }
-                            self.scopeData = scope
-                        }
-                    }
-                }
+                updateScopesIfNeeded(from: framed, pipeline: pipeline)
 
                 let frameDataBox = SendableBox(value: frameData)
                 let framedBox = SendableBox(value: framed)
@@ -1644,6 +1637,21 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
                     if self.cfaLabel != cfaName { self.cfaLabel = cfaName }
                     if self.droppedFrames != drops { self.droppedFrames = drops }
                 }
+            }
+        }
+    }
+
+    /// Updates live exposure scopes (histogram + waveform) throttled to ~10 Hz without blocking capture/render.
+    nonisolated private func updateScopesIfNeeded(from framed: MTLTexture, pipeline: MetalPipeline?) {
+        guard showScopesUnsafe else { return }
+        let now = CACurrentMediaTime()
+        guard now - lastScopeUpdateTime >= 0.1 else { return }
+        lastScopeUpdateTime = now
+        pipeline?.makeScopeData(from: framed) { [weak self] scope in
+            guard let self, let scope else { return }
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.scopeData = scope
             }
         }
     }
@@ -1667,6 +1675,8 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
         default: cfaName = "?\(frameData.cfaPattern)"
         }
         let drops = frameBuffer.droppedCount
+
+        updateScopesIfNeeded(from: framed, pipeline: metalPipeline)
 
         if let bgraPB, isRecordingUnsafe {
             if self.videoWriter.appendFrame(pixelBuffer: bgraPB, captureTime: frameData.timestamp) {

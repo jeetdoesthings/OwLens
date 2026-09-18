@@ -284,8 +284,11 @@ final class VideoWriter: @unchecked Sendable {
             elapsedSeconds = max(0, now - startHostTime)
         }
 
-        // How many CFR frames should exist by this capture time (rounded to nearest frame to avoid drift)
-        let wallTargetCount = Int64((elapsedSeconds * targetFPS).rounded()) + 1
+        // How many CFR frames should exist by this capture time.
+        // Tolerates up to 0.40 frame duration of optical timestamp jitter before inserting a hold frame,
+        // preventing premature duplicate frames from normal sensor readout latency variations.
+        let frameSlot = Int64(floor(elapsedSeconds * targetFPS + 0.40))
+        let wallTargetCount = frameSlot + 1
         // Always advance at least one slot for this real frame
         let targetCount = max(frameCount + 1, wallTargetCount)
 
