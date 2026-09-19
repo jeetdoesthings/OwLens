@@ -21,8 +21,7 @@
   - **Calibrated Physical $\cos^4\theta$ Lens Shading Correction:** Dynamic concentric radial optical model counteracting lens vignetting across Ultra-Wide, Wide, and Telephoto lenses.
 - **Rock-Solid Constant Frame Rate (CFR):** Strict 24.000 fps and 30.000 fps timeline synchronization with pre-warmed buffer pools, sub-millisecond audio sync, and startup stall bridging to guarantee zero dropped or frozen hold frames.
 - **Dual Viewfinder Monitoring:**
-  - **Hardware ISP (VID):** Zero-overhead live monitoring using hardware video preview.
-  - **Real-Time Log Preview (LOG):** Full debayered pipeline preview with integrated Rec.709 display LUT, high-frequency focus peaking, and diagonal clipping zebra stripes.
+  - **Real-Time Rec.709 Preview (709):** One-touch toggle between unadulterated Log monitoring and a calibrated Rec.709 display LUT, with high-frequency focus peaking and diagonal clipping zebras.
 - **Professional Cinematography Tools:** Real-time 6-axis gyroscope horizon level, framing grids, and live RGB histogram & waveform scopes.
 - **Comprehensive Audio Monitoring:** Real-time level meters with automatic detection for built-in, USB, Bluetooth, and 3.5mm external microphones.
 
@@ -56,14 +55,43 @@ OwLens video files contain standard NCLC color primaries, matrix, and transfer f
 
 ---
 
-## Installation & Building
+## Installation & Setup
 
-### Requirements
+### Method 1: Sideloading with Sideloadly (Recommended for Mac & Windows — No Xcode Required!)
+
+This is the easiest way to install OwLens on your iPhone or iPad without needing Xcode or a paid developer account.
+
+1. **Download `OwLens.ipa`:**
+   - Grab the latest `OwLens.ipa` from the [Releases](https://github.com/jeetdoesthings/OwLens/releases) page.
+
+2. **Install Sideloadly:**
+   - Download and install [Sideloadly](https://sideloadly.io) (available for both macOS and Windows).
+
+3. **Connect Your iPhone/iPad:**
+   - Connect your device to your computer via USB (tap **Trust This Computer** if prompted).
+
+4. **Sideload the App:**
+   - Open Sideloadly.
+   - Drag and drop `OwLens.ipa` into the IPA icon box in Sideloadly.
+   - Enter your Apple ID email in the **Apple account** field.
+   - Click **Start** and enter your password / 2-factor authentication code when prompted. Sideloadly securely communicates with Apple to sign the app for your device.
+
+5. **Trust the Developer Profile on iPhone:**
+   - On your device, navigate to **Settings** → **General** → **VPN & Device Management**.
+   - Under **Developer App**, tap your Apple ID.
+   - Tap **Trust "[Your Apple ID]"** and confirm.
+   - Launch **OwLens** from your home screen and enjoy cinema-grade Log recording!
+
+---
+
+### Method 2: Build from Source via Xcode (macOS)
+
+#### Requirements
 - Mac running macOS Sonoma or later with Xcode 15+
 - Physical iPhone running iOS 17.0+ (RAW capture requires physical camera hardware)
 - Apple Developer Account (free personal account works for device provisioning)
 
-### Steps
+#### Steps
 
 1. **Clone the repository:**
    ```bash
@@ -78,7 +106,7 @@ OwLens video files contain standard NCLC color primaries, matrix, and transfer f
 
 3. **Configure code signing:**
    - In Xcode, select the **OwLens** target.
-   - Under **Signing & Capabilities**, select your **Team** (Apple ID) and update the bundle identifier if needed.
+   - Under **Signing & Capabilities**, check **Automatically manage signing** and select your **Team** (Apple ID).
 
 4. **Build and install on device:**
    - Connect your iPhone and select it as the run target.
