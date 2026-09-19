@@ -316,7 +316,7 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
 
 
     enum ControlPanel: String, Identifiable {
-        case exposure, iso, shutter, wb, focus, fps, format, log, bitrate, denoise, mic, lens, save
+        case exposure, iso, shutter, wb, focus, fps, format, bitrate, denoise, mic, lens, save
         var id: String { rawValue }
     }
 
@@ -675,6 +675,17 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
 
     func togglePreviewDisplayMode() {
         previewDisplayMode = previewDisplayMode == .log ? .normalVideo : .log
+    }
+
+    func toggleLogCurve() {
+        guard !isRecording else { return }
+        let cases = LogCurveType.uiCases
+        if let idx = cases.firstIndex(of: selectedCurve) {
+            let nextIdx = (idx + 1) % cases.count
+            selectedCurve = cases[nextIdx]
+        } else {
+            selectedCurve = cases.first ?? .appleLog2
+        }
     }
 
     func toggleDisplayLUT() {

@@ -123,39 +123,34 @@ struct ControlsView: View {
             .disabled(isTopLocked)
             .opacity(isTopLocked ? 0.4 : 1.0)
 
-            // Curve Badge
+            // Log Profile Cycle Button
             Button {
                 Haptics.selection()
-                viewModel.togglePanel(.log)
+                viewModel.toggleLogCurve()
             } label: {
                 HStack(spacing: 5) {
-                    Text(shortCurveName(viewModel.selectedCurve))
+                    Text(viewModel.selectedCurve.displayName)
                         .font(.geist(.semiBold, size: 10))
                         .foregroundColor(isTopLocked ? OwLensTheme.textDisabled : OwLensTheme.textPrimary)
-                    if viewModel.selectedCurve != .linear {
-                        Text("10-BIT")
-                            .font(.geistMono(.bold, size: 8))
-                            .foregroundColor(isTopLocked ? OwLensTheme.textDisabled : .white)
-                            .padding(.horizontal, 4)
-                            .padding(.vertical, 1.5)
-                            .background(
-                                RoundedRectangle(cornerRadius: 3, style: .continuous)
-                                    .fill(Color.white.opacity(0.18))
-                            )
-                    }
+                    Text("10-BIT")
+                        .font(.geistMono(.bold, size: 8))
+                        .foregroundColor(isTopLocked ? OwLensTheme.textDisabled : .white)
+                        .padding(.horizontal, 4)
+                        .padding(.vertical, 1.5)
+                        .background(
+                            RoundedRectangle(cornerRadius: 3, style: .continuous)
+                                .fill(Color.white.opacity(0.18))
+                        )
                 }
                 .padding(.horizontal, 8)
                 .frame(height: 30)
-                .glassPanel(
-                    cornerRadius: OwLensTheme.radiusCard,
-                    border: viewModel.activePanel == .log ? OwLensTheme.glassBorderActive : OwLensTheme.glassBorder,
-                    background: viewModel.activePanel == .log ? OwLensTheme.glassActiveBg : OwLensTheme.glassBase
-                )
+                .glassPanel(cornerRadius: OwLensTheme.radiusCard)
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
             .disabled(isTopLocked)
             .opacity(isTopLocked ? 0.4 : 1.0)
+            .animation(.easeInOut(duration: 0.15), value: viewModel.selectedCurve)
         }
     }
 
@@ -526,9 +521,6 @@ struct ControlsView: View {
 
             case .bitrate:
                 bitrateDrawerContent
-
-            case .log:
-                curveDrawerContent
 
             case .mic:
                 micDrawerContent
@@ -906,39 +898,6 @@ struct ControlsView: View {
                         }
                         .frame(maxWidth: .infinity)
                         .padding(.vertical, 8)
-                        .background(
-                            RoundedRectangle(cornerRadius: OwLensTheme.radiusCard, style: .continuous)
-                                .fill(isSelected ? OwLensTheme.glassActive : OwLensTheme.glassBase)
-                        )
-                        .contentShape(Rectangle())
-                    }
-                    .buttonStyle(.plain)
-                }
-            }
-        }
-    }
-
-    private var curveDrawerContent: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            drawerHeader(title: "LOG CURVE")
-
-            HStack(spacing: 6) {
-                ForEach(LogCurveType.uiCases) { curve in
-                    let isSelected = viewModel.selectedCurve == curve
-                    Button {
-                        Haptics.selection()
-                        viewModel.selectedCurve = curve
-                    } label: {
-                        VStack(alignment: .leading, spacing: 3) {
-                            Text(shortCurveName(curve))
-                                .font(.geist(isSelected ? .semiBold : .medium, size: 12))
-                                .foregroundColor(isSelected ? .black : OwLensTheme.textPrimary)
-                            Text(curveDescription(curve))
-                                .font(.geist(.regular, size: 9))
-                                .foregroundColor(isSelected ? .black.opacity(0.5) : OwLensTheme.textMuted)
-                        }
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(10)
                         .background(
                             RoundedRectangle(cornerRadius: OwLensTheme.radiusCard, style: .continuous)
                                 .fill(isSelected ? OwLensTheme.glassActive : OwLensTheme.glassBase)
@@ -1356,22 +1315,6 @@ struct ControlsView: View {
         case .serious: return "Thermal Throttling Imminent"
         case .critical: return "Critical Temperature"
         default: return ""
-        }
-    }
-
-    private func shortCurveName(_ curve: LogCurveType) -> String {
-        switch curve {
-        case .linear: return "Linear"
-        case .sLog3Approx: return "S-Log3"
-        case .appleLog2: return "A-Log2"
-        }
-    }
-
-    private func curveDescription(_ curve: LogCurveType) -> String {
-        switch curve {
-        case .linear: return "8-bit Linear sRGB"
-        case .sLog3Approx: return "10-bit Sony S-Log3 · BT.2020"
-        case .appleLog2: return "10-bit Apple Log · BT.2020"
         }
     }
 }

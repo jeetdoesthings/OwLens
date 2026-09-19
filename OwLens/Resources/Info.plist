@@ -28,13 +28,6 @@
 	<string>OwLens needs microphone access to record audio alongside video.</string>
 	<key>NSPhotoLibraryAddUsageDescription</key>
 	<string>Save recorded log-encoded video to your photo library.</string>
-	<key>UIAppFonts</key>
-	<array>
-		<string>Geist-Regular.otf</string>
-		<string>Geist-SemiBold.otf</string>
-		<string>Geist-Bold.otf</string>
-		<string>Geist-Medium.otf</string>
-	</array>
 	<key>UIFileSharingEnabled</key>
 	<true/>
 	<key>UILaunchStoryboardName</key>
