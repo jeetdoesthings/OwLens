@@ -65,7 +65,7 @@ This is the easiest way to install OwLens on your iPhone or iPad without needing
    - Grab the latest `OwLens.ipa` from the [Releases](https://github.com/jeetdoesthings/OwLens/releases) page.
 
 2. **Install Sideloadly:**
-   - Download and install [Sideloadly](https://sideloadly.io) (available for both macOS and Windows).
+   - Download and install <a href="https://sideloadly.io" target="_blank" rel="noopener noreferrer">Sideloadly</a> (available for both macOS and Windows).
 
 3. **Connect Your iPhone/iPad:**
    - Connect your device to your computer via USB (tap **Trust This Computer** if prompted).
