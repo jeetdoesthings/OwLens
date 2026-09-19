@@ -22,7 +22,7 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
     @Published var isSaving = false
     @Published var controlsLocked = false
     @Published var thermalState: ProcessInfo.ThermalState = .nominal
-    @Published var selectedCurve: LogCurveType = .sLog3Approx {
+    @Published var selectedCurve: LogCurveType = .appleLog2 {
         didSet {
             guard !isRecording else { return }
             metalPipeline?.curveType = selectedCurve

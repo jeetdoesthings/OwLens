@@ -219,13 +219,13 @@ final class MetalPipeline: @unchecked Sendable {
     private var pixelBufferPoolH: Int = 0
     private var pixelBufferPoolFormat: OSType = 0
 
-    var curveType: LogCurveType = .sLog3Approx {
+    var curveType: LogCurveType = .appleLog2 {
         didSet {
             headroomScale = LogCurve.defaultRMax(for: curveType)
         }
     }
     /// Scene reflectance headroom multiplier (1.0 for linear, 12.0 for Apple Log 2, 10.0 for S-Log3).
-    var headroomScale: Float = LogCurve.defaultRMax(for: .sLog3Approx)
+    var headroomScale: Float = LogCurve.defaultRMax(for: .appleLog2)
     var wbParams: WhiteBalanceParams = .identity
     var bayerPattern: Int32 = 0
     var blackLevel: Float = 0

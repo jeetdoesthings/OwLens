@@ -26,7 +26,7 @@ final class VideoWriter: @unchecked Sendable {
     private var lastPixelBuffer: CVPixelBuffer?
     private var pendingAudioBuffers: [CMSampleBuffer] = []
     private let maxPendingAudioBuffers = 50
-    private var curveType: LogCurveType = .sLog3Approx
+    private var curveType: LogCurveType = .appleLog2
     private let lock = NSLock()
 
     var onLowDiskSpace: (@Sendable () -> Void)?
@@ -48,7 +48,7 @@ final class VideoWriter: @unchecked Sendable {
         bitrate: Int = 100_000_000,
         targetFPS: Double = 24,
         includeAudio: Bool = true,
-        curveType: LogCurveType = .sLog3Approx,
+        curveType: LogCurveType = .appleLog2,
         codec: VideoCodecOption = .hevc,
         orientation: UIInterfaceOrientation = .landscapeRight
     ) throws {

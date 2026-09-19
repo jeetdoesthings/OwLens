@@ -28,7 +28,7 @@ enum LogCurveType: Int, CaseIterable, Identifiable {
     }
 
     /// The curves exposed in the UI (hide linear unless debugging).
-    static var uiCases: [LogCurveType] { [.sLog3Approx, .appleLog2] }
+    static var uiCases: [LogCurveType] { [.appleLog2, .sLog3Approx] }
 }
 
 /// CPU-side log curve math — used for LUT generation and validation.
