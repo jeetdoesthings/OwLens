@@ -134,7 +134,15 @@ static inline float3 applyHighlightShoulder3(float3 rgb, float rKnee, float rMax
 
     float peakShoulder = applyHighlightShoulderMetal(peak, rKnee, rMax);
     float scale = peakShoulder / max(peak, 1e-6f);
-    return rgb * scale;
+    float3 scaled = rgb * scale;
+
+    // Smooth C¹ cubic highlight desaturation to pure neutral white as scene intensity
+    // approaches sensor clipping / peak dynamic range (peak >= 0.85 -> 1.65).
+    // Eliminates the Bayer clipping magenta/pink cast on the sky and clouds while
+    // maintaining 100% color fidelity in midtones, skin tones, and rich sunsets.
+    float u = clamp((peak - 0.85f) * 1.25f, 0.0f, 1.0f);
+    float desat = u * u * (3.0f - 2.0f * u);
+    return mix(scaled, float3(peakShoulder), desat);
 }
 
 static inline float3 encodeLogCurve(float3 rgb, int curveType, float headroomScale = 1.0f) {
