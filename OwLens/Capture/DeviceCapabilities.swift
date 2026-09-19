@@ -274,6 +274,26 @@ struct DeviceCapabilities: Sendable {
         "iPhone17,2", // iPhone 16 Pro Max
         "iPhone17,3", // iPhone 16
         "iPhone17,4", // iPhone 16 Plus
+        // iPhone 17 series / iPhone Air / SE 4 (A19 / A19 Pro)
+        "iPhone17,5", // iPhone SE (4th gen)
+        "iPhone18,1", // iPhone 17 Pro
+        "iPhone18,2", // iPhone 17 Pro Max
+        "iPhone18,3", // iPhone 17
+        "iPhone18,4", // iPhone Air
+        "iPhone18,5", // iPhone 17e
+        // iPhone 18 series / iPhone Duo (A20 / A20 Pro)
+        "iPhone19,1", // iPhone 18 Pro
+        "iPhone19,2", // iPhone 18 Pro Max
+        "iPhone19,3", // iPhone 18
+        "iPhone19,4", // iPhone Duo
+        // iPad Pro (M1 / M2 / M4) & iPad Air & mini
+        "iPad8,1", "iPad8,2", "iPad8,3", "iPad8,4", "iPad8,5", "iPad8,6", "iPad8,7", "iPad8,8",
+        "iPad8,9", "iPad8,10", "iPad8,11", "iPad8,12",
+        "iPad13,1", "iPad13,2", "iPad13,4", "iPad13,5", "iPad13,6", "iPad13,7", "iPad13,8",
+        "iPad13,9", "iPad13,10", "iPad13,11", "iPad13,16", "iPad13,17",
+        "iPad14,1", "iPad14,2", "iPad14,3", "iPad14,4", "iPad14,5", "iPad14,6", "iPad14,8",
+        "iPad14,9", "iPad14,10", "iPad14,11",
+        "iPad16,1", "iPad16,2", "iPad16,3", "iPad16,4", "iPad16,5", "iPad16,6",
     ]
 
     // MARK: - CFA override table (update as devices are tested)
@@ -425,7 +445,8 @@ struct DeviceCapabilities: Sendable {
             "iPhone18,1": "iPhone 17 Pro",
             "iPhone18,2": "iPhone 17 Pro Max",
             "iPhone18,3": "iPhone 17",
-            "iPhone18,4": "iPhone 17 Air",
+            "iPhone18,4": "iPhone Air",
+            "iPhone18,5": "iPhone 17e",
             "iPhone19,1": "iPhone 18 Pro",
             "iPhone19,2": "iPhone 18 Pro Max",
             "iPhone19,3": "iPhone 18",
