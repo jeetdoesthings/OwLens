@@ -242,19 +242,9 @@ struct ControlsView: View {
     private var leftToolRail: some View {
         VStack(spacing: 4) {
             monitoringToolButton(
-                systemName: viewModel.previewDisplayMode == .log ? "camera.metering.matrix" : "camera.viewfinder",
-                isActive: viewModel.previewDisplayMode == .normalVideo
-            ) {
-                viewModel.togglePreviewDisplayMode()
-            }
-
-            monitoringToolButton(
                 text: "709",
                 isActive: viewModel.showDisplayLUT
             ) {
-                if viewModel.previewDisplayMode != .log {
-                    viewModel.previewDisplayMode = .log
-                }
                 viewModel.toggleDisplayLUT()
             }
 
@@ -359,8 +349,8 @@ struct ControlsView: View {
             // Focus Mode (AF vs MF)
             deckTile(
                 title: "FOCUS",
-                value: viewModel.isAutoFocus ? "AF" : "MF",
-                subvalue: viewModel.isAutoFocus ? "CONT" : String(format: "%.2f", viewModel.focusLensPosition),
+                value: viewModel.isFocusLocked ? "AF-L" : (viewModel.isAutoFocus ? "AF" : "MF"),
+                subvalue: viewModel.isFocusLocked ? "LOCK" : (viewModel.isAutoFocus ? "CONT" : String(format: "%.2f", viewModel.focusLensPosition)),
                 isSelected: viewModel.activePanel == .focus,
                 isDisabled: exposureControlsDisabled,
                 width: 64
@@ -701,7 +691,7 @@ struct ControlsView: View {
             HStack(spacing: 6) {
                 Button {
                     Haptics.selection()
-                    viewModel.isAutoFocus = true
+                    viewModel.resetToContinuousAutoFocus()
                 } label: {
                     Text("AF")
                         .font(.geist(viewModel.isAutoFocus ? .semiBold : .regular, size: 10))

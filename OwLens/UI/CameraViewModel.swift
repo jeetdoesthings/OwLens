@@ -181,20 +181,7 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
     }
 
     // Focus properties
-    /// Tracks work item to cancel if focus is re-locked before 2s auto-dismiss fires.
-    private var focusLockDismissWork: DispatchWorkItem?
-    @Published var isFocusLocked: Bool = false {
-        didSet {
-            focusLockDismissWork?.cancel()
-            if isFocusLocked {
-                let work = DispatchWorkItem { [weak self] in
-                    self?.isFocusLocked = false
-                }
-                focusLockDismissWork = work
-                DispatchQueue.main.asyncAfter(deadline: .now() + 2.0, execute: work)
-            }
-        }
-    }
+    @Published var isFocusLocked: Bool = false
     @Published var isAutoFocus: Bool = true {
         didSet {
             guard !controlsLocked else { return }
@@ -984,21 +971,20 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
         print("[CameraViewModel] Controls unlocked (curve=\(selectedCurve.displayName))")
     }
 
-    func setFocusPoint(_ point: CGPoint, lock: Bool = false) {
+    func resetToContinuousAutoFocus() {
+        guard !controlsLocked else { return }
+        isAutoFocus = true
+        isFocusLocked = false
+        captureController.setContinuousAutoFocus()
+    }
+
+    func setFocusPoint(_ point: CGPoint, lock: Bool = true) {
         if meteringMode == .spot {
             captureController.setMeteringMode(.spot, at: point)
         }
-        if isRecording || controlsLocked {
-            // During recording: tap always locks focus (no continuous AF).
-            // Set the focus point and lock at that position.
-            isAutoFocus = false
-            isFocusLocked = true
-            captureController.setFocusPointOfInterest(point, lock: true)
-        } else {
-            isAutoFocus = true
-            isFocusLocked = lock
-            captureController.setFocusPointOfInterest(point, lock: lock)
-        }
+        isAutoFocus = true
+        isFocusLocked = lock
+        captureController.setFocusPointOfInterest(point, lock: lock)
     }
 
     private func clampWhiteBalanceGains(_ gains: AVCaptureDevice.WhiteBalanceGains, for device: AVCaptureDevice) -> AVCaptureDevice.WhiteBalanceGains {

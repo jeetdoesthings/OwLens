@@ -18,7 +18,6 @@ struct RootView: View {
     @State private var tapFocusPoint: CGPoint? = nil
     @State private var focusReticleOpacity: Double = 0
     @State private var focusReticleScale: CGFloat = 1.3
-    @State private var touchDownDate: Date? = nil
 
     var body: some View {
         ZStack {
@@ -31,17 +30,7 @@ struct RootView: View {
                     let videoRect = aspectFitRect(in: geo.size, aspect: viewModel.selectedFormat.aspectRatio)
 
                     ZStack {
-                        // Stock ISP Preview (Normal Video / Rec.709 monitoring mode)
-                        NormalVideoPreviewView(
-                            session: viewModel.captureController.session,
-                            lensID: viewModel.selectedLens?.uniqueID,
-                            videoAspect: viewModel.selectedFormat.aspectRatio
-                        )
-                        .opacity(viewModel.previewDisplayMode == .normalVideo ? 1 : 0)
-                        .allowsHitTesting(false)
-                        .ignoresSafeArea()
-
-                        // Metal Pipeline Preview (Bayer RAW -> Demosaic -> Log preview + Overlays)
+                        // Metal Pipeline Preview (Bayer RAW -> Demosaic -> Rec.709/Log preview + Overlays)
                         CameraPreviewView(
                             metalPipeline: pipeline,
                             currentTexture: $viewModel.currentTexture,
@@ -49,10 +38,10 @@ struct RootView: View {
                             showClipping: $viewModel.showClipping,
                             showFocusPeaking: $viewModel.showFocusPeaking,
                             showDisplayLUT: viewModel.showDisplayLUT,
-                            overlayOnly: viewModel.previewDisplayMode == .normalVideo
+                            overlayOnly: false
                         )
-                        .opacity(viewModel.previewDisplayMode == .log || viewModel.showClipping || viewModel.showFocusPeaking ? 1 : 0)
-                        .allowsHitTesting(viewModel.previewDisplayMode == .log)
+                        .opacity(1)
+                        .allowsHitTesting(true)
                         .ignoresSafeArea()
 
                         // Rule of Thirds Grid & Spirit Level
@@ -74,9 +63,7 @@ struct RootView: View {
                                 .transition(.opacity)
                         }
 
-
-
-                        // Pro-Cinema Tap-to-Focus Reticle
+                        // Tap-to-Focus Reticle
                         if let focusPt = tapFocusPoint {
                             cinemaFocusReticle
                                 .position(focusPt)
@@ -88,23 +75,14 @@ struct RootView: View {
                     .contentShape(Rectangle())
                     .gesture(
                         DragGesture(minimumDistance: 0)
-                            .onChanged { _ in
-                                if touchDownDate == nil {
-                                    touchDownDate = Date()
-                                }
-                            }
                             .onEnded { value in
-                                let duration = Date().timeIntervalSince(touchDownDate ?? Date())
-                                touchDownDate = nil
-                                let isLongPress = duration > 0.35
-                                
                                 let loc = value.location
                                 guard videoRect.contains(loc) else { return }
                                 let x = (loc.x - videoRect.minX) / videoRect.width
                                 let y = (loc.y - videoRect.minY) / videoRect.height
                                 
-                                Haptics.impact(isLongPress ? .heavy : .medium)
-                                viewModel.setFocusPoint(CGPoint(x: x, y: y), lock: isLongPress)
+                                Haptics.impact(.medium)
+                                viewModel.setFocusPoint(CGPoint(x: x, y: y), lock: true)
                                 
                                 tapFocusPoint = loc
                                 focusReticleScale = 1.15
@@ -114,7 +92,7 @@ struct RootView: View {
                                     focusReticleScale = 1.0
                                 }
                                 
-                                withAnimation(.easeOut(duration: 0.2).delay(isLongPress ? 1.5 : 0.7)) {
+                                withAnimation(.easeOut(duration: 0.2).delay(1.5)) {
                                     focusReticleOpacity = 0
                                 }
                             }
@@ -208,12 +186,6 @@ struct RootView: View {
             .stroke(reticleColor.opacity(0.9), lineWidth: 0.75)
             .shadow(color: .black.opacity(0.5), radius: 1, x: 0, y: 0)
             .frame(width: size, height: size)
-
-            // Center target dot
-            Circle()
-                .fill(reticleColor.opacity(0.8))
-                .shadow(color: .black.opacity(0.5), radius: 1, x: 0, y: 0)
-                .frame(width: 2, height: 2)
 
             // AF LOCK badge if locked
             if isLocked {
