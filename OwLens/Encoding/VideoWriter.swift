@@ -22,6 +22,8 @@ final class VideoWriter: @unchecked Sendable {
     private var startHostTime: CFTimeInterval = 0
     private var audioReferenceTime: CMTime = .invalid
     private var sessionStartTime: CMTime = .invalid
+    private var lastFrameCaptureTime: CMTime = .invalid
+    private var lastFrameHostTime: CFTimeInterval = 0
     private var hasStartedSession = false
     private var lastPixelBuffer: CVPixelBuffer?
     private var pendingAudioBuffers: [CMSampleBuffer] = []
@@ -173,6 +175,10 @@ final class VideoWriter: @unchecked Sendable {
         self.lastPixelBuffer = nil
         self.audioReferenceTime = .invalid
         self.pendingAudioBuffers.removeAll()
+        self.lastDiskCheckTime = 0
+        self.cachedHasSpace = true
+        self.lastFrameCaptureTime = .invalid
+        self.lastFrameHostTime = 0
         self.isRecording = true
 
         print("[VideoWriter] CFR \(Int(fps))fps \(width)x\(height) codec=\(codec.displayName) bitrate=\(bitrate) orientation=\(orientation.rawValue)")
@@ -194,7 +200,15 @@ final class VideoWriter: @unchecked Sendable {
         }
     }
 
+    private var lastDiskCheckTime: CFTimeInterval = 0
+    private var cachedHasSpace = true
+
     private func hasSufficientDiskSpace() -> Bool {
+        let now = CACurrentMediaTime()
+        if now - lastDiskCheckTime < 1.0 {
+            return cachedHasSpace
+        }
+        lastDiskCheckTime = now
         guard let outputURL = assetWriter?.outputURL else { return true }
         do {
             let values = try outputURL.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
@@ -202,11 +216,14 @@ final class VideoWriter: @unchecked Sendable {
                 // If less than 500 MB left, notify handler to stop recording safely and refuse further frames
                 if available <= 500 * 1024 * 1024 {
                     onLowDiskSpace?()
+                    cachedHasSpace = false
                     return false
                 }
+                cachedHasSpace = true
                 return true
             }
         } catch {}
+        cachedHasSpace = true
         return true
     }
 
@@ -240,49 +257,50 @@ final class VideoWriter: @unchecked Sendable {
             startHostTime = now
             if let captureTime = captureTime, captureTime.isValid {
                 sessionStartTime = captureTime
+                lastFrameCaptureTime = captureTime
             }
+            lastFrameHostTime = now
             assetWriter?.startSession(atSourceTime: .zero)
             hasStartedSession = true
         }
 
-        var elapsedSeconds: Double
-        if let captureTime = captureTime, captureTime.isValid, sessionStartTime.isValid {
-            elapsedSeconds = max(0, CMTimeSubtract(captureTime, sessionStartTime).seconds)
-        } else {
-            elapsedSeconds = max(0, now - startHostTime)
+        let frameDuration = 1.0 / targetFPS
+        var deltaSeconds: Double = frameDuration
+
+        if let captureTime = captureTime, captureTime.isValid, lastFrameCaptureTime.isValid {
+            deltaSeconds = max(0, CMTimeSubtract(captureTime, lastFrameCaptureTime).seconds)
+        } else if lastFrameHostTime > 0 {
+            deltaSeconds = max(0, now - lastFrameHostTime)
         }
 
         // Startup grace: If startup delays (pool allocation, camera mode lock, or initial pipeline spin-up)
-        // caused a gap after the very first frame or before the second frame, do NOT inject a flurry of hold frames!
-        // Hold frames are only for bridging mid-stream frame drops, not for startup stalls.
-        // If continuous motion has not been established yet (realFrameCount <= 1) and elapsedSeconds exceeds
-        // 1.5 frame durations, re-anchor sessionStartTime and startHostTime to this frame, resetting elapsedSeconds to 0.
-        if realFrameCount <= 1 && elapsedSeconds > (1.5 / targetFPS) {
+        // caused a gap before the second frame, do NOT inject a flurry of hold frames!
+        // Re-anchor sessionStartTime and startHostTime to this frame.
+        if realFrameCount <= 1 && deltaSeconds > (1.5 * frameDuration) {
             if let captureTime = captureTime, captureTime.isValid {
                 sessionStartTime = captureTime
+                lastFrameCaptureTime = captureTime
             }
             startHostTime = now
-            elapsedSeconds = 0.0
+            lastFrameHostTime = now
+            deltaSeconds = frameDuration
         }
 
-        // How many CFR frames should exist by this capture time.
-        // Tolerates up to 0.40 frame duration of optical timestamp jitter before inserting a hold frame,
-        // preventing premature duplicate frames from normal sensor readout latency variations.
-        let frameSlot = Int64(floor(elapsedSeconds * targetFPS + 0.40))
-        let wallTargetCount = frameSlot + 1
-        // Always advance at least one slot for this real frame
-        let targetCount = max(frameCount + 1, wallTargetCount)
-
-        // Hold last real frame for skipped slots to maintain strict CFR duration
-        if let hold = lastPixelBuffer {
-            let maxHold = min(targetCount - 1, frameCount + 10)
-            while frameCount < maxHold {
+        // Jitter-immune CFR timeline:
+        // Only insert hold frames if an entire frame interval was missed (delta >= 1.6 * frameDuration).
+        // Normal sensor readout variations (e.g. 35-55ms at 24fps) will have delta < 1.6 * frameDuration,
+        // which avoids inserting premature duplicate frames and prevents encoder queue backpressure.
+        if realFrameCount >= 1, deltaSeconds >= (1.6 * frameDuration), let hold = lastPixelBuffer {
+            let missedSlots = min(5, Int((deltaSeconds / frameDuration).rounded()) - 1)
+            var inserted = 0
+            while inserted < missedSlots {
                 guard input.isReadyForMoreMediaData else {
                     droppedFrames += 1
                     break
                 }
                 if writeCFR(hold, index: frameCount, adaptor: adaptor) {
                     frameCount += 1
+                    inserted += 1
                 } else {
                     droppedFrames += 1
                     break
@@ -304,6 +322,10 @@ final class VideoWriter: @unchecked Sendable {
             frameCount += 1
             realFrameCount += 1
             lastPixelBuffer = pixelBuffer
+            lastFrameHostTime = now
+            if let captureTime = captureTime, captureTime.isValid {
+                lastFrameCaptureTime = captureTime
+            }
             return true
         } else {
             droppedFrames += 1
@@ -401,11 +423,11 @@ final class VideoWriter: @unchecked Sendable {
         }
     }
 
-    func finish(completion: @Sendable @escaping (URL?) -> Void) {
+    func finish(completion: @Sendable @escaping (URL?, Error?) -> Void) {
         lock.lock()
         guard isRecording else {
             lock.unlock()
-            completion(nil)
+            completion(nil, NSError(domain: "OwLens", code: 100, userInfo: [NSLocalizedDescriptionKey: "Recording was not active"]))
             return
         }
 
@@ -451,7 +473,7 @@ final class VideoWriter: @unchecked Sendable {
         // nothing to finalize — report failure instead of silently never
         // invoking completion (which would hang the caller).
         guard let writer else {
-            completion(nil)
+            completion(nil, NSError(domain: "OwLens", code: 101, userInfo: [NSLocalizedDescriptionKey: "No active asset writer"]))
             return
         }
 
@@ -461,7 +483,7 @@ final class VideoWriter: @unchecked Sendable {
             if let url {
                 try? FileManager.default.removeItem(at: url)
             }
-            completion(nil)
+            completion(nil, NSError(domain: "OwLens", code: 102, userInfo: [NSLocalizedDescriptionKey: "Recording ended with no frames"]))
             return
         }
         let boxedWriter = SendableBox(value: writer)
@@ -470,10 +492,11 @@ final class VideoWriter: @unchecked Sendable {
             let duration = Double(total) / fps
             print("[VideoWriter] Done. timeline=\(total) real=\(real) holds=\(total - real) drops=\(drops) \(String(format: "%.2f", duration))s @ \(Int(fps))fps status=\(String(describing: status))")
             if status == .failed {
-                print("[VideoWriter] Error: \(String(describing: boxedWriter.value.error))")
-                completion(nil)
+                let err = boxedWriter.value.error ?? NSError(domain: "OwLens", code: 103, userInfo: [NSLocalizedDescriptionKey: "Video writer failed to finalize file"])
+                print("[VideoWriter] Error: \(err)")
+                completion(nil, err)
             } else {
-                completion(url)
+                completion(url, nil)
             }
         }
     }

@@ -73,6 +73,34 @@ struct ControlsView: View {
                 .padding(.horizontal, 10)
                 .frame(height: 30)
                 .glassPanel(cornerRadius: OwLensTheme.radiusCard, border: OwLensTheme.glassBorderRed, background: OwLensTheme.glassBaseHeavy)
+
+                // Storage remaining countdown pill during recording
+                HStack(spacing: 4) {
+                    Image(systemName: "internaldrive")
+                        .font(.system(size: 9, weight: .semibold))
+                    Text("REM \(viewModel.estimatedRecordTimeText)")
+                        .font(.geistMono(.semiBold, size: 10))
+                }
+                .foregroundColor(viewModel.remainingRecordSeconds < 60 ? OwLensTheme.recordingRed : (viewModel.remainingRecordSeconds < 180 ? Color.yellow : OwLensTheme.textSecondary))
+                .padding(.horizontal, 8)
+                .frame(height: 30)
+                .glassPanel(
+                    cornerRadius: OwLensTheme.radiusCard,
+                    border: viewModel.remainingRecordSeconds < 60 ? OwLensTheme.glassBorderRed : OwLensTheme.glassBorder,
+                    background: OwLensTheme.glassBaseHeavy
+                )
+            } else {
+                // Not recording: Show storage remaining estimate
+                HStack(spacing: 4) {
+                    Image(systemName: "internaldrive")
+                        .font(.system(size: 9, weight: .medium))
+                    Text("REM \(viewModel.estimatedRecordTimeText)")
+                        .font(.geistMono(.medium, size: 10))
+                }
+                .foregroundColor(OwLensTheme.textSecondary)
+                .padding(.horizontal, 8)
+                .frame(height: 30)
+                .glassPanel(cornerRadius: OwLensTheme.radiusCard, border: OwLensTheme.glassBorder, background: OwLensTheme.glassBase)
             }
 
             if viewModel.droppedFrames > 0 {
@@ -326,7 +354,7 @@ struct ControlsView: View {
             deckTile(
                 title: "EXPOSURE",
                 value: exposureSummaryValue,
-                subvalue: viewModel.isAutoExposureEnabled ? "AUTO" : "MANUAL",
+                subvalue: "MANUAL",
                 isSelected: viewModel.activePanel == .exposure,
                 isDisabled: exposureControlsDisabled,
                 width: 92
@@ -338,7 +366,7 @@ struct ControlsView: View {
             deckTile(
                 title: "WB",
                 value: "\(Int(viewModel.wbKelvin))K",
-                subvalue: viewModel.isAutoWhiteBalanceEnabled ? "AUTO" : "MANUAL",
+                subvalue: viewModel.isAutoWhiteBalanceEnabled ? (viewModel.isAutoWBLockEnabled ? "AUTO-L" : "AUTO") : "MANUAL",
                 isSelected: viewModel.activePanel == .wb,
                 isDisabled: exposureControlsDisabled,
                 width: 72
@@ -534,41 +562,7 @@ struct ControlsView: View {
 
     private var exposureDrawerContent: some View {
         VStack(alignment: .leading, spacing: 10) {
-            drawerHeaderRow(
-                title: "EXPOSURE",
-                isAutoOn: $viewModel.isAutoExposureEnabled,
-                autoLabel: "AUTO"
-            )
-
-            // Metering Mode Selector
-            HStack(spacing: 10) {
-                Text("METER")
-                    .font(.geistMono(.semiBold, size: 10))
-                    .foregroundColor(OwLensTheme.textSecondary)
-                    .frame(width: 36, alignment: .leading)
-
-                HStack(spacing: 4) {
-                    ForEach(MeteringMode.allCases) { mode in
-                        let isSelected = viewModel.meteringMode == mode
-                        Button {
-                            Haptics.selection()
-                            viewModel.meteringMode = mode
-                        } label: {
-                            Text(mode.rawValue)
-                                .font(.geistMono(isSelected ? .semiBold : .regular, size: 9))
-                                .foregroundColor(isSelected ? .black : OwLensTheme.textSecondary)
-                                .padding(.horizontal, 8)
-                                .padding(.vertical, 4)
-                                .background(
-                                    RoundedRectangle(cornerRadius: 6, style: .continuous)
-                                        .fill(isSelected ? OwLensTheme.glassActive : OwLensTheme.glassBase)
-                                )
-                                .contentShape(Rectangle())
-                        }
-                        .buttonStyle(.plain)
-                    }
-                }
-            }
+            drawerHeader(title: "EXPOSURE")
 
             VStack(spacing: 8) {
                 // ISO Stepped Stop Control
@@ -629,8 +623,6 @@ struct ControlsView: View {
                     }
                 }
             }
-            .opacity(viewModel.isAutoExposureEnabled ? 0.3 : 1.0)
-            .disabled(viewModel.isAutoExposureEnabled)
         }
     }
 
@@ -642,45 +634,103 @@ struct ControlsView: View {
                 autoLabel: "AUTO"
             )
 
-            VStack(spacing: 8) {
-                // Kelvin Stop Stepper
-                stopStepper(
-                    index: $viewModel.wbStopIndex,
-                    count: viewModel.wbStops.count,
-                    label: String(format: "%.0fK", viewModel.wbKelvin),
-                    onNudge: { viewModel.nudgeWB($0) }
-                )
+            if viewModel.isAutoWhiteBalanceEnabled {
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack(spacing: 10) {
+                        Text("RECORD")
+                            .font(.geistMono(.semiBold, size: 10))
+                            .foregroundColor(OwLensTheme.textSecondary)
+                            .frame(width: 44, alignment: .leading)
 
-                // Quick Presets
-                HStack(spacing: 4) {
-                    ForEach([
-                        ("3200K", Float(3200)),
-                        ("4000K", Float(4000)),
-                        ("5600K", Float(5600)),
-                        ("7000K", Float(7000))
-                    ], id: \.0) { item in
-                        let isMatch = abs(viewModel.wbKelvin - item.1) < 150
-                        Button {
-                            Haptics.selection()
-                            viewModel.wbStopIndex = ExposureStops.nearestIndex(in: viewModel.wbStops, to: item.1)
-                        } label: {
-                            Text(item.0)
-                                .font(.geist(isMatch ? .semiBold : .regular, size: 9))
-                                .foregroundColor(isMatch ? .black : OwLensTheme.textSecondary)
-                                .padding(.horizontal, 7)
-                                .padding(.vertical, 4)
-                                .background(
-                                    RoundedRectangle(cornerRadius: 6, style: .continuous)
-                                        .fill(isMatch ? OwLensTheme.glassActive : OwLensTheme.glassBase)
-                                )
-                                .contentShape(Rectangle())
+                        HStack(spacing: 4) {
+                            Button {
+                                Haptics.selection()
+                                viewModel.isAutoWBLockEnabled = false
+                            } label: {
+                                Text("UNLOCKED")
+                                    .font(.geistMono(!viewModel.isAutoWBLockEnabled ? .semiBold : .regular, size: 9))
+                                    .foregroundColor(!viewModel.isAutoWBLockEnabled ? .black : OwLensTheme.textSecondary)
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 5)
+                                    .background(
+                                        RoundedRectangle(cornerRadius: 6, style: .continuous)
+                                            .fill(!viewModel.isAutoWBLockEnabled ? OwLensTheme.glassActive : OwLensTheme.glassBase)
+                                    )
+                                    .contentShape(Rectangle())
+                            }
+                            .buttonStyle(.plain)
+
+                            Button {
+                                Haptics.selection()
+                                viewModel.isAutoWBLockEnabled = true
+                            } label: {
+                                Text("LOCKED")
+                                    .font(.geistMono(viewModel.isAutoWBLockEnabled ? .semiBold : .regular, size: 9))
+                                    .foregroundColor(viewModel.isAutoWBLockEnabled ? .black : OwLensTheme.textSecondary)
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 5)
+                                    .background(
+                                        RoundedRectangle(cornerRadius: 6, style: .continuous)
+                                            .fill(viewModel.isAutoWBLockEnabled ? OwLensTheme.glassActive : OwLensTheme.glassBase)
+                                    )
+                                    .contentShape(Rectangle())
+                            }
+                            .buttonStyle(.plain)
                         }
-                        .buttonStyle(.plain)
+                    }
+
+                    Text(viewModel.isAutoWBLockEnabled ? "WB locks when recording starts (constant color)" : "WB continuously adapts during recording")
+                        .font(.geistMono(.regular, size: 8.5))
+                        .foregroundColor(OwLensTheme.textMuted)
+
+                    // Live WB readout
+                    HStack {
+                        Text("LIVE AWB: \(Int(viewModel.wbKelvin))K · Tint \(Int(viewModel.wbTint))")
+                            .font(.geistMono(.regular, size: 9))
+                            .foregroundColor(OwLensTheme.textMuted)
+                        Spacer()
+                    }
+                    .padding(.top, 2)
+                }
+            } else {
+                VStack(spacing: 8) {
+                    // Kelvin Stop Stepper
+                    stopStepper(
+                        index: $viewModel.wbStopIndex,
+                        count: viewModel.wbStops.count,
+                        label: String(format: "%.0fK", viewModel.wbKelvin),
+                        onNudge: { viewModel.nudgeWB($0) }
+                    )
+
+                    // Quick Presets
+                    HStack(spacing: 4) {
+                        ForEach([
+                            ("3200K", Float(3200)),
+                            ("4000K", Float(4000)),
+                            ("5600K", Float(5600)),
+                            ("7000K", Float(7000))
+                        ], id: \.0) { item in
+                            let isMatch = abs(viewModel.wbKelvin - item.1) < 150
+                            Button {
+                                Haptics.selection()
+                                viewModel.wbStopIndex = ExposureStops.nearestIndex(in: viewModel.wbStops, to: item.1)
+                            } label: {
+                                Text(item.0)
+                                    .font(.geist(isMatch ? .semiBold : .regular, size: 9))
+                                    .foregroundColor(isMatch ? .black : OwLensTheme.textSecondary)
+                                    .padding(.horizontal, 7)
+                                    .padding(.vertical, 4)
+                                    .background(
+                                        RoundedRectangle(cornerRadius: 6, style: .continuous)
+                                            .fill(isMatch ? OwLensTheme.glassActive : OwLensTheme.glassBase)
+                                    )
+                                    .contentShape(Rectangle())
+                            }
+                            .buttonStyle(.plain)
+                        }
                     }
                 }
             }
-            .opacity(viewModel.isAutoWhiteBalanceEnabled ? 0.3 : 1.0)
-            .disabled(viewModel.isAutoWhiteBalanceEnabled)
         }
     }
 

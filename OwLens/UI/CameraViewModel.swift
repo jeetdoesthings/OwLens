@@ -41,6 +41,7 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
             if selectedBitrate.rawValue > selectedFormat.maxBitratePreset.rawValue {
                 selectedBitrate = selectedFormat.suggestedBitratePreset
             }
+            updateStorageEstimate()
             refreshStatusLine()
         }
     }
@@ -53,18 +54,21 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
             // We just need to refresh limits and push the new duration to hardware.
             seedControlRanges()
             if isCameraReady { applyManualExposureAndWB() }
+            updateStorageEstimate()
             refreshStatusLine()
         }
     }
     @Published var selectedBitrate: BitratePreset = .mbps100 {
         didSet {
             guard !controlsLocked else { return }
+            updateStorageEstimate()
             refreshStatusLine()
         }
     }
     @Published var selectedCodec: VideoCodecOption = .hevc {
         didSet {
             guard !isRecording else { return }
+            updateStorageEstimate()
             refreshStatusLine()
         }
     }
@@ -76,6 +80,7 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
             // Skip no-op reassign (same port) — avoids hang loops
             guard oldValue.portUID != selectedAudioSource.portUID else { return }
             applyAudioSource()
+            updateStorageEstimate()
         }
     }
     @Published var isSwitchingMic = false
@@ -147,20 +152,19 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
     /// Allow-list miss — soft warning, record still allowed.
     @Published private(set) var showUnverifiedDeviceWarning = false
     /// True when session started (or hard-failed setup) so splash can dismiss.
-    @Published private(set) var isCameraReady = false
+    @Published private(set) var isCameraReady = false {
+        didSet {
+            if isCameraReady {
+                updateStorageEstimate()
+                startStorageMonitor()
+            }
+        }
+    }
 
     @Published private(set) var isoValue: Float = 100
     @Published private(set) var shutterValue: Float = 180
     @Published private(set) var wbKelvin: Float = 5600
-    @Published var isAutoExposureEnabled: Bool = false {
-        didSet {
-            guard oldValue != isAutoExposureEnabled else { return }
-            if !isAutoExposureEnabled {
-                isoStopIndex = ExposureStops.nearestIndex(in: isoStops, to: isoValue)
-            }
-            if isCameraReady { applyManualExposureAndWB() }
-        }
-    }
+
     @Published var isAutoWhiteBalanceEnabled: Bool = false {
         didSet {
             guard oldValue != isAutoWhiteBalanceEnabled else { return }
@@ -170,8 +174,20 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
             if isCameraReady { applyManualExposureAndWB() }
         }
     }
-    @Published private(set) var isAutoExposureAdjusting: Bool = false
+    /// When true, auto white balance locks when recording starts or controls are locked.
+    /// When false (unlocked), white balance continuously adapts during recording.
+    @Published var isAutoWBLockEnabled: Bool = false
+
     @Published private(set) var isAutoWhiteBalanceAdjusting: Bool = false
+
+    /// Formatted remaining record time (e.g. "45:12" or "1h 20m").
+    @Published var estimatedRecordTimeText: String = "—"
+    /// Estimated remaining recording time in seconds.
+    @Published var remainingRecordSeconds: Int = 0
+    /// Available storage capacity in bytes.
+    @Published var availableStorageBytes: Int64 = 0
+
+    private var storageRefreshTimer: Timer?
 
     /// User-adjustable denoise strength (0.0–1.0). Written to MetalPipeline on change.
     @Published var denoiseStrength: Float = 1.0 {
@@ -211,7 +227,6 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
             guard !isoStops.isEmpty else { return }
             let i = ExposureStops.clampIndex(isoStopIndex, count: isoStops.count)
             if i != isoStopIndex { isoStopIndex = i; return }
-            guard !isAutoExposureEnabled else { return }
             let v = isoStops[i]
             guard v != isoValue else { return }
             isoValue = v
@@ -220,7 +235,6 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
         }
     }
     func setShutterAngleWithSnapping(_ rawValue: Float) {
-        guard !isAutoExposureEnabled else { return }
         let snapTargets = ExposureStops.shutterAngles
         var finalValue = rawValue
         
@@ -263,8 +277,8 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
     let captureController = CaptureController()
     nonisolated let metalPipeline: MetalPipeline?
     nonisolated private let videoWriter = VideoWriter()
-    /// Capacity 8: absorb burst stalls while keeping latency low.
-    nonisolated(unsafe) private let frameBuffer = RawFrameBuffer(capacity: 8)
+    /// Capacity 16: absorb burst stalls while keeping latency low.
+    nonisolated(unsafe) private let frameBuffer = RawFrameBuffer(capacity: 16)
 
     private var cancellables = Set<AnyCancellable>()
     /// Debounce rapid slider changes to avoid blocking the main thread on lockForConfiguration().
@@ -456,11 +470,16 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
                 _ = self.videoWriter.appendAudio(sampleBuffer: sample)
             }
         }
+
+        updateStorageEstimate()
+        startStorageMonitor()
     }
 
     private func handleAppInactive() {
         isAppActive = false
         UIApplication.shared.isIdleTimerDisabled = false
+        storageRefreshTimer?.invalidate()
+        storageRefreshTimer = nil
         // Stop stills + drain queue so no Metal submits after background
         captureController.stopSession()
         frameBuffer.flush()
@@ -474,6 +493,8 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
     private func handleAppActive() {
         isAppActive = true
         UIApplication.shared.isIdleTimerDisabled = true
+        updateStorageEstimate()
+        startStorageMonitor()
         // Restart session if we already configured once
         if captureController.activeDevice != nil {
             captureController.setCaptureFPS(selectedFPS.rawValue)
@@ -789,7 +810,7 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
     }
 
     func nudgeISO(_ delta: Int) {
-        guard !controlsLocked, !isAutoExposureEnabled else { return }
+        guard !controlsLocked else { return }
         isoStopIndex = ExposureStops.clampIndex(isoStopIndex + delta, count: isoStops.count)
     }
 
@@ -829,31 +850,25 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
         do {
             try device.lockForConfiguration()
 
-            if isAutoExposureEnabled {
-                if device.isExposureModeSupported(.continuousAutoExposure) {
-                    device.exposureMode = .continuousAutoExposure
-                }
+            let clampedISO = max(device.activeFormat.minISO, min(device.activeFormat.maxISO, isoValue))
+            var shutterDuration = CMTimeMakeWithSeconds((Double(shutterValue) / 360.0) / activeFPS, preferredTimescale: 1_000_000)
+            let minD = device.activeFormat.minExposureDuration
+            let maxD = device.activeFormat.maxExposureDuration
+            if CMTimeCompare(shutterDuration, minD) < 0 { shutterDuration = minD }
+            if CMTimeCompare(shutterDuration, maxD) > 0 { shutterDuration = maxD }
+            // setExposureModeCustom raises NSInvalidArgumentException ("Unsupported
+            // exposure mode") when .custom isn't supported by the active format/device
+            // (e.g. some ultrawides) — and Swift `try/catch` does NOT catch ObjC
+            // exceptions. Guard it, mirroring the setFocusModeLocked fix, and fall back
+            // to a supported mode so toggling exposure doesn't crash the app.
+            if device.isExposureModeSupported(.custom) {
+                device.setExposureModeCustom(duration: shutterDuration, iso: clampedISO)
+            } else if device.isExposureModeSupported(.locked) {
+                device.exposureMode = .locked
+            } else if device.isExposureModeSupported(.continuousAutoExposure) {
+                device.exposureMode = .continuousAutoExposure
             } else {
-                let clampedISO = max(device.activeFormat.minISO, min(device.activeFormat.maxISO, isoValue))
-                var shutterDuration = CMTimeMakeWithSeconds((Double(shutterValue) / 360.0) / activeFPS, preferredTimescale: 1_000_000)
-                let minD = device.activeFormat.minExposureDuration
-                let maxD = device.activeFormat.maxExposureDuration
-                if CMTimeCompare(shutterDuration, minD) < 0 { shutterDuration = minD }
-                if CMTimeCompare(shutterDuration, maxD) > 0 { shutterDuration = maxD }
-                // setExposureModeCustom raises NSInvalidArgumentException ("Unsupported
-                // exposure mode") when .custom isn't supported by the active format/device
-                // (e.g. some ultrawides) — and Swift `try/catch` does NOT catch ObjC
-                // exceptions. Guard it, mirroring the setFocusModeLocked fix, and fall back
-                // to a supported mode so toggling exposure doesn't crash the app.
-                if device.isExposureModeSupported(.custom) {
-                    device.setExposureModeCustom(duration: shutterDuration, iso: clampedISO)
-                } else if device.isExposureModeSupported(.locked) {
-                    device.exposureMode = .locked
-                } else if device.isExposureModeSupported(.continuousAutoExposure) {
-                    device.exposureMode = .continuousAutoExposure
-                } else {
-                    print("[CameraViewModel] No supported manual exposure mode on \(device.localizedName)")
-                }
+                print("[CameraViewModel] No supported manual exposure mode on \(device.localizedName)")
             }
 
             if isAutoWhiteBalanceEnabled {
@@ -886,50 +901,30 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
         }
     }
 
-    /// Freeze any active auto modes (AE/AWB) directly on hardware at their current values,
-    /// ensuring that locking controls or starting recording prevents exposure/color drift.
-    private func freezeAutoExposureAndWB(on device: AVCaptureDevice) {
-        // Lock exposure if auto: freeze hardware directly at current duration and ISO
-        if isAutoExposureEnabled {
-            let curDuration = device.exposureDuration
-            let curISO = device.iso
-            isoValue = curISO
-            isoStopIndex = ExposureStops.nearestIndex(in: isoStops, to: curISO)
-            let angle = Float(curDuration.seconds * activeFPS * 360.0)
-            if angle.isFinite && angle > 0 {
-                shutterValue = max(shutterRange.lowerBound, min(shutterRange.upperBound, angle))
-            }
-            isAutoExposureEnabled = false
-            isAutoExposureAdjusting = false
-            let minISO = device.activeFormat.minISO
-            let maxISO = device.activeFormat.maxISO
-            let clampedISO = max(minISO, min(maxISO, curISO))
-            let minDuration = device.activeFormat.minExposureDuration
-            let maxDuration = device.activeFormat.maxExposureDuration
-            var clampedDuration = curDuration
-            if CMTimeCompare(clampedDuration, minDuration) < 0 { clampedDuration = minDuration }
-            if CMTimeCompare(clampedDuration, maxDuration) > 0 { clampedDuration = maxDuration }
-            if device.isExposureModeSupported(.custom) {
-                device.setExposureModeCustom(duration: clampedDuration, iso: clampedISO)
-            } else if device.isExposureModeSupported(.locked) {
-                device.exposureMode = .locked
-            }
-        }
-
-        // Lock white balance if auto: preserve exact device gains and tint without lossy round-tripping
+    /// Freeze active auto white balance directly on hardware at its current values,
+    /// ensuring that locking controls or starting recording prevents color drift if WB lock is enabled.
+    private func freezeAutoWhiteBalance(on device: AVCaptureDevice) {
+        // Lock white balance if auto and lock enabled: preserve exact device gains and tint
         if isAutoWhiteBalanceEnabled {
-            let currentGains = device.deviceWhiteBalanceGains
-            let tempTint = device.temperatureAndTintValues(for: currentGains)
-            wbKelvin = max(2000, min(10000, tempTint.temperature))
-            wbStopIndex = ExposureStops.nearestIndex(in: wbStops, to: wbKelvin)
-            wbTint = tempTint.tint
-            isAutoWhiteBalanceEnabled = false
-            isAutoWhiteBalanceAdjusting = false
-            let clamped = clampWhiteBalanceGains(currentGains, for: device)
-            if device.isWhiteBalanceModeSupported(.locked) {
-                device.setWhiteBalanceModeLocked(with: clamped)
+            if isAutoWBLockEnabled {
+                let currentGains = device.deviceWhiteBalanceGains
+                let tempTint = device.temperatureAndTintValues(for: currentGains)
+                wbKelvin = max(2000, min(10000, tempTint.temperature))
+                wbStopIndex = ExposureStops.nearestIndex(in: wbStops, to: wbKelvin)
+                wbTint = tempTint.tint
+                isAutoWhiteBalanceEnabled = false
+                isAutoWhiteBalanceAdjusting = false
+                let clamped = clampWhiteBalanceGains(currentGains, for: device)
+                if device.isWhiteBalanceModeSupported(.locked) {
+                    device.setWhiteBalanceModeLocked(with: clamped)
+                }
+                updateWBParams(from: device, explicitGains: clamped)
+            } else {
+                if device.isWhiteBalanceModeSupported(.continuousAutoWhiteBalance) {
+                    device.whiteBalanceMode = .continuousAutoWhiteBalance
+                }
+                metalPipeline?.isAutoWBEnabled = true
             }
-            updateWBParams(from: device, explicitGains: clamped)
         }
     }
 
@@ -939,14 +934,14 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
 
         do {
             try device.lockForConfiguration()
-            freezeAutoExposureAndWB(on: device)
+            freezeAutoWhiteBalance(on: device)
             device.unlockForConfiguration()
         } catch {
             print("[CameraViewModel] lockControls: \(error)")
         }
 
-        // If not in auto modes, push manual settings
-        if !isAutoExposureEnabled && !isAutoWhiteBalanceEnabled {
+        // Push manual exposure and WB settings (if WB is locked)
+        if !isAutoWhiteBalanceEnabled || isAutoWBLockEnabled {
             applyManualExposureAndWB()
         }
 
@@ -1105,6 +1100,13 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
             Self.cleanStaleTemporaryRecordings()
         }
 
+        // Verify storage capacity before starting recording
+        updateStorageEstimate()
+        guard remainingRecordSeconds > 5 else {
+            errorMessage = "Storage Full (<500MB left) — Cannot record."
+            return
+        }
+
         activeEncodeWidth = selectedFormat.width
         activeEncodeHeight = selectedFormat.height
         activeFPS = selectedFPS.rawValue
@@ -1185,17 +1187,17 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
     private func lockAutoModesForRecording() {
         guard let device = captureController.activeDevice else { return }
 
-        // If exposure, white balance, and focus are already locked (e.g. via lockControls()),
+        // If white balance and focus are already locked (e.g. via lockControls()),
         // skip locking hardware configuration to avoid stalling the capture pipeline.
-        let needsExposureOrWB = isAutoExposureEnabled || isAutoWhiteBalanceEnabled
+        let needsWB = isAutoWhiteBalanceEnabled && isAutoWBLockEnabled
         let needsFocus = isAutoFocus
-        guard needsExposureOrWB || needsFocus else { return }
+        guard needsWB || needsFocus else { return }
 
         do {
             try device.lockForConfiguration()
 
-            if needsExposureOrWB {
-                freezeAutoExposureAndWB(on: device)
+            if needsWB {
+                freezeAutoWhiteBalance(on: device)
             }
 
             // Lock focus at current position without calling setFocusModeLocked with invalid lensPosition.
@@ -1212,7 +1214,7 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
             }
 
             device.unlockForConfiguration()
-            if needsExposureOrWB {
+            if needsWB {
                 updateWBParams(from: device)
             }
         } catch {
@@ -1244,17 +1246,17 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
             }
         }
 
-        videoWriter.finish { [weak self] url in
+        videoWriter.finish { [weak self] url, error in
             guard let url else {
                 Task { @MainActor [weak self] in
                     self?.statusText = "Save failed"
-                    self?.errorMessage = "Recording ended with no frames"
+                    self?.errorMessage = error?.localizedDescription ?? "Recording ended with no frames"
                     self?.endSaveTask()
                 }
                 return
             }
             Task { @MainActor [weak self] in
-                self?.saveFinishedRecording(at: url)
+                await self?.saveFinishedRecording(at: url)
             }
         }
         metalPipeline?.trimMemory()
@@ -1276,9 +1278,9 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
         }
     }
 
-    private func saveFinishedRecording(at url: URL) {
+    private func saveFinishedRecording(at url: URL) async {
         // Validate the file before attempting any save
-        guard validateVideoFile(at: url) else {
+        guard await validateVideoFile(at: url) else {
             statusText = "Save failed"
             errorMessage = "Video file is corrupt or empty"
             print("[CameraViewModel] File validation failed for \(url.lastPathComponent)")
@@ -1321,7 +1323,7 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
     }
 
     /// Verify the output file exists, is non-empty, and contains a playable video track.
-    private func validateVideoFile(at url: URL) -> Bool {
+    private func validateVideoFile(at url: URL) async -> Bool {
         guard let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
               let size = attrs[.size] as? Int64,
               size > 1024 else {
@@ -1329,11 +1331,18 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
             return false
         }
         let asset = AVURLAsset(url: url)
-        guard let track = asset.tracks(withMediaType: .video).first else {
-            print("[CameraViewModel] Output file has no video track")
+        do {
+            let tracks = try await asset.loadTracks(withMediaType: .video)
+            guard let track = tracks.first else {
+                print("[CameraViewModel] Output file has no video track")
+                return false
+            }
+            let timeRange = try await track.load(.timeRange)
+            return timeRange.duration.seconds > 0
+        } catch {
+            print("[CameraViewModel] Failed to validate video track: \(error)")
             return false
         }
-        return track.timeRange.duration.seconds > 0
     }
 
     private func presentFilesFolderPicker() {
@@ -1479,6 +1488,45 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
         let minutes = Int(elapsed) / 60
         let seconds = Int(elapsed) % 60
         recordingDuration = String(format: "%02d:%02d", minutes, seconds)
+
+        // Storage countdown & auto-stop check
+        updateStorageEstimate()
+        if remainingRecordSeconds <= 0 && isRecording {
+            print("[CameraViewModel] Auto-stopping recording: storage limit reached.")
+            stopRecording()
+            errorMessage = "Storage limit reached — recording stopped and saved."
+            refreshStatusLine()
+        }
+    }
+
+    // MARK: - Storage Estimation & Monitoring
+
+    func updateStorageEstimate() {
+        let available = StorageEstimator.availableDiskSpaceBytes()
+        availableStorageBytes = available
+        let bytesPerSec = StorageEstimator.estimatedBytesPerSecond(
+            format: selectedFormat,
+            fps: selectedFPS,
+            codec: selectedCodec,
+            bitratePreset: selectedBitrate,
+            includeAudio: selectedAudioSource.portUID != nil
+        )
+        let remainingSecs = StorageEstimator.estimatedRemainingSeconds(
+            availableBytes: available,
+            bytesPerSecond: bytesPerSec
+        )
+        remainingRecordSeconds = remainingSecs
+        estimatedRecordTimeText = StorageEstimator.formatRemainingTime(seconds: remainingSecs)
+    }
+
+    private func startStorageMonitor() {
+        storageRefreshTimer?.invalidate()
+        storageRefreshTimer = Timer.scheduledTimer(withTimeInterval: 5.0, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                guard let self, !self.isRecording else { return }
+                self.updateStorageEstimate()
+            }
+        }
     }
 
     // MARK: - Frame Pipeline
@@ -1737,25 +1785,6 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
 
     private func syncLiveAutoValues(from frameData: RawFrameData) {
         guard let device = captureController.activeDevice else { return }
-        if isAutoExposureEnabled {
-            if frameData.iso > 0 && abs(isoValue - frameData.iso) >= 1.0 {
-                isoValue = frameData.iso
-                isoStopIndex = ExposureStops.nearestIndex(in: isoStops, to: frameData.iso)
-            }
-            if frameData.exposureDurationSeconds > 0 {
-                let angle = Float(frameData.exposureDurationSeconds * activeFPS * 360.0)
-                let clampedAngle = max(shutterRange.lowerBound, min(shutterRange.upperBound, angle))
-                if abs(shutterValue - clampedAngle) >= 0.5 {
-                    shutterValue = clampedAngle
-                }
-            }
-            let isAdj = device.isAdjustingExposure
-            if isAutoExposureAdjusting != isAdj {
-                isAutoExposureAdjusting = isAdj
-            }
-        } else if isAutoExposureAdjusting {
-            isAutoExposureAdjusting = false
-        }
 
         if isAutoWhiteBalanceEnabled {
             if let gains = frameData.whiteBalanceGains {

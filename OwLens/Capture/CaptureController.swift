@@ -75,6 +75,7 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
     private var cachedFM1: [Float]?
     private var cachedFM2: [Float]?
     private var cachedColorMatrices: (bt2020: simd_float3x3?, sgamut: simd_float3x3?)?
+    private var lastComputedMatrixKelvin: Float?
 
     // MARK: - Session Configuration
 
@@ -653,6 +654,7 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
                 self.cachedWhiteLevel = nil
                 self.cachedISO = nil
                 self.cachedColorMatrices = nil
+                self.lastComputedMatrixKelvin = nil
                 self.prepareRAWPhotoResources()
 
                 if wasRunning {
@@ -934,6 +936,9 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
     /// Must be called from the main thread.
     func setRecordingMode(_ recording: Bool) {
         isRecordingMode = recording
+        if recording {
+            enableBurstHelpersIfSafe()
+        }
         if photoOutput.isResponsiveCaptureEnabled {
             maxInFlight = 2
         } else {
@@ -1018,7 +1023,7 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
 
         if bayerBufferPool == nil || bayerPoolW != width || bayerPoolH != height || bayerPoolFormat != format {
             let poolAttrs: [String: Any] = [
-                kCVPixelBufferPoolMinimumBufferCountKey as String: 6
+                kCVPixelBufferPoolMinimumBufferCountKey as String: 18
             ]
             let pbAttrs: [String: Any] = [
                 kCVPixelBufferPixelFormatTypeKey as String: format,
@@ -1215,8 +1220,8 @@ extension CaptureController: AVCapturePhotoCaptureDelegate {
     }
 
     private func extractColorMatrices(from photo: AVCapturePhoto, kelvin: Float? = nil) -> (bt2020: simd_float3x3?, sgamut: simd_float3x3?) {
-        guard let dng = photo.metadata["{DNG}"] as? [String: Any] else {
-            return cachedColorMatrices ?? (nil, nil)
+        if let k = kelvin, let lastK = lastComputedMatrixKelvin, abs(k - lastK) < 25, let cached = cachedColorMatrices {
+            return cached
         }
 
         // Standard CIE XYZ D50 to ITU-R BT.2020 (D65) matrix (CIE XYZ D65 -> BT.2020 * Bradford D50 -> D65):
@@ -1248,16 +1253,28 @@ extension CaptureController: AVCapturePhotoCaptureDelegate {
         )
 
         // Priority 1: DNG ForwardMatrix (Dual-Illuminant Interpolation between Standard Light A ~2856K and D65 ~6504K)
-        if cachedFM1 == nil {
-            let fm1Raw = dng["ForwardMatrix1"] as? [Any]
-            cachedFM1 = fm1Raw.flatMap(Self.parseMatrixFloats)
+        let fm1Vals: [Float]?
+        let fm2Vals: [Float]?
+        let dngDict: [String: Any]?
+        if let c1 = cachedFM1, let c2 = cachedFM2 {
+            fm1Vals = c1
+            fm2Vals = c2
+            dngDict = nil
+        } else {
+            dngDict = photo.metadata["{DNG}"] as? [String: Any]
+            if let dng = dngDict {
+                if cachedFM1 == nil {
+                    let fm1Raw = dng["ForwardMatrix1"] as? [Any]
+                    cachedFM1 = fm1Raw.flatMap(Self.parseMatrixFloats)
+                }
+                if cachedFM2 == nil {
+                    let fm2Raw = dng["ForwardMatrix2"] as? [Any]
+                    cachedFM2 = fm2Raw.flatMap(Self.parseMatrixFloats)
+                }
+            }
+            fm1Vals = cachedFM1
+            fm2Vals = cachedFM2
         }
-        if cachedFM2 == nil {
-            let fm2Raw = dng["ForwardMatrix2"] as? [Any]
-            cachedFM2 = fm2Raw.flatMap(Self.parseMatrixFloats)
-        }
-        let fm1Vals = cachedFM1
-        let fm2Vals = cachedFM2
 
         var finalFMVals: [Float]? = nil
         if let fm1Vals, let fm2Vals, let kelvin {
@@ -1284,7 +1301,10 @@ extension CaptureController: AVCapturePhotoCaptureDelegate {
             if abs(fmMatrix.determinant) > 1e-5 {
                 let camTo2020 = Self.normalizeMatrixRows(mD50to2020 * fmMatrix)
                 let camToSGamut = Self.normalizeMatrixRows(mD50toSGamut * fmMatrix)
-                return (camTo2020, camToSGamut)
+                lastComputedMatrixKelvin = kelvin
+                let result = (camTo2020, camToSGamut)
+                cachedColorMatrices = result
+                return result
             }
         }
 
@@ -1292,7 +1312,8 @@ extension CaptureController: AVCapturePhotoCaptureDelegate {
         // ColorMatrix maps XYZ D65 to raw (un-white-balanced) camera native RGB.
         // To apply to white-balanced camera RGB, we must invert ColorMatrix and multiply
         // by the inverse of the sensor's native D65 white-balance gains D^-1.
-        let cmRaw = (dng["ColorMatrix2"] as? [Any]) ?? (dng["ColorMatrix1"] as? [Any])
+        let dng = dngDict ?? (photo.metadata["{DNG}"] as? [String: Any])
+        let cmRaw = (dng?["ColorMatrix2"] as? [Any]) ?? (dng?["ColorMatrix1"] as? [Any])
         if let cm = cmRaw, let cmVals = Self.parseMatrixFloats(cm), cmVals.count == 9 {
             let cmMatrix = simd_float3x3(
                 SIMD3<Float>(cmVals[0], cmVals[3], cmVals[6]), // column 0
@@ -1315,10 +1336,13 @@ extension CaptureController: AVCapturePhotoCaptureDelegate {
 
             let camTo2020 = Self.normalizeMatrixRows(mXYZto2020 * camToXYZ)
             let camToSGamut = Self.normalizeMatrixRows(mXYZtoSGamut * camToXYZ)
-            return (camTo2020, camToSGamut)
+            lastComputedMatrixKelvin = kelvin
+            let result = (camTo2020, camToSGamut)
+            cachedColorMatrices = result
+            return result
         }
 
-        return (nil, nil)
+        return cachedColorMatrices ?? (nil, nil)
     }
 
     private static func parseMatrixFloats(_ raw: [Any]) -> [Float]? {

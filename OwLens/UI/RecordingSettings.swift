@@ -138,3 +138,89 @@ enum PreviewDisplayMode: Int, CaseIterable, Identifiable {
         }
     }
 }
+
+// MARK: - Storage Estimator
+
+/// Utilities for querying free device storage and estimating remaining recording time.
+enum StorageEstimator {
+    /// Safety reserve (500 MB) left untouched so AVAssetWriter can finalize moov atoms and PhotoKit can save.
+    static let safetyReserveBytes: Int64 = 500 * 1024 * 1024
+
+    /// Queries the currently available disk capacity suitable for important user recordings.
+    static func availableDiskSpaceBytes() -> Int64 {
+        do {
+            let values = try URL(fileURLWithPath: NSHomeDirectory()).resourceValues(forKeys: [
+                .volumeAvailableCapacityForImportantUsageKey,
+                .volumeAvailableCapacityKey
+            ])
+            if let important = values.volumeAvailableCapacityForImportantUsage, important > 0 {
+                return important
+            }
+            if let normal = values.volumeAvailableCapacity, normal > 0 {
+                return Int64(normal)
+            }
+        } catch {}
+        if let attrs = try? FileManager.default.attributesOfFileSystem(forPath: NSHomeDirectory()),
+           let freeSize = attrs[.systemFreeSize] as? NSNumber {
+            return freeSize.int64Value
+        }
+        return 0
+    }
+
+    /// Estimates bytes written per second for the given recording configuration.
+    static func estimatedBytesPerSecond(
+        format: RecordingFormat,
+        fps: CaptureFrameRate,
+        codec: VideoCodecOption,
+        bitratePreset: BitratePreset,
+        includeAudio: Bool
+    ) -> Double {
+        let audioBps: Double = includeAudio ? 128_000.0 : 0.0
+        let videoBps: Double
+        switch codec {
+        case .hevc:
+            let effective = min(bitratePreset.bitsPerSecond, format.maxBitratePreset.bitsPerSecond)
+            videoBps = Double(effective)
+        case .proRes422:
+            let baseRate: Double
+            switch format {
+            case .uhd4k: baseRate = 500_000_000.0
+            case .openGate: baseRate = 156_000_000.0
+            case .hd169: baseRate = 117_000_000.0
+            }
+            videoBps = baseRate * (fps.rawValue / 24.0)
+        case .proRes422HQ:
+            let baseRate: Double
+            switch format {
+            case .uhd4k: baseRate = 750_000_000.0
+            case .openGate: baseRate = 235_000_000.0
+            case .hd169: baseRate = 176_000_000.0
+            }
+            videoBps = baseRate * (fps.rawValue / 24.0)
+        }
+        return (videoBps + audioBps) / 8.0
+    }
+
+    /// Computes usable recording time in seconds after reserving safety margin.
+    static func estimatedRemainingSeconds(
+        availableBytes: Int64,
+        bytesPerSecond: Double
+    ) -> Int {
+        let usable = max(0, availableBytes - safetyReserveBytes)
+        guard bytesPerSecond > 0 else { return 0 }
+        return Int(Double(usable) / bytesPerSecond)
+    }
+
+    /// Formats remaining seconds into a concise display string (e.g. "45:12" or "1h 20m").
+    static func formatRemainingTime(seconds: Int) -> String {
+        if seconds <= 0 { return "00:00" }
+        let hours = seconds / 3600
+        let mins = (seconds % 3600) / 60
+        let secs = seconds % 60
+        if hours > 0 {
+            return String(format: "%dh %02dm", hours, mins)
+        } else {
+            return String(format: "%02d:%02d", mins, secs)
+        }
+    }
+}

@@ -638,8 +638,53 @@ extension MetalPipeline {
             allPassed = false
         }
 
+        // 5. Storage Estimator bytes-per-second and remaining time validation
+        let bps = StorageEstimator.estimatedBytesPerSecond(
+            format: .uhd4k,
+            fps: .fps24,
+            codec: .hevc,
+            bitratePreset: .mbps100,
+            includeAudio: true
+        )
+        let expectedBps = (100_000_000.0 + 128_000.0) / 8.0
+        if abs(bps - expectedBps) > 1e-2 {
+            print("[AE/AWBTest] FAIL: Expected bps \(expectedBps), got \(bps)")
+            allPassed = false
+        }
+
+        // Usable storage with 500MB safety reserve
+        let testAvailableBytes: Int64 = 10_000_000_000 // 10 GB
+        let remainingSecs = StorageEstimator.estimatedRemainingSeconds(
+            availableBytes: testAvailableBytes,
+            bytesPerSecond: bps
+        )
+        let expectedSecs = Int(Double(10_000_000_000 - 500 * 1024 * 1024) / expectedBps)
+        if remainingSecs != expectedSecs {
+            print("[AE/AWBTest] FAIL: Expected remaining seconds \(expectedSecs), got \(remainingSecs)")
+            allPassed = false
+        }
+
+        // Time string formatting
+        let fmtZero = StorageEstimator.formatRemainingTime(seconds: 0)
+        let fmtMins = StorageEstimator.formatRemainingTime(seconds: 759)
+        let fmtHours = StorageEstimator.formatRemainingTime(seconds: 3665)
+        if fmtZero != "00:00" || fmtMins != "12:39" || fmtHours != "1h 01m" {
+            print("[AE/AWBTest] FAIL: Time formatting mismatch: zero='\(fmtZero)', mins='\(fmtMins)', hours='\(fmtHours)'")
+            allPassed = false
+        }
+
+        // Zero usable space when below 500MB
+        let lowSpaceRemaining = StorageEstimator.estimatedRemainingSeconds(
+            availableBytes: 400 * 1024 * 1024,
+            bytesPerSecond: bps
+        )
+        if lowSpaceRemaining != 0 {
+            print("[AE/AWBTest] FAIL: Low space (<500MB) expected 0 remaining seconds, got \(lowSpaceRemaining)")
+            allPassed = false
+        }
+
         if allPassed {
-            print("[AE/AWBTest] PASS: Auto Exposure & Auto White Balance logic & mathematics verified successfully")
+            print("[AE/AWBTest] PASS: Auto Exposure, White Balance & Storage Estimator verified successfully")
         }
         return allPassed
     }
