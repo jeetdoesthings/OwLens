@@ -4,14 +4,14 @@ struct ScopesOverlay: View {
     let data: ScopeData
 
     var body: some View {
-        VStack(spacing: 5) {
+        VStack(spacing: 4) {
             // RGB Histogram Block
             scopeBlock(
                 title: "HISTOGRAM",
                 headerAccessory: AnyView(histogramBadge)
             ) {
                 histogramCanvas
-                    .frame(height: 30)
+                    .frame(height: 26)
             }
 
             // Luma Waveform Block with IRE Scale
@@ -20,12 +20,12 @@ struct ScopesOverlay: View {
                 headerAccessory: AnyView(waveformBadge)
             ) {
                 waveformCanvas
-                    .frame(height: 46)
+                    .frame(height: 38)
             }
         }
-        .frame(width: 108)
-        .padding(.horizontal, 6)
-        .padding(.vertical, 6)
+        .frame(width: 104)
+        .padding(.horizontal, 5)
+        .padding(.vertical, 5)
         .glassPanel(
             cornerRadius: OwLensTheme.radiusCard,
             border: OwLensTheme.glassBorderActive,

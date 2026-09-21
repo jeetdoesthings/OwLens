@@ -287,10 +287,10 @@ final class VideoWriter: @unchecked Sendable {
         }
 
         // Jitter-immune CFR timeline:
-        // Only insert hold frames if an entire frame interval was missed (delta >= 1.6 * frameDuration).
-        // Normal sensor readout variations (e.g. 35-55ms at 24fps) will have delta < 1.6 * frameDuration,
-        // which avoids inserting premature duplicate frames and prevents encoder queue backpressure.
-        if realFrameCount >= 1, deltaSeconds >= (1.6 * frameDuration), let hold = lastPixelBuffer {
+        // Only insert hold frames if an entire frame interval was genuinely missed (delta >= 2.2 * frameDuration).
+        // Normal mobile sensor readout jitter (e.g. 40-58ms at 30fps) will have delta < 2.2 * frameDuration,
+        // preventing artificial duplicate hold frames from flooding the encoder and causing real frames to drop.
+        if realFrameCount >= 1, deltaSeconds >= (2.2 * frameDuration), let hold = lastPixelBuffer {
             let missedSlots = min(5, Int((deltaSeconds / frameDuration).rounded()) - 1)
             var inserted = 0
             while inserted < missedSlots {

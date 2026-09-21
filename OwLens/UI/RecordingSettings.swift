@@ -24,7 +24,6 @@ enum CaptureFrameRate: Double, CaseIterable, Identifiable {
 enum RecordingFormat: String, CaseIterable, Identifiable {
     case openGate = "openGate"
     case hd169 = "hd169"
-    case uhd4k = "uhd4k"
 
     var id: String { rawValue }
 
@@ -32,7 +31,6 @@ enum RecordingFormat: String, CaseIterable, Identifiable {
         switch self {
         case .openGate: return 1920
         case .hd169: return 1920
-        case .uhd4k: return 3840
         }
     }
 
@@ -40,7 +38,6 @@ enum RecordingFormat: String, CaseIterable, Identifiable {
         switch self {
         case .openGate: return 1440
         case .hd169: return 1080
-        case .uhd4k: return 2160
         }
     }
 
@@ -52,7 +49,6 @@ enum RecordingFormat: String, CaseIterable, Identifiable {
         switch self {
         case .openGate: return "OG"
         case .hd169: return "1080"
-        case .uhd4k: return "4K"
         }
     }
 
@@ -60,7 +56,6 @@ enum RecordingFormat: String, CaseIterable, Identifiable {
         switch self {
         case .openGate: return "Open Gate 4:3"
         case .hd169: return "1080p 16:9"
-        case .uhd4k: return "4K 16:9"
         }
     }
 
@@ -70,7 +65,6 @@ enum RecordingFormat: String, CaseIterable, Identifiable {
         switch self {
         case .openGate: return .mbps100
         case .hd169: return .mbps80
-        case .uhd4k: return .mbps100
         }
     }
 
@@ -184,7 +178,6 @@ enum StorageEstimator {
         case .proRes422:
             let baseRate: Double
             switch format {
-            case .uhd4k: baseRate = 500_000_000.0
             case .openGate: baseRate = 156_000_000.0
             case .hd169: baseRate = 117_000_000.0
             }
@@ -192,7 +185,6 @@ enum StorageEstimator {
         case .proRes422HQ:
             let baseRate: Double
             switch format {
-            case .uhd4k: baseRate = 750_000_000.0
             case .openGate: baseRate = 235_000_000.0
             case .hd169: baseRate = 176_000_000.0
             }

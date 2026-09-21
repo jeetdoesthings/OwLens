@@ -33,8 +33,7 @@ struct RootView: View {
                         // Metal Pipeline Preview (Bayer RAW -> Demosaic -> Rec.709/Log preview + Overlays)
                         CameraPreviewView(
                             metalPipeline: pipeline,
-                            currentTexture: $viewModel.currentTexture,
-                            textureChangeCount: $viewModel.textureChangeCount,
+                            previewFeed: viewModel.previewFeed,
                             showClipping: $viewModel.showClipping,
                             showFocusPeaking: $viewModel.showFocusPeaking,
                             showDisplayLUT: viewModel.showDisplayLUT,
@@ -103,6 +102,7 @@ struct RootView: View {
                 // Interactive HUD Controls & Panels
                 ControlsView(viewModel: viewModel)
                     .frame(maxWidth: UIDevice.current.userInterfaceIdiom == .pad ? 750 : .infinity)
+                    .ignoresSafeArea(edges: .vertical)
             } else if viewModel.metalPipeline == nil {
                 metalUnavailableView
             } else {

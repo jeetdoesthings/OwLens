@@ -49,6 +49,7 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
     /// Outstanding capturePhoto calls (RAW usually 1; responsive may allow more).
     private var inFlightCaptures = 0
     private var maxInFlight = 1
+    private var isCapturePending = false
 
     var onRawFrameData: ((RawFrameData) -> Void)?
     var onAudioSample: ((CMSampleBuffer) -> Void)?
@@ -905,6 +906,9 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
     func stopSession() {
         captureTimer?.cancel()
         captureTimer = nil
+        captureLock.lock()
+        isCapturePending = false
+        captureLock.unlock()
         captureQueue.async { [weak self] in
             self?.session.stopRunning()
         }
@@ -953,9 +957,12 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
         guard session.isRunning else { return }
         captureTimer?.cancel()
         captureTimer = nil
+        captureLock.lock()
+        isCapturePending = false
+        captureLock.unlock()
         minFrameInterval = 1.0 / max(1, fps)
         let timer = DispatchSource.makeTimerSource(queue: captureQueue)
-        timer.schedule(deadline: .now(), repeating: minFrameInterval)
+        timer.schedule(deadline: .now(), repeating: minFrameInterval, leeway: .nanoseconds(500_000))
         timer.setEventHandler { [weak self] in
             self?.captureOneRawFrame()
         }
@@ -969,10 +976,12 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
 
         captureLock.lock()
         if inFlightCaptures >= maxInFlight {
+            isCapturePending = true
             captureLock.unlock()
             return
         }
         inFlightCaptures += 1
+        isCapturePending = false
         lastCaptureStart = CACurrentMediaTime()
         captureLock.unlock()
 
@@ -1108,13 +1117,17 @@ extension CaptureController: AVCapturePhotoCaptureDelegate {
     func photoOutput(_ output: AVCapturePhotoOutput, didFinishProcessingPhoto photo: AVCapturePhoto, error: Error?) {
         // Free the capture slot ASAP after we copy the buffer, and re-trigger immediately if due
         defer {
-            endInFlight()
-            if isRecordingMode {
-                let now = CACurrentMediaTime()
-                if now - lastCaptureStart >= minFrameInterval {
-                    captureQueue.async { [weak self] in
-                        self?.captureOneRawFrame()
-                    }
+            captureLock.lock()
+            inFlightCaptures = max(0, inFlightCaptures - 1)
+            let triggerPending = isCapturePending && inFlightCaptures < maxInFlight
+            if triggerPending {
+                isCapturePending = false
+            }
+            captureLock.unlock()
+
+            if triggerPending {
+                captureQueue.async { [weak self] in
+                    self?.captureOneRawFrame()
                 }
             }
         }

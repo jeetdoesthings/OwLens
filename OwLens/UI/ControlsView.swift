@@ -6,9 +6,6 @@ import AVFoundation
 struct ControlsView: View {
     @ObservedObject var viewModel: CameraViewModel
 
-    @State private var showLockNotice = false
-    @State private var lockNoticeTimer: Timer?
-
     var body: some View {
         ZStack {
             // Top HUD Status Bar
@@ -27,9 +24,28 @@ struct ControlsView: View {
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
 
-            // Right Record Grip
+            // Right Record Grip (Record button + Scopes below)
             rightRecordGrip
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .trailing)
+
+            // Interactive Toast Pill
+            if let toast = viewModel.activeToast {
+                HStack(spacing: 6) {
+                    Image(systemName: "checkmark.circle.fill")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundColor(OwLensTheme.audioNominal)
+                    Text(toast)
+                        .font(.geist(.medium, size: 12))
+                        .foregroundColor(.white)
+                }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 7)
+                .glassPanel(cornerRadius: OwLensTheme.radiusCard, border: OwLensTheme.glassBorderActive, background: OwLensTheme.glassBaseHeavy)
+                .padding(.top, 46)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+                .transition(.move(edge: .top).combined(with: .opacity))
+                .zIndex(30)
+            }
         }
         .animation(.spring(response: 0.28, dampingFraction: 0.82), value: viewModel.activePanel)
         .animation(.spring(response: 0.28, dampingFraction: 0.82), value: viewModel.isRecording)
@@ -47,8 +63,8 @@ struct ControlsView: View {
             Spacer(minLength: 8)
             rightStatusGroup
         }
-        .padding(.leading, 64)
-        .padding(.trailing, 92)
+        .padding(.leading, 56)
+        .padding(.trailing, 126)
         .padding(.top, 10)
     }
 
@@ -103,6 +119,9 @@ struct ControlsView: View {
                 .glassPanel(cornerRadius: OwLensTheme.radiusCard, border: OwLensTheme.glassBorder, background: OwLensTheme.glassBase)
             }
 
+            // Live Device Battery Gauge with Percentage Inside
+            batteryIndicator
+
             if viewModel.droppedFrames > 0 {
                 HStack(spacing: 4) {
                     Image(systemName: "exclamationmark.triangle.fill")
@@ -118,47 +137,105 @@ struct ControlsView: View {
         }
     }
 
+    private var batteryIndicator: some View {
+        let level = viewModel.batteryLevel
+        let isCharging = viewModel.isBatteryCharging
+        let percent = Int(max(0, min(100, (level * 100).rounded())))
+        let isLow = level < 0.20
+        let statusColor: Color = isLow ? OwLensTheme.recordingRed : (isCharging ? OwLensTheme.audioNominal : OwLensTheme.textPrimary)
+
+        return HStack(spacing: 0) {
+            ZStack(alignment: .leading) {
+                // Battery body frame
+                RoundedRectangle(cornerRadius: 3.5, style: .continuous)
+                    .strokeBorder(statusColor.opacity(0.40), lineWidth: 1)
+                    .background(
+                        RoundedRectangle(cornerRadius: 3.5, style: .continuous)
+                            .fill(Color.black.opacity(0.35))
+                    )
+                    .frame(width: 32, height: 16)
+
+                // Fill level indicator
+                RoundedRectangle(cornerRadius: 2.2, style: .continuous)
+                    .fill(statusColor.opacity(0.35))
+                    .frame(width: max(2, CGFloat(level) * 28), height: 12)
+                    .padding(.leading, 2)
+
+                // Percentage number inside battery
+                HStack(spacing: 1) {
+                    if isCharging {
+                        Image(systemName: "bolt.fill")
+                            .font(.system(size: 6.5, weight: .black))
+                            .foregroundColor(OwLensTheme.audioNominal)
+                    }
+                    Text("\(percent)")
+                        .font(.system(size: 8, weight: .bold, design: .rounded))
+                        .foregroundColor(isLow ? OwLensTheme.recordingRed : .white)
+                }
+                .frame(width: 32, height: 16)
+            }
+
+            // Battery positive terminal nub
+            Capsule()
+                .fill(statusColor.opacity(0.40))
+                .frame(width: 1.5, height: 6)
+                .offset(x: 1)
+        }
+        .frame(height: 30)
+        .padding(.horizontal, 4)
+    }
+
     private var centerStatusGroup: some View {
         HStack(spacing: 6) {
             // Lens Switcher Pill
             lensSwitcherPill
 
-            // Resolution & FPS Pill
+            // Format Button (OG / 1080 - single tap cycles)
             Button {
                 Haptics.selection()
-                viewModel.togglePanel(.format)
+                viewModel.cycleFormat()
             } label: {
-                HStack(spacing: 4) {
-                    Text(viewModel.selectedFormat.shortLabel)
-                        .font(.geist(.semiBold, size: 11))
-                        .foregroundColor(isTopLocked ? OwLensTheme.textDisabled : OwLensTheme.textPrimary)
-                    Text("·")
-                        .foregroundColor(isTopLocked ? OwLensTheme.textDisabled : OwLensTheme.textMuted)
-                    Text("\(viewModel.selectedFPS.label)fps")
-                        .font(.geistMono(.medium, size: 10))
-                        .foregroundColor(isTopLocked ? OwLensTheme.textDisabled : OwLensTheme.textSecondary)
-                }
-                .padding(.horizontal, 10)
-                .frame(height: 30)
-                .glassPanel(
-                    cornerRadius: OwLensTheme.radiusCard,
-                    border: (viewModel.activePanel == .format || viewModel.activePanel == .fps) ? OwLensTheme.glassBorderActive : OwLensTheme.glassBorder,
-                    background: (viewModel.activePanel == .format || viewModel.activePanel == .fps) ? OwLensTheme.glassActiveBg : OwLensTheme.glassBase
-                )
-                .contentShape(Rectangle())
+                Text(viewModel.selectedFormat.shortLabel)
+                    .font(.geist(.bold, size: 12))
+                    .foregroundColor(isTopLocked ? OwLensTheme.textDisabled : OwLensTheme.textPrimary)
+                    .padding(.horizontal, 8)
+                    .frame(minWidth: 38)
+                    .frame(height: 30)
+                    .glassPanel(cornerRadius: OwLensTheme.radiusCard)
+                    .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
             .disabled(isTopLocked)
             .opacity(isTopLocked ? 0.4 : 1.0)
+            .animation(.easeInOut(duration: 0.15), value: viewModel.selectedFormat)
 
-            // Log Profile Cycle Button
+            // FPS Button (24 / 30 - no "fps" text, single tap cycles)
+            Button {
+                Haptics.selection()
+                viewModel.cycleFPS()
+            } label: {
+                Text(viewModel.selectedFPS.label)
+                    .font(.geistMono(.bold, size: 12))
+                    .foregroundColor(isTopLocked ? OwLensTheme.textDisabled : OwLensTheme.textPrimary)
+                    .padding(.horizontal, 8)
+                    .frame(minWidth: 32)
+                    .frame(height: 30)
+                    .glassPanel(cornerRadius: OwLensTheme.radiusCard)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .disabled(isTopLocked)
+            .opacity(isTopLocked ? 0.4 : 1.0)
+            .animation(.easeInOut(duration: 0.15), value: viewModel.selectedFPS)
+
+            // Log Profile Selector Button (Single tap cycles Apple Log 2 / Sony S-Log3)
             Button {
                 Haptics.selection()
                 viewModel.toggleLogCurve()
             } label: {
                 HStack(spacing: 5) {
                     Text(viewModel.selectedCurve.displayName)
-                        .font(.geist(.semiBold, size: 10))
+                        .font(.geist(.semiBold, size: 11))
                         .foregroundColor(isTopLocked ? OwLensTheme.textDisabled : OwLensTheme.textPrimary)
                     Text("10-BIT")
                         .font(.geistMono(.bold, size: 8))
@@ -253,15 +330,6 @@ struct ControlsView: View {
             .buttonStyle(.plain)
             .disabled(isTopLocked)
             .opacity(isTopLocked ? 0.4 : 1.0)
-
-            // CFA Pattern Tag
-            Text(viewModel.cfaLabel)
-                .font(.geistMono(.medium, size: 9))
-                .foregroundColor(OwLensTheme.textMuted)
-                .padding(.horizontal, 8)
-                .frame(height: 30)
-                .glassPanel(cornerRadius: OwLensTheme.radiusCard)
-                .opacity(isTopLocked ? 0.4 : 1.0)
         }
     }
 
@@ -313,7 +381,7 @@ struct ControlsView: View {
         }
         .padding(4)
         .glassPanel(cornerRadius: OwLensTheme.radiusLg, background: OwLensTheme.glassBaseHeavy)
-        .padding(.leading, 12)
+        .padding(.leading, 20)
     }
 
     private func monitoringToolButton(
@@ -398,21 +466,25 @@ struct ControlsView: View {
                 viewModel.togglePanel(.bitrate)
             }
 
-            // Audio Source
-            deckTile(
-                title: "AUDIO",
-                value: micShortName,
-                subvalue: viewModel.selectedAudioSource.portUID == nil ? "MUTED" : "ACTIVE",
-                isSelected: viewModel.activePanel == .mic,
-                isDisabled: viewModel.isRecording || viewModel.controlsLocked,
-                width: 68
-            ) {
-                viewModel.togglePanel(.mic)
-            }
+            // Audio Source with Live VU Meter
+            audioDeckTile
         }
-        .padding(.leading, 64)
-        .padding(.trailing, 92)
-        .padding(.bottom, 10)
+        .padding(.leading, 56)
+        .padding(.trailing, 84)
+        .padding(.bottom, 20)
+    }
+
+    private var audioDeckTile: some View {
+        AudioDeckTile(
+            audioMonitor: viewModel.audioMonitor,
+            isSelected: viewModel.activePanel == .mic,
+            isDisabled: viewModel.isRecording || viewModel.controlsLocked,
+            isMuted: viewModel.selectedAudioSource.portUID == nil,
+            micShortName: micShortName
+        ) {
+            Haptics.selection()
+            viewModel.togglePanel(.mic)
+        }
     }
 
     private func deckTile(
@@ -484,15 +556,6 @@ struct ControlsView: View {
                 messageBadge(icon: "thermometer.medium", text: thermalMessage, color: thermalColor)
             }
 
-            if showLockNotice {
-                messageBadge(
-                    icon: "lock.fill",
-                    text: "Lock controls to start recording",
-                    color: OwLensTheme.textSecondary
-                )
-                .transition(.scale.combined(with: .opacity))
-            }
-
             if let panel = viewModel.activePanel, !viewModel.isRecording {
                 floatingAdjustmentPanel(panel)
                     .transition(.asymmetric(
@@ -551,14 +614,74 @@ struct ControlsView: View {
 
             case .lens:
                 lensDrawerContent
+
+            case .logCurve:
+                logCurveDrawerContent
             }
         }
         .padding(12)
-        .glassPanel(cornerRadius: OwLensTheme.radiusLg, border: OwLensTheme.glassBorderActive, background: OwLensTheme.glassBaseHeavy)
-        .shadow(color: Color.black.opacity(0.4), radius: 12, x: 0, y: 4)
+        .glassPanel(cornerRadius: OwLensTheme.radiusLg, border: OwLensTheme.glassBorderActive, background: Color.black.opacity(0.32))
+        .shadow(color: Color.black.opacity(0.35), radius: 14, x: 0, y: 5)
     }
 
     // MARK: - Drawer Sub-views
+
+    private var logCurveDrawerContent: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            drawerHeader(title: "LOG COLOR PROFILE")
+
+            VStack(spacing: 8) {
+                ForEach(LogCurveType.uiCases, id: \.self) { curve in
+                    let isSelected = viewModel.selectedCurve == curve
+                    Button {
+                        Haptics.selection()
+                        viewModel.selectedCurve = curve
+                        viewModel.showToast("\(curve.displayName) · 10-Bit BT.2020")
+                    } label: {
+                        HStack {
+                            VStack(alignment: .leading, spacing: 3) {
+                                HStack(spacing: 6) {
+                                    Text(curve.displayName)
+                                        .font(.geist(isSelected ? .semiBold : .medium, size: 12))
+                                        .foregroundColor(isSelected ? .black : OwLensTheme.textPrimary)
+                                    Text("10-BIT")
+                                        .font(.geistMono(.bold, size: 8))
+                                        .foregroundColor(isSelected ? .black.opacity(0.75) : .white)
+                                        .padding(.horizontal, 4)
+                                        .padding(.vertical, 1.5)
+                                        .background(
+                                            RoundedRectangle(cornerRadius: 3, style: .continuous)
+                                                .fill(isSelected ? Color.black.opacity(0.12) : Color.white.opacity(0.18))
+                                        )
+                                }
+                                Text(curve == .appleLog2 ? "Native Apple Log OETF · ITU-R BT.2020 · 12 stops dynamic range" : "Sony S-Log3 OETF · S-Gamut3.Cine · Standardized Cine EI")
+                                    .font(.geist(.regular, size: 9))
+                                    .foregroundColor(isSelected ? .black.opacity(0.60) : OwLensTheme.textSecondary)
+                            }
+                            Spacer()
+                            if isSelected {
+                                Image(systemName: "checkmark.circle.fill")
+                                    .foregroundColor(.black)
+                                    .font(.system(size: 14, weight: .semibold))
+                            }
+                        }
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 10)
+                        .background(
+                            RoundedRectangle(cornerRadius: OwLensTheme.radiusCard, style: .continuous)
+                                .fill(isSelected ? OwLensTheme.glassActive : OwLensTheme.glassBase)
+                        )
+                        .overlay(
+                            RoundedRectangle(cornerRadius: OwLensTheme.radiusCard, style: .continuous)
+                                .strokeBorder(isSelected ? Color.clear : OwLensTheme.glassBorder, lineWidth: 0.5)
+                        )
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+        }
+    }
 
     private var exposureDrawerContent: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -702,29 +825,33 @@ struct ControlsView: View {
                         onNudge: { viewModel.nudgeWB($0) }
                     )
 
-                    // Quick Presets
+                    // Quick Presets with Icons
                     HStack(spacing: 4) {
                         ForEach([
-                            ("3200K", Float(3200)),
-                            ("4000K", Float(4000)),
-                            ("5600K", Float(5600)),
-                            ("7000K", Float(7000))
+                            ("Tungsten", "lightbulb.fill", Float(3200)),
+                            ("Fluorescent", "sun.haze.fill", Float(4000)),
+                            ("Daylight", "sun.max.fill", Float(5600)),
+                            ("Shade", "cloud.sun.fill", Float(7000))
                         ], id: \.0) { item in
-                            let isMatch = abs(viewModel.wbKelvin - item.1) < 150
+                            let isMatch = abs(viewModel.wbKelvin - item.2) < 150
                             Button {
                                 Haptics.selection()
-                                viewModel.wbStopIndex = ExposureStops.nearestIndex(in: viewModel.wbStops, to: item.1)
+                                viewModel.wbStopIndex = ExposureStops.nearestIndex(in: viewModel.wbStops, to: item.2)
                             } label: {
-                                Text(item.0)
-                                    .font(.geist(isMatch ? .semiBold : .regular, size: 9))
-                                    .foregroundColor(isMatch ? .black : OwLensTheme.textSecondary)
-                                    .padding(.horizontal, 7)
-                                    .padding(.vertical, 4)
-                                    .background(
-                                        RoundedRectangle(cornerRadius: 6, style: .continuous)
-                                            .fill(isMatch ? OwLensTheme.glassActive : OwLensTheme.glassBase)
-                                    )
-                                    .contentShape(Rectangle())
+                                HStack(spacing: 3) {
+                                    Image(systemName: item.1)
+                                        .font(.system(size: 8))
+                                    Text("\(Int(item.2))K")
+                                        .font(.geist(isMatch ? .semiBold : .regular, size: 9))
+                                }
+                                .foregroundColor(isMatch ? .black : OwLensTheme.textSecondary)
+                                .padding(.horizontal, 7)
+                                .padding(.vertical, 4)
+                                .background(
+                                    RoundedRectangle(cornerRadius: 6, style: .continuous)
+                                        .fill(isMatch ? OwLensTheme.glassActive : OwLensTheme.glassBase)
+                                )
+                                .contentShape(Rectangle())
                             }
                             .buttonStyle(.plain)
                         }
@@ -1018,7 +1145,7 @@ struct ControlsView: View {
                 }
 
                 if viewModel.denoiseStrength > 0.7 {
-                    Text("High values may drop frames in 4K.")
+                    Text("Higher values increase spatial noise reduction.")
                         .font(.geist(.regular, size: 9))
                         .foregroundColor(OwLensTheme.textSecondary)
                         .frame(maxWidth: .infinity, alignment: .leading)
@@ -1210,111 +1337,72 @@ struct ControlsView: View {
     // MARK: - Right Record Grip
 
     private var rightRecordGrip: some View {
-        let isLocked = viewModel.controlsLocked
-        let lockColor: Color = isLocked ? OwLensTheme.lockLocked : OwLensTheme.lockUnlocked
+        ZStack(alignment: .trailing) {
+            // Shutter / Record Trigger - Locked in the exact physical vertical center
+            recordButton
+                .frame(maxHeight: .infinity, alignment: .center)
 
-        return VStack(spacing: 12) {
-            // Lock / Unlock Switch (Only lock button in HUD, on top of record button)
-            Button {
-                Haptics.impact(.medium)
-                if isLocked {
-                    viewModel.unlockControls()
-                } else {
-                    viewModel.lockControls()
-                }
-            } label: {
-                Image(systemName: isLocked ? "lock.fill" : "lock.open")
-                    .font(.system(size: 14, weight: .semibold))
-                    .foregroundColor(lockColor)
-                    .frame(width: 44, height: 36)
-                    .background(
-                        RoundedRectangle(cornerRadius: OwLensTheme.radiusCard, style: .continuous)
-                            .fill(lockColor.opacity(0.14))
-                    )
-                    .overlay(
-                        RoundedRectangle(cornerRadius: OwLensTheme.radiusCard, style: .continuous)
-                            .strokeBorder(lockColor.opacity(0.40), lineWidth: 0.75)
-                    )
-                    .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .disabled(viewModel.isRecording || viewModel.isSaving)
-            .opacity(viewModel.isRecording || viewModel.isSaving ? 0.3 : 1.0)
-
-            // Shutter / Record Trigger
-            Button {
-                guard !viewModel.isSaving else { return }
-                if viewModel.isRecording {
-                    Haptics.notification(.success)
-                    viewModel.stopRecording()
-                } else {
-                    if !viewModel.controlsLocked {
-                        Haptics.notification(.warning)
-                        showLockNoticeToast()
-                    } else {
-                        Haptics.notification(.success)
-                        viewModel.startRecording()
-                    }
-                }
-            } label: {
-                ZStack {
-                    // Outer Ring
-                    Circle()
-                        .strokeBorder(OwLensTheme.textPrimary, lineWidth: 2.5)
-                        .frame(width: 64, height: 64)
-                        .shadow(color: viewModel.isRecording ? OwLensTheme.recordingRed.opacity(0.6) : Color.clear, radius: 8)
-
-                    if viewModel.isSaving {
-                        ProgressView()
-                            .progressViewStyle(CircularProgressViewStyle(tint: .white))
-                            .scaleEffect(1.2)
-                    } else if viewModel.isRecording {
-                        // Red Stop Square
-                        RoundedRectangle(cornerRadius: 5, style: .continuous)
-                            .fill(OwLensTheme.recordingRed)
-                            .frame(width: 22, height: 22)
-                    } else {
-                        // Inner Record Circle
-                        Circle()
-                            .fill(
-                                viewModel.isDeviceUnsupportedForLog
-                                    ? Color.gray.opacity(0.3)
-                                    : (viewModel.controlsLocked ? OwLensTheme.recordingRed : OwLensTheme.recordingRed.opacity(0.35))
-                            )
-                            .frame(width: 48, height: 48)
-                    }
-                }
-                .frame(width: 64, height: 64)
-                .contentShape(Circle())
-            }
-            .buttonStyle(.plain)
-            .disabled(viewModel.isDeviceUnsupportedForLog || viewModel.isSaving)
-        }
-        .frame(width: 84)
-        .overlay(alignment: .topTrailing) {
-            // Scopes Overlay (Histogram & Waveform) docked under record button
-            // Anchored with topTrailing so it aligns cleanly with the right grip rail
+            // Scopes / Histogram Monitor - Positioned directly ABOVE the centered record button
             if viewModel.showScopes {
-                ScopesOverlay(data: viewModel.scopeData)
-                    .offset(y: 118) // lock height (36) + spacing (12) + shutter height (64) + gap (6) = 118
-                    .transition(.opacity.combined(with: .scale(scale: 0.95)))
+                VStack {
+                    Spacer()
+                    ScopesContainerView(monitor: viewModel.scopeMonitor)
+                    Spacer()
+                        .frame(height: 32 + 14) // 32 (half record button) + 14 (clearance gap)
+                }
+                .frame(maxHeight: .infinity, alignment: .center)
+                .transition(.asymmetric(
+                    insertion: .opacity.combined(with: .scale(scale: 0.95)),
+                    removal: .opacity
+                ))
             }
         }
-        .padding(.trailing, 10)
+        .padding(.trailing, 22)
     }
 
-    private func showLockNoticeToast() {
-        lockNoticeTimer?.invalidate()
-        withAnimation {
-            showLockNotice = true
-        }
-        lockNoticeTimer = Timer.scheduledTimer(withTimeInterval: 2.5, repeats: false) { _ in
-            Task { @MainActor in
-                withAnimation {
-                    showLockNotice = false
+    private var recordButton: some View {
+        Button {
+            guard !viewModel.isSaving else { return }
+            if viewModel.isRecording {
+                Haptics.notification(.success)
+                viewModel.stopRecording()
+            } else {
+                Haptics.notification(.success)
+                viewModel.startRecording()
+            }
+        } label: {
+            ZStack {
+                // Outer Ring with subtle pulsing glow when recording
+                Circle()
+                    .strokeBorder(viewModel.isRecording ? OwLensTheme.recordingRed : OwLensTheme.textPrimary, lineWidth: 2.5)
+                    .frame(width: 64, height: 64)
+                    .shadow(color: viewModel.isRecording ? OwLensTheme.recordingRed.opacity(0.65) : Color.black.opacity(0.3), radius: viewModel.isRecording ? 10 : 3)
+
+                if viewModel.isSaving {
+                    ProgressView()
+                        .progressViewStyle(CircularProgressViewStyle(tint: .white))
+                        .scaleEffect(1.2)
+                } else if viewModel.isRecording {
+                    // Red Stop Square
+                    RoundedRectangle(cornerRadius: 5, style: .continuous)
+                        .fill(OwLensTheme.recordingRed)
+                        .frame(width: 22, height: 22)
+                } else {
+                    // Inner Record Circle
+                    Circle()
+                        .fill(
+                            viewModel.isDeviceUnsupportedForLog
+                                ? Color.gray.opacity(0.3)
+                                : OwLensTheme.recordingRed
+                        )
+                        .frame(width: 48, height: 48)
                 }
             }
+            .frame(width: 64, height: 64)
+            .contentShape(Circle())
         }
+        .buttonStyle(.plain)
+        .disabled(viewModel.isDeviceUnsupportedForLog || viewModel.isSaving)
     }
 
     // MARK: - Utilities & Formatters
@@ -1358,3 +1446,85 @@ struct ControlsView: View {
         }
     }
 }
+
+/// Isolated scopes container that re-renders only its contents on 10 Hz scope updates,
+/// shielding the parent HUD from redundant body evaluations.
+private struct ScopesContainerView: View {
+    @ObservedObject var monitor: ScopeMonitor
+
+    var body: some View {
+        ScopesOverlay(data: monitor.scopeData)
+    }
+}
+
+/// Isolated audio deck tile that re-renders only when the live VU meter updates,
+/// shielding the parent HUD from 50–100 Hz CoreAudio buffer invalidations.
+private struct AudioDeckTile: View {
+    @ObservedObject var audioMonitor: AudioMonitor
+    let isSelected: Bool
+    let isDisabled: Bool
+    let isMuted: Bool
+    let micShortName: String
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            VStack(spacing: 2) {
+                HStack(spacing: 3) {
+                    Text("AUDIO")
+                        .font(.geistMono(.medium, size: 7))
+                        .foregroundColor(isSelected ? .black.opacity(0.50) : OwLensTheme.textMuted)
+                    if !isMuted {
+                        Circle()
+                            .fill(audioMonitor.level > 0.85 ? OwLensTheme.audioPeak : (audioMonitor.level > 0.60 ? OwLensTheme.audioWarning : OwLensTheme.audioNominal))
+                            .frame(width: 3.5, height: 3.5)
+                    }
+                }
+
+                Text(micShortName)
+                    .font(.geistMono(.semiBold, size: 12))
+                    .foregroundColor(isSelected ? .black : (isDisabled ? OwLensTheme.textDisabled : OwLensTheme.textPrimary))
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.75)
+
+                if isMuted {
+                    Text("MUTED")
+                        .font(.geistMono(.regular, size: 7))
+                        .foregroundColor(isSelected ? .black.opacity(0.40) : OwLensTheme.textMuted)
+                } else {
+                    // Mini live VU meter bar
+                    GeometryReader { geo in
+                        ZStack(alignment: .leading) {
+                            Capsule()
+                                .fill(Color.white.opacity(0.15))
+                            Capsule()
+                                .fill(
+                                    LinearGradient(
+                                        colors: [OwLensTheme.audioNominal, OwLensTheme.audioWarning, OwLensTheme.audioPeak],
+                                        startPoint: .leading,
+                                        endPoint: .trailing
+                                    )
+                                )
+                                .frame(width: max(2, min(geo.size.width, geo.size.width * CGFloat(audioMonitor.level))))
+                        }
+                    }
+                    .frame(height: 2.5)
+                    .padding(.horizontal, 6)
+                }
+            }
+            .frame(width: 72, height: 42)
+            .background(
+                RoundedRectangle(cornerRadius: OwLensTheme.radiusCard, style: .continuous)
+                    .fill(isSelected ? OwLensTheme.glassActive : (isDisabled ? OwLensTheme.glassBase.opacity(0.3) : OwLensTheme.glassBaseHeavy))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: OwLensTheme.radiusCard, style: .continuous)
+                    .strokeBorder(isSelected ? Color.clear : OwLensTheme.glassBorder, lineWidth: 0.5)
+            )
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .disabled(isDisabled)
+    }
+}
+

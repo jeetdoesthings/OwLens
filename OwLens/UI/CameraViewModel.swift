@@ -7,17 +7,51 @@ import QuartzCore
 import simd
 import UIKit
 import UniformTypeIdentifiers
+import SwiftUI
+
+/// Dedicated observable object holding live audio peak levels.
+/// Throttled to ~15 Hz with a deadband filter, isolating VU meter animations
+/// to `MicButton` without invalidating the parent camera HUD.
+@MainActor
+final class AudioMonitor: ObservableObject {
+    @Published private(set) var level: Float = 0.0
+    private var lastUpdateTime: CFTimeInterval = 0
+
+    func update(peak: Float) {
+        let now = CACurrentMediaTime()
+        // Throttle UI update frequency to ~15 Hz (66 ms)
+        guard now - lastUpdateTime >= 0.066 else { return }
+
+        let newLevel: Float
+        if peak >= level {
+            newLevel = peak
+        } else {
+            newLevel = level * 0.80 + peak * 0.20
+        }
+
+        // 0.015 deadband to prevent microscopic floating-point jitter
+        if abs(newLevel - level) >= 0.015 || (newLevel == 0 && level != 0) {
+            level = newLevel
+            lastUpdateTime = now
+        }
+    }
+
+    func reset() {
+        if level != 0 {
+            level = 0
+            lastUpdateTime = CACurrentMediaTime()
+        }
+    }
+}
 
 /// Central view model — CaptureController → RawFrameBuffer → MetalPipeline → preview + VideoWriter.
 @MainActor
 final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegate {
     // MARK: - Published State
 
-    @Published var currentTexture: MTLTexture?
-    /// Incremented with every new texture frame. UInt64 is Equatable so SwiftUI can
-    /// reliably detect the change and call updateUIView on CameraPreviewView, even
-    /// though MTLTexture itself is not Equatable.
-    @Published var textureChangeCount: UInt64 = 0
+    /// High-speed direct preview feed to MTKView. Eliminates per-frame SwiftUI re-renders.
+    let previewFeed = PreviewFeed()
+    var currentTexture: MTLTexture? { previewFeed.currentTexture }
     @Published var isRecording = false
     @Published var isSaving = false
     @Published var controlsLocked = false
@@ -76,6 +110,7 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
     @Published var audioSources: [AudioSourceOption] = [.none]
     @Published var selectedAudioSource: AudioSourceOption = .none {
         didSet {
+            isAudioMutedUnsafe = (selectedAudioSource.portUID == nil)
             guard !controlsLocked, !isRecording else { return }
             // Skip no-op reassign (same port) — avoids hang loops
             guard oldValue.portUID != selectedAudioSource.portUID else { return }
@@ -101,7 +136,8 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
     @Published var showClipping = false
     @Published var showFocusPeaking = false
     @Published var showScopes = true
-    @Published var scopeData: ScopeData = .empty
+    let scopeMonitor = ScopeMonitor()
+    var scopeData: ScopeData { scopeMonitor.scopeData }
     @Published var previewDisplayMode: PreviewDisplayMode = .log
     /// Optional viewfinder display transform; defaults to false so log preview remains untouched.
     @Published var showDisplayLUT: Bool = false
@@ -234,14 +270,54 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
             scheduleExposureUpdate()
         }
     }
-    func setShutterAngleWithSnapping(_ rawValue: Float) {
-        let snapTargets = ExposureStops.shutterAngles
+
+    func setISOWithSnapping(_ rawValue: Float) {
+        guard !controlsLocked else { return }
+        let snapTargets: [Float] = [50, 100, 200, 400, 800, 1600, 3200].filter { isoRange.contains($0) }
         var finalValue = rawValue
+        var didSnap = false
+
+        for target in snapTargets {
+            let logDiff = abs(log2(max(1.0, rawValue)) - log2(max(1.0, target)))
+            // Magnetic snap radius of ~0.10 stops (~7% difference)
+            if logDiff < 0.10 {
+                finalValue = target
+                didSnap = true
+                break
+            }
+        }
+
+        if !didSnap {
+            // Round to nearest 5 for clean intervals
+            finalValue = (finalValue / 5.0).rounded() * 5.0
+        }
+
+        finalValue = max(isoRange.lowerBound, min(isoRange.upperBound, finalValue))
+
+        if finalValue != isoValue {
+            let wasDifferent = abs(isoValue - finalValue) >= 1.0
+            isoValue = finalValue
+            if let idx = isoStops.firstIndex(where: { abs($0 - finalValue) < 5 }) {
+                isoStopIndex = idx
+            }
+            if didSnap && wasDifferent {
+                Haptics.selection()
+            }
+            if isCameraReady { scheduleExposureUpdate() }
+        }
+    }
+
+    func setShutterAngleWithSnapping(_ rawValue: Float) {
+        guard !controlsLocked else { return }
+        let snapTargets: [Float] = [45.0, 90.0, 144.0, 172.8, 180.0, 360.0].filter { shutterRange.contains($0) }
+        var finalValue = rawValue
+        var didSnap = false
         
         for target in snapTargets {
-            // Magnetic snap radius of 15 degrees
-            if abs(rawValue - target) < 15.0 {
+            // Magnetic snap radius of 6 degrees
+            if abs(rawValue - target) < 6.0 {
                 finalValue = target
+                didSnap = true
                 break
             }
         }
@@ -249,9 +325,23 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
         finalValue = max(shutterRange.lowerBound, min(shutterRange.upperBound, finalValue))
         
         if finalValue != shutterValue {
+            let wasDifferent = abs(shutterValue - finalValue) > 0.05
             shutterValue = finalValue
+            if didSnap && wasDifferent {
+                Haptics.selection()
+            }
             if isCameraReady { scheduleExposureUpdate() }
         }
+    }
+
+    var shutterSpeedText: String {
+        let angle = Double(shutterValue)
+        let fps = activeFPS
+        guard angle > 0, fps > 0 else { return "" }
+        let duration = angle / (360.0 * fps)
+        guard duration > 0 else { return "" }
+        let denom = Int((1.0 / duration).rounded())
+        return "1/\(denom)s"
     }
     @Published var wbStopIndex: Int = 0 {
         didSet {
@@ -268,6 +358,19 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
     }
 
     @Published var activePanel: ControlPanel? = nil
+
+    // MARK: - Real-Time Audio & Battery Telemetry
+    let audioMonitor = AudioMonitor()
+    var audioLevel: Float { audioMonitor.level }
+    nonisolated(unsafe) private var lastAudioLevelUpdateTime: CFTimeInterval = 0
+
+    @Published var batteryLevel: Float = 1.0
+    @Published var isBatteryCharging: Bool = false
+
+    // MARK: - HUD State & Toast Notifications
+    @Published var isHUDHidden: Bool = false
+    @Published var activeToast: String? = nil
+    private var toastWorkItem: DispatchWorkItem?
 
     var isoRange: ClosedRange<Float> = 50...2000
     var shutterRange: ClosedRange<Float> = 11.25...360.0
@@ -290,14 +393,17 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
     private var filesFolderBookmark: Data?
     private let filesFolderBookmarkKey = "OwLens.FilesFolderBookmark"
 
-    private let processQueue = DispatchQueue(label: "raw.process.queue", qos: .userInitiated)
+    private let processQueue = DispatchQueue(label: "raw.process.queue", qos: .userInteractive)
+    private let recordingQueue = DispatchQueue(label: "com.owlens.recording", qos: .userInteractive)
     nonisolated private let processLock = NSLock()
-    nonisolated(unsafe) private var isProcessing = false
+    nonisolated(unsafe) private var inFlightProcessCount = 0
+    nonisolated(unsafe) private var processSlotIndex = 0
 
     nonisolated(unsafe) private var activeEncodeWidth = 1920
     nonisolated(unsafe) private var activeEncodeHeight = 1440
     nonisolated(unsafe) private var activeFPS: Double = 24
-nonisolated(unsafe) private var isRecordingUnsafe = false
+    nonisolated(unsafe) private var isRecordingUnsafe = false
+    nonisolated(unsafe) private var isAudioMutedUnsafe = false
     nonisolated(unsafe) private var showScopesUnsafe = true
     nonisolated(unsafe) private var lastScopeUpdateTime: CFTimeInterval = 0
     nonisolated(unsafe) var isAppActive = true
@@ -314,28 +420,17 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
     nonisolated(unsafe) private var latestColorMatrix: simd_float3x3?
     nonisolated(unsafe) private var latestSGamutMatrix: simd_float3x3?
 
-
-
     enum ControlPanel: String, Identifiable {
-        case exposure, iso, shutter, wb, focus, fps, format, bitrate, denoise, mic, lens, save
+        case exposure, iso, shutter, wb, focus, fps, format, bitrate, denoise, mic, lens, save, logCurve
         var id: String { rawValue }
     }
 
     // MARK: - Init
 
     override init() {
-        print("""
-
-        ================================================================
-          🎬 OwLens — Accurate 10-Bit LOG Pipeline Active
-          🌿 Git Branch: fix/highlight-green-tint-and-demosaic
-          🎯 Format: 10-Bit Video Range YCbCr (x420) · BT.2020
-          📐 Headroom: C1 Filmic Highlight Shoulder (Rmax=12.0 Apple Log, 10.0 S-Log3)
-        ================================================================
-
-        """)
         metalPipeline = MetalPipeline()
         super.init()
+        startBatteryMonitoring()
 #if DEBUG
         if let pipeline = metalPipeline {
             Task { @MainActor in
@@ -465,9 +560,13 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
         }
         captureController.onAudioSample = { [weak self] sample in
             guard let self else { return }
+            self.processAudioSample(sample)
             // isRecordingUnsafe set from MainActor when record starts/stops
             if self.isRecordingUnsafe {
-                _ = self.videoWriter.appendAudio(sampleBuffer: sample)
+                self.recordingQueue.async { [weak self] in
+                    guard let self, self.isRecordingUnsafe else { return }
+                    _ = self.videoWriter.appendAudio(sampleBuffer: sample)
+                }
             }
         }
 
@@ -657,32 +756,162 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
         }
     }
 
+    func toggleHUDVisibility() {
+        Haptics.selection()
+        withAnimation(.easeInOut(duration: 0.22)) {
+            isHUDHidden.toggle()
+        }
+    }
+
+    func showToast(_ message: String) {
+        toastWorkItem?.cancel()
+        withAnimation(.spring(response: 0.24, dampingFraction: 0.8)) {
+            activeToast = message
+        }
+        let work = DispatchWorkItem { [weak self] in
+            withAnimation(.easeOut(duration: 0.25)) {
+                self?.activeToast = nil
+            }
+        }
+        toastWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.6, execute: work)
+    }
+
+    private func startBatteryMonitoring() {
+        UIDevice.current.isBatteryMonitoringEnabled = true
+        updateBatteryStatus()
+
+        // Hardware PMU needs a cycle after enabling battery monitoring to populate true level
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
+            self?.updateBatteryStatus()
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+            self?.updateBatteryStatus()
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+            self?.updateBatteryStatus()
+        }
+
+        NotificationCenter.default.publisher(for: UIDevice.batteryLevelDidChangeNotification)
+            .sink { [weak self] _ in self?.updateBatteryStatus() }
+            .store(in: &cancellables)
+        NotificationCenter.default.publisher(for: UIDevice.batteryStateDidChangeNotification)
+            .sink { [weak self] _ in self?.updateBatteryStatus() }
+            .store(in: &cancellables)
+        NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)
+            .sink { [weak self] _ in
+                UIDevice.current.isBatteryMonitoringEnabled = true
+                self?.updateBatteryStatus()
+            }
+            .store(in: &cancellables)
+
+        // Periodic 5s polling ensures live updates without relying solely on coalesced notifications
+        Timer.publish(every: 5.0, on: .main, in: .common)
+            .autoconnect()
+            .sink { [weak self] _ in self?.updateBatteryStatus() }
+            .store(in: &cancellables)
+    }
+
+    private func updateBatteryStatus() {
+        if !UIDevice.current.isBatteryMonitoringEnabled {
+            UIDevice.current.isBatteryMonitoringEnabled = true
+        }
+        let raw = UIDevice.current.batteryLevel
+        if raw >= 0 {
+            batteryLevel = raw
+        }
+        let state = UIDevice.current.batteryState
+        isBatteryCharging = (state == .charging || state == .full)
+    }
+
+    nonisolated private func processAudioSample(_ sample: CMSampleBuffer) {
+        if isAudioMutedUnsafe {
+            DispatchQueue.main.async { [weak self] in
+                self?.audioMonitor.reset()
+            }
+            return
+        }
+        let now = CACurrentMediaTime()
+        guard now - lastAudioLevelUpdateTime >= 0.05 else { return }
+        lastAudioLevelUpdateTime = now
+
+        guard let blockBuffer = CMSampleBufferGetDataBuffer(sample) else { return }
+        var totalLength: Int = 0
+        var dataPointer: UnsafeMutablePointer<Int8>?
+        guard CMBlockBufferGetDataPointer(blockBuffer, atOffset: 0, lengthAtOffsetOut: nil, totalLengthOut: &totalLength, dataPointerOut: &dataPointer) == noErr,
+              let dataPtr = dataPointer, totalLength > 0 else { return }
+
+        let sampleCount = totalLength / MemoryLayout<Int16>.size
+        guard sampleCount > 0 else { return }
+
+        var maxAmp: Float = 0
+        let step = max(1, sampleCount / 48)
+        dataPtr.withMemoryRebound(to: Int16.self, capacity: sampleCount) { ptr in
+            var i = 0
+            while i < sampleCount {
+                let val = abs(Float(ptr[i])) / 32768.0
+                if val > maxAmp { maxAmp = val }
+                i += step
+            }
+        }
+
+        let peak = min(1.0, maxAmp)
+        DispatchQueue.main.async { [weak self] in
+            self?.audioMonitor.update(peak: peak)
+        }
+    }
+
     func toggleGrid() {
         showGrid.toggle()
+        showToast(showGrid ? "Framing Grid: ON" : "Framing Grid: OFF")
     }
 
     func toggleLevel() {
         showLevel.toggle()
+        showToast(showLevel ? "Horizon Level: ON" : "Horizon Level: OFF")
     }
 
     func toggleClipping() {
         showClipping.toggle()
+        showToast(showClipping ? "Zebra Clipping: ON" : "Zebra Clipping: OFF")
     }
     
     func toggleFocusPeaking() {
         showFocusPeaking.toggle()
+        showToast(showFocusPeaking ? "Focus Peaking: ON" : "Focus Peaking: OFF")
     }
 
     func toggleScopes() {
         showScopes.toggle()
         showScopesUnsafe = showScopes
         if !showScopes {
-            scopeData = .empty
+            scopeMonitor.reset()
         }
+        showToast(showScopes ? "Waveform & Histogram: ON" : "Scopes: OFF")
     }
 
     func togglePreviewDisplayMode() {
         previewDisplayMode = previewDisplayMode == .log ? .normalVideo : .log
+    }
+
+    func cycleFormat() {
+        guard !isRecording else { return }
+        let cases = RecordingFormat.allCases
+        if let idx = cases.firstIndex(of: selectedFormat) {
+            let next = cases[(idx + 1) % cases.count]
+            selectedFormat = next
+            showToast("Format: \(next.displayName)")
+        }
+    }
+
+    func cycleFPS() {
+        guard !controlsLocked, !isRecording else { return }
+        let cases = CaptureFrameRate.allCases
+        if let idx = cases.firstIndex(of: selectedFPS) {
+            let next = cases[(idx + 1) % cases.count]
+            selectedFPS = next
+            showToast("\(next.label) FPS")
+        }
     }
 
     func toggleLogCurve() {
@@ -694,10 +923,12 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
         } else {
             selectedCurve = cases.first ?? .appleLog2
         }
+        showToast("\(selectedCurve.displayName) · 10-Bit")
     }
 
     func toggleDisplayLUT() {
         showDisplayLUT.toggle()
+        showToast(showDisplayLUT ? "Rec.709 Preview: ON" : "Log (Flat) Preview: ON")
     }
 
     func refreshAudioSources() {
@@ -1056,12 +1287,12 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
 
         let name = generateRecordingFileName(
             date: testDate,
-            format: .uhd4k,
+            format: .openGate,
             fps: .fps24,
             curve: .sLog3Approx,
             bitrateMbps: 150
         )
-        let expected = "OWL_20260911_143207_4K_24fps_SLog3_150M.mov"
+        let expected = "OWL_20260911_143207_OG_24fps_SLog3_150M.mov"
         guard name == expected else {
             print("[FileNameTest] FAIL: expected \(expected), got \(name)")
             return false
@@ -1093,7 +1324,10 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
             errorMessage = "Recording disabled — device has no Bayer RAW."
             return
         }
-        guard controlsLocked, !isRecording, !isSaving else { return }
+        if !controlsLocked {
+            lockControls()
+        }
+        guard !isRecording, !isSaving else { return }
 
         // Clean stale temporary recordings from previous interrupted sessions in background
         Task.detached(priority: .utility) {
@@ -1246,21 +1480,25 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
             }
         }
 
-        videoWriter.finish { [weak self] url, error in
-            guard let url else {
-                Task { @MainActor [weak self] in
-                    self?.statusText = "Save failed"
-                    self?.errorMessage = error?.localizedDescription ?? "Recording ended with no frames"
-                    self?.endSaveTask()
+        recordingQueue.async { [weak self] in
+            guard let self else { return }
+            self.videoWriter.finish { [weak self] url, error in
+                guard let url else {
+                    Task { @MainActor [weak self] in
+                        self?.statusText = "Save failed"
+                        self?.errorMessage = error?.localizedDescription ?? "Recording ended with no frames"
+                        self?.endSaveTask()
+                    }
+                    return
                 }
-                return
-            }
-            Task { @MainActor [weak self] in
-                await self?.saveFinishedRecording(at: url)
+                Task { @MainActor [weak self] in
+                    await self?.saveFinishedRecording(at: url)
+                }
             }
         }
         metalPipeline?.trimMemory()
 
+        frameCount = Int(frameIndex)
         let realNote = "frames=\(frameCount) drops=\(droppedFrames) fps=\(selectedFPS.label) fmt=\(selectedFormat.shortLabel)"
         print("[CameraViewModel] Recording stopped \(realNote)")
         if let caps = capabilities {
@@ -1541,19 +1779,25 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
 
     nonisolated private func scheduleProcess() {
         processLock.lock()
-        if isProcessing {
+        guard inFlightProcessCount < 3 else {
             processLock.unlock()
             return
         }
-        isProcessing = true
+        guard frameBuffer.currentCount > 0 else {
+            processLock.unlock()
+            return
+        }
+        inFlightProcessCount += 1
+        let slot = processSlotIndex
+        processSlotIndex = (processSlotIndex + 1) % 3
         processLock.unlock()
 
         processQueue.async { [weak self] in
-            self?.drainBuffer()
+            self?.drainBuffer(slot: slot)
         }
     }
 
-    nonisolated private func drainBuffer() {
+    nonisolated private func drainBuffer(slot: Int) {
         let frame: RawFrameData?
         if isRecordingUnsafe {
             // FIFO during recording: process every single captured frame in order without skipping
@@ -1564,14 +1808,18 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
         }
         guard let frame else {
             processLock.lock()
-            isProcessing = false
+            inFlightProcessCount = max(0, inFlightProcessCount - 1)
             processLock.unlock()
             return
         }
-        processFrame(frame) { [weak self] in
+
+        // Check if another frame can begin encoding concurrently in the other slot
+        scheduleProcess()
+
+        processFrame(frame, slot: slot) { [weak self] in
             guard let self else { return }
             processLock.lock()
-            isProcessing = false
+            inFlightProcessCount = max(0, inFlightProcessCount - 1)
             let remaining = frameBuffer.currentCount
             processLock.unlock()
             if remaining > 0 {
@@ -1580,7 +1828,7 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
         }
     }
 
-    nonisolated private func processFrame(_ frameData: RawFrameData, completion: @escaping () -> Void) {
+    nonisolated private func processFrame(_ frameData: RawFrameData, slot: Int = 0, completion: @escaping () -> Void) {
         guard isAppActive else { completion(); return }
         guard let pipeline = metalPipeline else { completion(); return }
 
@@ -1656,13 +1904,11 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
 
         if isRecordingUnsafe {
             // ── Recording ──
-            // 4K or elevated thermal state: use previewFast (radius=2, no local-sigma stats, no chroma history store)
-            // to keep GPU cool and responsive.
-            // Lower res (OpenGate, 1080p) under normal thermals: full denoise pipeline fits within budget.
-            let is4K = w >= 3840
+            // Elevated thermal state: use previewFast (radius=2, no local-sigma stats, no chroma history store)
+            // to keep GPU cool and responsive. Under normal thermals: recordQuality.
             let isThermalElevated = (metalPipeline?.thermalState.rawValue ?? 0) >= ProcessInfo.ThermalState.serious.rawValue
-            pipeline.processingQuality = (is4K || isThermalElevated) ? .previewFast : .recordQuality
-            pipeline.process(frameData.pixelBuffer, encodeWidth: w, encodeHeight: h, encodeAsBGRA: true) { [weak self] framed, bgraPB in
+            pipeline.processingQuality = isThermalElevated ? .previewFast : .recordQuality
+            pipeline.process(frameData.pixelBuffer, encodeWidth: w, encodeHeight: h, encodeAsBGRA: true, slot: slot) { [weak self] framed, bgraPB in
                 guard let self else { completion(); return }
                 handleRecordedFrame(framed, bgraPB: bgraPB, frameData: frameData, completion: completion)
             }
@@ -1670,7 +1916,7 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
             // ── Preview (non-recording): lightweight path, no denoise ──
             pipeline.processingQuality = .previewFast
             // Cap preview resolution to max 1920 (preserving exact aspect ratio) to avoid
-            // upscaling to 4K just for on-screen viewfinder rendering.
+            // rendering excessive resolution just for on-screen viewfinder rendering.
             let maxPreviewDim = 1920
             let prevW: Int
             let prevH: Int
@@ -1682,7 +1928,7 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
                 prevW = w
                 prevH = h
             }
-            pipeline.processPreviewOnly(frameData.pixelBuffer, encodeWidth: prevW, encodeHeight: prevH) { [weak self] framed in
+            pipeline.processPreviewOnly(frameData.pixelBuffer, encodeWidth: prevW, encodeHeight: prevH, slot: slot) { [weak self] framed in
                 defer { completion() }
                 guard let self, let framed else { return }
 
@@ -1697,13 +1943,13 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
                 let drops = frameBuffer.droppedCount
                 updateScopesIfNeeded(from: framed, pipeline: pipeline)
 
+                // Submit texture directly to PreviewFeed for zero-allocation rendering on MTKView
+                previewFeed.submit(texture: framed)
+
                 let frameDataBox = SendableBox(value: frameData)
-                let framedBox = SendableBox(value: framed)
                 Task { @MainActor [weak self] in
                     guard let self else { return }
                     self.syncLiveAutoValues(from: frameDataBox.value)
-                    self.currentTexture = framedBox.value
-                    self.textureChangeCount &+= 1
                     if self.cfaLabel != cfaName { self.cfaLabel = cfaName }
                     if self.droppedFrames != drops { self.droppedFrames = drops }
                 }
@@ -1720,8 +1966,7 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
         pipeline?.makeScopeData(from: framed) { [weak self] scope in
             guard let self, let scope else { return }
             Task { @MainActor [weak self] in
-                guard let self else { return }
-                self.scopeData = scope
+                self?.scopeMonitor.update(scope)
             }
         }
     }
@@ -1733,7 +1978,9 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
         frameData: RawFrameData,
         completion: @escaping () -> Void
     ) {
-        defer { completion() }
+        // Immediately release the Metal pipeline slot so the next frame can begin GPU work concurrently!
+        completion()
+
         guard let framed else { return }
 
         let cfaName: String
@@ -1749,22 +1996,24 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
         updateScopesIfNeeded(from: framed, pipeline: metalPipeline)
 
         if let bgraPB, isRecordingUnsafe {
-            if self.videoWriter.appendFrame(pixelBuffer: bgraPB, captureTime: frameData.timestamp) {
-                self.frameIndex += 1
+            let timestamp = frameData.timestamp
+            recordingQueue.async { [weak self] in
+                guard let self, self.isRecordingUnsafe else { return }
+                if self.videoWriter.appendFrame(pixelBuffer: bgraPB, captureTime: timestamp) {
+                    self.frameIndex += 1
+                }
             }
         }
 
+        // Submit texture directly to PreviewFeed for zero-allocation rendering on MTKView
+        previewFeed.submit(texture: framed)
+
         let frameDataBox = SendableBox(value: frameData)
-        let framedBox = SendableBox(value: framed)
-        let recordedIndex = self.frameIndex
         Task { @MainActor [weak self] in
             guard let self else { return }
             self.syncLiveAutoValues(from: frameDataBox.value)
-            self.currentTexture = framedBox.value
-            self.textureChangeCount &+= 1
             if self.cfaLabel != cfaName { self.cfaLabel = cfaName }
             if self.droppedFrames != drops { self.droppedFrames = drops }
-            self.frameCount = Int(recordedIndex)
         }
     }
 
@@ -1784,6 +2033,7 @@ nonisolated(unsafe) private var isRecordingUnsafe = false
     }
 
     private func syncLiveAutoValues(from frameData: RawFrameData) {
+        guard isAutoWhiteBalanceEnabled || isAutoWhiteBalanceAdjusting else { return }
         guard let device = captureController.activeDevice else { return }
 
         if isAutoWhiteBalanceEnabled {

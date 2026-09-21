@@ -640,7 +640,7 @@ extension MetalPipeline {
 
         // 5. Storage Estimator bytes-per-second and remaining time validation
         let bps = StorageEstimator.estimatedBytesPerSecond(
-            format: .uhd4k,
+            format: .openGate,
             fps: .fps24,
             codec: .hevc,
             bitratePreset: .mbps100,

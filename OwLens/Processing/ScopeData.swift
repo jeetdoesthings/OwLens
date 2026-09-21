@@ -40,54 +40,55 @@ struct ScopeData: Equatable {
         let maxWaveRow = waveformRows - 1
         let waveScale = Float(maxWaveRow)
 
-        // Precompute column mapping: O(W) instead of O(W * H) divisions in inner loop
-        var colMap = [Int](repeating: 0, count: width)
-        for x in 0..<width {
-            colMap[x] = min(waveformColumns - 1, x * waveformColumns / width)
-        }
+        // Precompute column mapping: O(W) with zero heap allocations via stack/temporary buffer
+        return withUnsafeTemporaryAllocation(of: Int.self, capacity: width) { colMap in
+            for x in 0..<width {
+                colMap[x] = min(waveformColumns - 1, x * waveformColumns / width)
+            }
 
-        pixels.withUnsafeBufferPointer { ptr in
-            guard let base = ptr.baseAddress else { return }
-            var idx = 0
-            for _ in 0..<height {
-                for x in 0..<width {
-                    let r16 = Float16(bitPattern: base[idx])
-                    let g16 = Float16(bitPattern: base[idx + 1])
-                    let b16 = Float16(bitPattern: base[idx + 2])
-                    idx += 4
+            pixels.withUnsafeBufferPointer { ptr in
+                guard let base = ptr.baseAddress else { return }
+                var idx = 0
+                for _ in 0..<height {
+                    for x in 0..<width {
+                        let r16 = Float16(bitPattern: base[idx])
+                        let g16 = Float16(bitPattern: base[idx + 1])
+                        let b16 = Float16(bitPattern: base[idx + 2])
+                        idx += 4
 
-                    let r = min(1.0, max(0.0, Float(r16)))
-                    let g = min(1.0, max(0.0, Float(g16)))
-                    let b = min(1.0, max(0.0, Float(b16)))
-                    let luma = min(1.0, max(0.0, 0.2627 * r + 0.6780 * g + 0.0593 * b))
+                        let r = min(1.0, max(0.0, Float(r16)))
+                        let g = min(1.0, max(0.0, Float(g16)))
+                        let b = min(1.0, max(0.0, Float(b16)))
+                        let luma = min(1.0, max(0.0, 0.2627 * r + 0.6780 * g + 0.0593 * b))
 
-                    let rBin = min(maxHistBin, Int(r * histScale))
-                    let gBin = min(maxHistBin, Int(g * histScale))
-                    let bBin = min(maxHistBin, Int(b * histScale))
-                    histogramRed[rBin] += 1
-                    histogramGreen[gBin] += 1
-                    histogramBlue[bBin] += 1
+                        let rBin = min(maxHistBin, Int(r * histScale))
+                        let gBin = min(maxHistBin, Int(g * histScale))
+                        let bBin = min(maxHistBin, Int(b * histScale))
+                        histogramRed[rBin] += 1
+                        histogramGreen[gBin] += 1
+                        histogramBlue[bBin] += 1
 
-                    let col = colMap[x]
-                    let row = maxWaveRow - min(maxWaveRow, Int(luma * waveScale))
-                    waveform[row * waveformColumns + col] += 1
+                        let col = colMap[x]
+                        let row = maxWaveRow - min(maxWaveRow, Int(luma * waveScale))
+                        waveform[row * waveformColumns + col] += 1
+                    }
                 }
             }
+
+            normalize(&histogramRed)
+            normalize(&histogramGreen)
+            normalize(&histogramBlue)
+            normalize(&waveform)
+
+            return ScopeData(
+                histogramRed: histogramRed,
+                histogramGreen: histogramGreen,
+                histogramBlue: histogramBlue,
+                waveform: waveform,
+                waveformColumns: waveformColumns,
+                waveformRows: waveformRows
+            )
         }
-
-        normalize(&histogramRed)
-        normalize(&histogramGreen)
-        normalize(&histogramBlue)
-        normalize(&waveform)
-
-        return ScopeData(
-            histogramRed: histogramRed,
-            histogramGreen: histogramGreen,
-            histogramBlue: histogramBlue,
-            waveform: waveform,
-            waveformColumns: waveformColumns,
-            waveformRows: waveformRows
-        )
     }
 
     private static func normalize(_ values: inout [Float]) {
@@ -98,3 +99,21 @@ struct ScopeData: Equatable {
         }
     }
 }
+
+/// Dedicated observable object holding live exposure scopes (histogram and waveform).
+/// Isolates 10 Hz scope updates to `ScopesContainerView`, preventing camera HUD invalidations.
+@MainActor
+final class ScopeMonitor: ObservableObject {
+    @Published private(set) var scopeData: ScopeData = .empty
+
+    func update(_ data: ScopeData) {
+        scopeData = data
+    }
+
+    func reset() {
+        if scopeData != .empty {
+            scopeData = .empty
+        }
+    }
+}
+

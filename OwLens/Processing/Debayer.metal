@@ -247,6 +247,45 @@ struct LSCParams {
 };
 
 
+struct BayerNeighborhood {
+    float c00, cN1, cS1, cE1, cW1, cN2, cS2, cE2, cW2, cNE, cNW, cSE, cSW;
+};
+
+static inline BayerNeighborhood fetchBayerNeighborhood(texture2d<float, access::read> rawTexture, int maxW, int maxH, int x, int y) {
+    BayerNeighborhood nb;
+    if (x >= 2 && x <= maxW - 2 && y >= 2 && y <= maxH - 2) {
+        uint2 u = uint2(x, y);
+        nb.c00 = rawTexture.read(u).r;
+        nb.cN1 = rawTexture.read(uint2(x, y - 1)).r;
+        nb.cS1 = rawTexture.read(uint2(x, y + 1)).r;
+        nb.cE1 = rawTexture.read(uint2(x + 1, y)).r;
+        nb.cW1 = rawTexture.read(uint2(x - 1, y)).r;
+        nb.cN2 = rawTexture.read(uint2(x, y - 2)).r;
+        nb.cS2 = rawTexture.read(uint2(x, y + 2)).r;
+        nb.cE2 = rawTexture.read(uint2(x + 2, y)).r;
+        nb.cW2 = rawTexture.read(uint2(x - 2, y)).r;
+        nb.cNE = rawTexture.read(uint2(x + 1, y - 1)).r;
+        nb.cNW = rawTexture.read(uint2(x - 1, y - 1)).r;
+        nb.cSE = rawTexture.read(uint2(x + 1, y + 1)).r;
+        nb.cSW = rawTexture.read(uint2(x - 1, y + 1)).r;
+    } else {
+        nb.c00 = sampleBayerRaw(rawTexture, maxW, maxH, x, y, 0, 0);
+        nb.cN1 = sampleBayerRaw(rawTexture, maxW, maxH, x, y, 0, -1);
+        nb.cS1 = sampleBayerRaw(rawTexture, maxW, maxH, x, y, 0, 1);
+        nb.cE1 = sampleBayerRaw(rawTexture, maxW, maxH, x, y, 1, 0);
+        nb.cW1 = sampleBayerRaw(rawTexture, maxW, maxH, x, y, -1, 0);
+        nb.cN2 = sampleBayerRaw(rawTexture, maxW, maxH, x, y, 0, -2);
+        nb.cS2 = sampleBayerRaw(rawTexture, maxW, maxH, x, y, 0, 2);
+        nb.cE2 = sampleBayerRaw(rawTexture, maxW, maxH, x, y, 2, 0);
+        nb.cW2 = sampleBayerRaw(rawTexture, maxW, maxH, x, y, -2, 0);
+        nb.cNE = sampleBayerRaw(rawTexture, maxW, maxH, x, y, 1, -1);
+        nb.cNW = sampleBayerRaw(rawTexture, maxW, maxH, x, y, -1, -1);
+        nb.cSE = sampleBayerRaw(rawTexture, maxW, maxH, x, y, 1, 1);
+        nb.cSW = sampleBayerRaw(rawTexture, maxW, maxH, x, y, -1, 1);
+    }
+    return nb;
+}
+
 // ──────────────────────────────────────────────────────────────────────
 // LINEAR OUTPUT: demosaic + LSC + WB — NO log curve.
 // Used by the linear denoise pipeline before luma/chroma split and log encoding.
@@ -276,36 +315,25 @@ kernel void debayerWBLinear(
     int maxH = int(rawTexture.get_height()) - 1;
 
     // ── Directional Demosaic (Malvar-He-Cutler) on raw DNs ──
-    float c00 = sampleBayerRaw(rawTexture, maxW, maxH, x, y, 0, 0);
-    float cN1 = sampleBayerRaw(rawTexture, maxW, maxH, x, y, 0, -1);
-    float cS1 = sampleBayerRaw(rawTexture, maxW, maxH, x, y, 0, 1);
-    float cE1 = sampleBayerRaw(rawTexture, maxW, maxH, x, y, 1, 0);
-    float cW1 = sampleBayerRaw(rawTexture, maxW, maxH, x, y, -1, 0);
-    
-    float cN2 = sampleBayerRaw(rawTexture, maxW, maxH, x, y, 0, -2);
-    float cS2 = sampleBayerRaw(rawTexture, maxW, maxH, x, y, 0, 2);
-    float cE2 = sampleBayerRaw(rawTexture, maxW, maxH, x, y, 2, 0);
-    float cW2 = sampleBayerRaw(rawTexture, maxW, maxH, x, y, -2, 0);
-    
-    float cNE = sampleBayerRaw(rawTexture, maxW, maxH, x, y, 1, -1);
-    float cNW = sampleBayerRaw(rawTexture, maxW, maxH, x, y, -1, -1);
-    float cSE = sampleBayerRaw(rawTexture, maxW, maxH, x, y, 1, 1);
-    float cSW = sampleBayerRaw(rawTexture, maxW, maxH, x, y, -1, 1);
-
-    float G_at_RB = (2*(cN1 + cS1 + cE1 + cW1) + 4*c00 - (cN2 + cS2 + cE2 + cW2)) * 0.125f;
-    float Color_at_G_H = (4*(cE1 + cW1) + 5*c00 - (cE2 + cW2) + 0.5f*(cN2 + cS2) - (cNE + cNW + cSE + cSW)) * 0.125f;
-    float Color_at_G_V = (4*(cN1 + cS1) + 5*c00 - (cN2 + cS2) + 0.5f*(cE2 + cW2) - (cNE + cNW + cSE + cSW)) * 0.125f;
-    float Color_at_Diag = (2*(cNE + cNW + cSE + cSW) + 6*c00 - 1.5f*(cN2 + cS2 + cE2 + cW2)) * 0.125f;
+    BayerNeighborhood nb = fetchBayerNeighborhood(rawTexture, maxW, maxH, x, y);
 
     float r, g, b;
-    if (yEven && xEven) {
-        r = c00; g = G_at_RB; b = Color_at_Diag;
-    } else if (yEven && !xEven) {
-        r = Color_at_G_H; g = c00; b = Color_at_G_V;
-    } else if (!yEven && xEven) {
-        b = Color_at_G_H; g = c00; r = Color_at_G_V;
+    if (xEven == yEven) {
+        float G_at_RB = (2.0f * (nb.cN1 + nb.cS1 + nb.cE1 + nb.cW1) + 4.0f * nb.c00 - (nb.cN2 + nb.cS2 + nb.cE2 + nb.cW2)) * 0.125f;
+        float Color_at_Diag = (2.0f * (nb.cNE + nb.cNW + nb.cSE + nb.cSW) + 6.0f * nb.c00 - 1.5f * (nb.cN2 + nb.cS2 + nb.cE2 + nb.cW2)) * 0.125f;
+        if (yEven) {
+            r = nb.c00; g = G_at_RB; b = Color_at_Diag;
+        } else {
+            b = nb.c00; g = G_at_RB; r = Color_at_Diag;
+        }
     } else {
-        b = c00; g = G_at_RB; r = Color_at_Diag;
+        float Color_at_G_H = (4.0f * (nb.cE1 + nb.cW1) + 5.0f * nb.c00 - (nb.cE2 + nb.cW2) + 0.5f * (nb.cN2 + nb.cS2) - (nb.cNE + nb.cNW + nb.cSE + nb.cSW)) * 0.125f;
+        float Color_at_G_V = (4.0f * (nb.cN1 + nb.cS1) + 5.0f * nb.c00 - (nb.cN2 + nb.cS2) + 0.5f * (nb.cE2 + nb.cW2) - (nb.cNE + nb.cNW + nb.cSE + nb.cSW)) * 0.125f;
+        if (yEven) {
+            r = Color_at_G_H; g = nb.c00; b = Color_at_G_V;
+        } else {
+            b = Color_at_G_H; g = nb.c00; r = Color_at_G_V;
+        }
     }
 
     // ── Single Post-Demosaic Linearization: (DN - black) * invDenom ──
@@ -383,36 +411,25 @@ kernel void debayerFusedLog(
     int maxH = int(rawTexture.get_height()) - 1;
 
     // ── Directional Demosaic (Malvar-He-Cutler) on raw DNs ──
-    float c00 = sampleBayerRaw(rawTexture, maxW, maxH, x, y, 0, 0);
-    float cN1 = sampleBayerRaw(rawTexture, maxW, maxH, x, y, 0, -1);
-    float cS1 = sampleBayerRaw(rawTexture, maxW, maxH, x, y, 0, 1);
-    float cE1 = sampleBayerRaw(rawTexture, maxW, maxH, x, y, 1, 0);
-    float cW1 = sampleBayerRaw(rawTexture, maxW, maxH, x, y, -1, 0);
-    
-    float cN2 = sampleBayerRaw(rawTexture, maxW, maxH, x, y, 0, -2);
-    float cS2 = sampleBayerRaw(rawTexture, maxW, maxH, x, y, 0, 2);
-    float cE2 = sampleBayerRaw(rawTexture, maxW, maxH, x, y, 2, 0);
-    float cW2 = sampleBayerRaw(rawTexture, maxW, maxH, x, y, -2, 0);
-    
-    float cNE = sampleBayerRaw(rawTexture, maxW, maxH, x, y, 1, -1);
-    float cNW = sampleBayerRaw(rawTexture, maxW, maxH, x, y, -1, -1);
-    float cSE = sampleBayerRaw(rawTexture, maxW, maxH, x, y, 1, 1);
-    float cSW = sampleBayerRaw(rawTexture, maxW, maxH, x, y, -1, 1);
-
-    float G_at_RB = (2*(cN1 + cS1 + cE1 + cW1) + 4*c00 - (cN2 + cS2 + cE2 + cW2)) * 0.125f;
-    float Color_at_G_H = (4*(cE1 + cW1) + 5*c00 - (cE2 + cW2) + 0.5f*(cN2 + cS2) - (cNE + cNW + cSE + cSW)) * 0.125f;
-    float Color_at_G_V = (4*(cN1 + cS1) + 5*c00 - (cN2 + cS2) + 0.5f*(cE2 + cW2) - (cNE + cNW + cSE + cSW)) * 0.125f;
-    float Color_at_Diag = (2*(cNE + cNW + cSE + cSW) + 6*c00 - 1.5f*(cN2 + cS2 + cE2 + cW2)) * 0.125f;
+    BayerNeighborhood nb = fetchBayerNeighborhood(rawTexture, maxW, maxH, x, y);
 
     float r, g, b;
-    if (yEven && xEven) {
-        r = c00; g = G_at_RB; b = Color_at_Diag;
-    } else if (yEven && !xEven) {
-        r = Color_at_G_H; g = c00; b = Color_at_G_V;
-    } else if (!yEven && xEven) {
-        b = Color_at_G_H; g = c00; r = Color_at_G_V;
+    if (xEven == yEven) {
+        float G_at_RB = (2.0f * (nb.cN1 + nb.cS1 + nb.cE1 + nb.cW1) + 4.0f * nb.c00 - (nb.cN2 + nb.cS2 + nb.cE2 + nb.cW2)) * 0.125f;
+        float Color_at_Diag = (2.0f * (nb.cNE + nb.cNW + nb.cSE + nb.cSW) + 6.0f * nb.c00 - 1.5f * (nb.cN2 + nb.cS2 + nb.cE2 + nb.cW2)) * 0.125f;
+        if (yEven) {
+            r = nb.c00; g = G_at_RB; b = Color_at_Diag;
+        } else {
+            b = nb.c00; g = G_at_RB; r = Color_at_Diag;
+        }
     } else {
-        b = c00; g = G_at_RB; r = Color_at_Diag;
+        float Color_at_G_H = (4.0f * (nb.cE1 + nb.cW1) + 5.0f * nb.c00 - (nb.cE2 + nb.cW2) + 0.5f * (nb.cN2 + nb.cS2) - (nb.cNE + nb.cNW + nb.cSE + nb.cSW)) * 0.125f;
+        float Color_at_G_V = (4.0f * (nb.cN1 + nb.cS1) + 5.0f * nb.c00 - (nb.cN2 + nb.cS2) + 0.5f * (nb.cE2 + nb.cW2) - (nb.cNE + nb.cNW + nb.cSE + nb.cSW)) * 0.125f;
+        if (yEven) {
+            r = Color_at_G_H; g = nb.c00; b = Color_at_G_V;
+        } else {
+            b = Color_at_G_H; g = nb.c00; r = Color_at_G_V;
+        }
     }
 
     // ── Single Post-Demosaic Linearization: (DN - black) * invDenom ──
@@ -499,10 +516,18 @@ kernel void convertRgbTo420YpCbCr10(
     uint srcH = srcRGB.get_height();
 
     // Sample 2x2 block with edge clamping
-    float3 p00 = srcRGB.read(uint2(min(baseX,      srcW - 1u), min(baseY,      srcH - 1u))).rgb;
-    float3 p10 = srcRGB.read(uint2(min(baseX + 1u, srcW - 1u), min(baseY,      srcH - 1u))).rgb;
-    float3 p01 = srcRGB.read(uint2(min(baseX,      srcW - 1u), min(baseY + 1u, srcH - 1u))).rgb;
-    float3 p11 = srcRGB.read(uint2(min(baseX + 1u, srcW - 1u), min(baseY + 1u, srcH - 1u))).rgb;
+    float3 p00, p10, p01, p11;
+    if (baseX + 1u < srcW && baseY + 1u < srcH) {
+        p00 = srcRGB.read(uint2(baseX,      baseY)).rgb;
+        p10 = srcRGB.read(uint2(baseX + 1u, baseY)).rgb;
+        p01 = srcRGB.read(uint2(baseX,      baseY + 1u)).rgb;
+        p11 = srcRGB.read(uint2(baseX + 1u, baseY + 1u)).rgb;
+    } else {
+        p00 = srcRGB.read(uint2(min(baseX,      srcW - 1u), min(baseY,      srcH - 1u))).rgb;
+        p10 = srcRGB.read(uint2(min(baseX + 1u, srcW - 1u), min(baseY,      srcH - 1u))).rgb;
+        p01 = srcRGB.read(uint2(min(baseX,      srcW - 1u), min(baseY + 1u, srcH - 1u))).rgb;
+        p11 = srcRGB.read(uint2(min(baseX + 1u, srcW - 1u), min(baseY + 1u, srcH - 1u))).rgb;
+    }
 
     // ITU-R BT.2020 non-constant luminance luma:
     constexpr float3 wY = float3(0.2627f, 0.6780f, 0.0593f);
@@ -649,7 +674,6 @@ fragment float4 displayFragment(
     float4 color = tex.sample(s, uv);
     
     float isClipped = step(color.a, 0.5);
-    float applyRed = (uniforms.showClipping > 0) ? isClipped : 0.0;
     
     float3 finalColor = color.rgb;
 

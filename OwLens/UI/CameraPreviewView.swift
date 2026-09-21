@@ -3,13 +3,57 @@ import UIKit
 import MetalKit
 import QuartzCore
 
+/// Thread-safe texture delivery pipe from the Metal pipeline to MTKView.
+/// Completely bypasses SwiftUI's view body evaluation loop at 24/30 fps,
+/// scheduling direct layer updates onto the MTKView.
+final class PreviewFeed: @unchecked Sendable {
+    private let lock = NSLock()
+    private(set) var currentTexture: MTLTexture?
+    private weak var targetView: MTKView?
+    private weak var coordinator: CameraPreviewView.Coordinator?
+
+    func register(view: MTKView, coordinator: CameraPreviewView.Coordinator) {
+        lock.lock()
+        defer { lock.unlock() }
+        self.targetView = view
+        self.coordinator = coordinator
+        if let currentTexture {
+            coordinator.currentTexture = currentTexture
+            view.setNeedsDisplay()
+        }
+    }
+
+    func unregister() {
+        lock.lock()
+        defer { lock.unlock() }
+        self.targetView = nil
+        self.coordinator = nil
+    }
+
+    func submit(texture: MTLTexture) {
+        lock.lock()
+        currentTexture = texture
+        let view = targetView
+        let coord = coordinator
+        lock.unlock()
+
+        guard let view, let coord else { return }
+        if Thread.isMainThread {
+            coord.currentTexture = texture
+            view.setNeedsDisplay()
+        } else {
+            DispatchQueue.main.async {
+                coord.currentTexture = texture
+                view.setNeedsDisplay()
+            }
+        }
+    }
+}
+
 /// MTKView wrapper — aspect-fits log texture into landscape drawable (no stretch / fake 9:16)
 struct CameraPreviewView: UIViewRepresentable {
     let metalPipeline: MetalPipeline
-    @Binding var currentTexture: MTLTexture?
-    /// Equatable counter that forces updateUIView on every new texture, because
-    /// MTLTexture is not Equatable and SwiftUI otherwise can't detect changes.
-    @Binding var textureChangeCount: UInt64
+    let previewFeed: PreviewFeed
     @Binding var showClipping: Bool
     @Binding var showFocusPeaking: Bool
     var showDisplayLUT: Bool = false
@@ -33,11 +77,21 @@ struct CameraPreviewView: UIViewRepresentable {
         mtkView.contentMode = .scaleToFill
         // Avoid UIKit transforming layers into portrait letterbox mid-record
         mtkView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+
+        previewFeed.register(view: mtkView, coordinator: context.coordinator)
         return mtkView
+    }
+
+    static func dismantleUIView(_ uiView: MTKView, coordinator: Coordinator) {
+        coordinator.previewFeed?.unregister()
     }
  
     func updateUIView(_ uiView: MTKView, context: Context) {
-        context.coordinator.currentTexture = currentTexture
+        if context.coordinator.previewFeed !== previewFeed {
+            context.coordinator.previewFeed?.unregister()
+            context.coordinator.previewFeed = previewFeed
+            previewFeed.register(view: uiView, coordinator: context.coordinator)
+        }
         context.coordinator.showClipping = showClipping
         context.coordinator.showFocusPeaking = showFocusPeaking
         context.coordinator.showDisplayLUT = showDisplayLUT
@@ -54,7 +108,9 @@ struct CameraPreviewView: UIViewRepresentable {
     }
  
     func makeCoordinator() -> Coordinator {
-        Coordinator(metalPipeline: metalPipeline)
+        let coord = Coordinator(metalPipeline: metalPipeline)
+        coord.previewFeed = previewFeed
+        return coord
     }
  
     struct DisplayUniforms {
@@ -69,6 +125,7 @@ struct CameraPreviewView: UIViewRepresentable {
 
     final class Coordinator: NSObject, MTKViewDelegate {
         let metalPipeline: MetalPipeline
+        weak var previewFeed: PreviewFeed?
         var currentTexture: MTLTexture?
         var showClipping: Bool = false
         var showFocusPeaking: Bool = false
