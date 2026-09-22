@@ -31,9 +31,8 @@
 
 | Mode | Capture Resolution | Aspect Ratio | Max Bitrate | Description |
 | :--- | :---: | :---: | :---: | :--- |
-| **Open Gate 4:3** | $1920 \times 1440$ | 4:3 | 100 Mbps | Full sensor vertical capture with maximum reframing flexibility |
-| **1080p Full HD** | $1920 \times 1080$ | 16:9 | 100 Mbps | Standard broadcast HD delivery with native 10-bit Log |
-| **4K UHD** | $3840 \times 2160$ | 16:9 | 150 Mbps | Pristine 4K capture from native 12.2MP Bayer sensor data |
+| **Open Gate 4:3** | $1920 \times 1440$ | 4:3 | 150 Mbps | Full sensor vertical capture with maximum reframing flexibility |
+| **1080p Full HD** | $1920 \times 1080$ | 16:9 | 150 Mbps | Standard broadcast HD delivery with native 10-bit Log |
 
 ---
 
