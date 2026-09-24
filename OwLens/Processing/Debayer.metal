@@ -922,15 +922,16 @@ kernel void spatialDenoise(
             if (dist2 > maxDist2) continue; // Diamond pattern
             
             uint2 pid = uint2(clamp(cx + dx, 0, w - 1), clamp(cy + dy, 0, h - 1));
-            float3 sYUV = rgb2yuv(inTexture.read(pid).rgb);
+            float3 sRGB = inTexture.read(pid).rgb;
+            float sY = dot(sRGB, float3(0.2627f, 0.6780f, 0.0593f));
             
             float spatialW = exp(-dist2 / (2.0 * spatialS2));
-            float lumaDiff = sYUV.x - centerYUV.x;
+            float lumaDiff = sY - centerYUV.x;
             
             // Luma bilateral: edge-stopped by luma difference (tight threshold)
             float lumaW = spatialW * exp(-(lumaDiff * lumaDiff) / (2.0 * lumaRS2));
             sumLumaW += lumaW;
-            sumLuma += sYUV.x * lumaW;
+            sumLuma += sY * lumaW;
             // NOTE: Chroma is NOT smoothed here. The dedicated half-res chroma
             // pipeline (extractHalfResChroma -> denoiseHalfResChroma -> recombine)
             // handles all chroma denoising. Any chroma work in this pass would
@@ -998,7 +999,8 @@ kernel void denoiseHalfResChroma(
 
     int centerGuideX = clamp(cx * 2 + 1, 0, guideW - 1);
     int centerGuideY = clamp(cy * 2 + 1, 0, guideH - 1);
-    float centerY = rgb2yuv(lumaGuideTexture.read(uint2(centerGuideX, centerGuideY)).rgb).x;
+    float3 centerGuideRGB = lumaGuideTexture.read(uint2(centerGuideX, centerGuideY)).rgb;
+    float centerY = dot(centerGuideRGB, float3(0.2627f, 0.6780f, 0.0593f));
     float luma01 = saturate(centerY);
     // Calibrated chroma sigma: use measured coefficients when available.
     float chromaSigmaRef;
@@ -1031,7 +1033,8 @@ kernel void denoiseHalfResChroma(
             int py = clamp(cy + dy, 0, chromaH - 1);
             int guideX = clamp(px * 2 + 1, 0, guideW - 1);
             int guideY = clamp(py * 2 + 1, 0, guideH - 1);
-            float sampleY = rgb2yuv(lumaGuideTexture.read(uint2(guideX, guideY)).rgb).x;
+            float3 sampleRGB = lumaGuideTexture.read(uint2(guideX, guideY)).rgb;
+            float sampleY = dot(sampleRGB, float3(0.2627f, 0.6780f, 0.0593f));
             float lumaDiff = sampleY - centerY;
             float spatialW = exp(-dist2 / (2.0 * spatialS2));
             float chromaWgt = spatialW * exp(-(lumaDiff * lumaDiff) / (2.0 * chromaRS2));
@@ -1090,7 +1093,7 @@ kernel void recombineLumaWithHalfResChroma(
     if (gid.x >= outTexture.get_width() || gid.y >= outTexture.get_height()) return;
 
     float4 lumaPx = lumaTexture.read(gid);
-    float y = rgb2yuv(lumaPx.rgb).x;
+    float y = dot(lumaPx.rgb, float3(0.2627f, 0.6780f, 0.0593f));
 
     float2 chromaCoord = (float2(gid) + 0.5) * 0.5 - 0.5;
     int2 p0 = int2(floor(chromaCoord));
@@ -1257,7 +1260,7 @@ kernel void estimateGlobalMotion(
             int x = (w * gx) / gridW;
             int y = (h * gy) / gridH;
             uint2 coord = uint2(clamp(x, 0, w - 1), clamp(y, 0, h - 1));
-            float curY = rgb2yuv(currentRGB.read(coord).rgb).x;
+            float curY = dot(currentRGB.read(coord).rgb, float3(0.2627f, 0.6780f, 0.0593f));
             float histY = lumaHistory.read(coord, newestSlot).r;
             sumDiff += abs(curY - histY);
             count++;

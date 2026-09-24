@@ -72,6 +72,7 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
     private var cachedBlackLevel: Float?
     private var cachedWhiteLevel: Float?
     private var cachedISO: Float?
+    private var cachedCFAPattern: Int32?
     private var cachedKelvin: Float?
     private var cachedFM1: [Float]?
     private var cachedFM2: [Float]?
@@ -654,6 +655,7 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
                 self.cachedBlackLevel = nil
                 self.cachedWhiteLevel = nil
                 self.cachedISO = nil
+                self.cachedCFAPattern = nil
                 self.cachedColorMatrices = nil
                 self.lastComputedMatrixKelvin = nil
                 self.prepareRAWPhotoResources()
@@ -1149,20 +1151,21 @@ extension CaptureController: AVCapturePhotoCaptureDelegate {
         }
 
         let bufferFormat = CVPixelBufferGetPixelFormatType(owned)
-        let metaCFA = extractCFAPattern(from: photo)
-        let fromFourCC = AVCapturePhotoOutput.isBayerRAWPixelFormat(bufferFormat)
-            ? Self.cfaPatternOptional(forBayerFormat: bufferFormat)
-            : nil
-        // Priority: device-model override → DNG metadata → OSType FourCC → session default → RGGB
+        // Priority: device-model override → cached pattern → DNG metadata → OSType FourCC → session default → RGGB
         let cfa: Int32
         if let override = bayerPatternOverride {
             cfa = override
-        } else if let metaCFA {
+        } else if let cached = cachedCFAPattern {
+            cfa = cached
+        } else if let metaCFA = extractCFAPattern(from: photo) {
             cfa = metaCFA
-        } else if let fromFourCC {
+            cachedCFAPattern = metaCFA
+        } else if let fromFourCC = (AVCapturePhotoOutput.isBayerRAWPixelFormat(bufferFormat) ? Self.cfaPatternOptional(forBayerFormat: bufferFormat) : nil) {
             cfa = fromFourCC
+            cachedCFAPattern = fromFourCC
         } else {
             cfa = formatCFAPattern
+            cachedCFAPattern = formatCFAPattern
         }
         let currentISO = device?.iso ?? 0
         let levels: (Float, Float)

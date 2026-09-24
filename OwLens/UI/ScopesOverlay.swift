@@ -161,12 +161,13 @@ struct ScopesOverlay: View {
             let cellW = traceWidth / CGFloat(columns)
             let cellH = size.height / CGFloat(rows)
 
-            // ── 1. Oscilloscope Signal Trace ──
+            // ── 1. Oscilloscope Signal Trace (Batched) ──
+            var corePath = Path()
+            var tracePath = Path()
             for row in 0..<rows {
                 for col in 0..<columns {
                     let value = data.waveform[row * columns + col]
                     guard value > 0.015 else { continue }
-                    let v = Double(value)
                     let rect = CGRect(
                         x: CGFloat(col) * cellW,
                         y: CGFloat(row) * cellH,
@@ -174,18 +175,18 @@ struct ScopesOverlay: View {
                         height: max(1.0, cellH)
                     )
 
-                    if v > 0.45 {
-                        // Dense phosphor core: mint-white / bright neon
-                        let coreAlpha = min(0.95, 0.40 + v * 0.55)
-                        let coreColor = Color(red: 0.45, green: 1.0, blue: 0.65).opacity(coreAlpha)
-                        context.fill(Path(rect), with: .color(coreColor))
+                    if value > 0.45 {
+                        corePath.addRect(rect)
                     } else {
-                        // Oscilloscope trace emerald green
-                        let traceAlpha = min(0.70, 0.15 + v * 0.90)
-                        let traceColor = Color(red: 0.0, green: 0.88, blue: 0.38).opacity(traceAlpha)
-                        context.fill(Path(rect), with: .color(traceColor))
+                        tracePath.addRect(rect)
                     }
                 }
+            }
+            if !tracePath.isEmpty {
+                context.fill(tracePath, with: .color(Color(red: 0.0, green: 0.88, blue: 0.38).opacity(0.55)))
+            }
+            if !corePath.isEmpty {
+                context.fill(corePath, with: .color(Color(red: 0.45, green: 1.0, blue: 0.65).opacity(0.85)))
             }
 
             // ── 2. Horizontal IRE Graticule Lines (across trace area) ──

@@ -147,8 +147,8 @@ final class VideoWriter: @unchecked Sendable {
             let audioSettings: [String: Any] = [
                 AVFormatIDKey: kAudioFormatMPEG4AAC,
                 AVSampleRateKey: 48_000,
-                AVNumberOfChannelsKey: 1,
-                AVEncoderBitRateKey: 128_000
+                AVNumberOfChannelsKey: 2,
+                AVEncoderBitRateKey: 256_000
             ]
             let input = AVAssetWriterInput(mediaType: .audio, outputSettings: audioSettings)
             input.expectsMediaDataInRealTime = true
@@ -265,45 +265,41 @@ final class VideoWriter: @unchecked Sendable {
         }
 
         let frameDuration = 1.0 / targetFPS
-        var deltaSeconds: Double = frameDuration
 
-        if let captureTime = captureTime, captureTime.isValid, lastFrameCaptureTime.isValid {
-            deltaSeconds = max(0, CMTimeSubtract(captureTime, lastFrameCaptureTime).seconds)
-        } else if lastFrameHostTime > 0 {
-            deltaSeconds = max(0, now - lastFrameHostTime)
+        // Timeline synchronization:
+        // Calculate the expected frame slot index from absolute elapsed capture/host time.
+        // This guarantees rock-solid constant frame rate with zero cumulative audio/video drift.
+        let elapsed: Double
+        if let captureTime = captureTime, captureTime.isValid, sessionStartTime.isValid {
+            elapsed = max(0, CMTimeSubtract(captureTime, sessionStartTime).seconds)
+        } else {
+            elapsed = max(0, now - startHostTime)
         }
 
-        // Startup grace: If startup delays (pool allocation, camera mode lock, or initial pipeline spin-up)
-        // caused a gap before the second frame, do NOT inject a flurry of hold frames!
-        // Re-anchor sessionStartTime and startHostTime to this frame.
-        if realFrameCount <= 1 && deltaSeconds > (1.5 * frameDuration) {
+        // Startup grace: If initial spin-up caused a delay before the second frame,
+        // re-anchor session start to prevent a flurry of duplicate hold frames.
+        if realFrameCount <= 1 && elapsed > (1.5 * frameDuration) {
             if let captureTime = captureTime, captureTime.isValid {
                 sessionStartTime = captureTime
                 lastFrameCaptureTime = captureTime
             }
             startHostTime = now
             lastFrameHostTime = now
-            deltaSeconds = frameDuration
-        }
-
-        // Jitter-immune CFR timeline:
-        // Only insert hold frames if an entire frame interval was genuinely missed (delta >= 2.2 * frameDuration).
-        // Normal mobile sensor readout jitter (e.g. 40-58ms at 30fps) will have delta < 2.2 * frameDuration,
-        // preventing artificial duplicate hold frames from flooding the encoder and causing real frames to drop.
-        if realFrameCount >= 1, deltaSeconds >= (2.2 * frameDuration), let hold = lastPixelBuffer {
-            let missedSlots = min(5, Int((deltaSeconds / frameDuration).rounded()) - 1)
-            var inserted = 0
-            while inserted < missedSlots {
-                guard input.isReadyForMoreMediaData else {
-                    droppedFrames += 1
-                    break
-                }
-                if writeCFR(hold, index: frameCount, adaptor: adaptor) {
-                    frameCount += 1
-                    inserted += 1
-                } else {
-                    droppedFrames += 1
-                    break
+        } else if realFrameCount >= 1, let hold = lastPixelBuffer {
+            let expectedIndex = Int64((elapsed * targetFPS).rounded())
+            if expectedIndex > frameCount {
+                let missedSlots = min(15, Int(expectedIndex - frameCount))
+                for _ in 0..<missedSlots {
+                    guard input.isReadyForMoreMediaData else {
+                        droppedFrames += 1
+                        break
+                    }
+                    if writeCFR(hold, index: frameCount, adaptor: adaptor) {
+                        frameCount += 1
+                    } else {
+                        droppedFrames += 1
+                        break
+                    }
                 }
             }
         }
@@ -431,12 +427,12 @@ final class VideoWriter: @unchecked Sendable {
             return
         }
 
-        // Bounded pad to wall clock: pad at most 4 hold frames to match audio duration cleanly
+        // Bounded pad to wall clock: pad hold frames to match audio duration cleanly
         if let hold = lastPixelBuffer,
            let adaptor = pixelBufferAdaptor,
            let vIn = videoInput {
             let elapsed = max(0, CACurrentMediaTime() - startHostTime)
-            let targetCount = min(Int64((elapsed * targetFPS).rounded()), frameCount + 4)
+            let targetCount = min(Int64((elapsed * targetFPS).rounded()), frameCount + 15)
             while frameCount < targetCount && vIn.isReadyForMoreMediaData {
                 if writeCFR(hold, index: frameCount, adaptor: adaptor) {
                     frameCount += 1

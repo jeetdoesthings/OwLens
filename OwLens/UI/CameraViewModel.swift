@@ -55,6 +55,9 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
     @Published var isRecording = false
     @Published var isSaving = false
     @Published var controlsLocked = false
+    private var wasControlsLockedBeforeRecording = false
+    private var wasAutoFocusBeforeRecording = true
+    private var wasAutoWBBeforeRecording = false
     @Published var thermalState: ProcessInfo.ThermalState = .nominal
     @Published var selectedCurve: LogCurveType = .appleLog2 {
         didSet {
@@ -433,7 +436,7 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
         startBatteryMonitoring()
 #if DEBUG
         if let pipeline = metalPipeline {
-            Task { @MainActor in
+            Task.detached(priority: .utility) {
                 _ = pipeline.runSyntheticHotPixelTest()
                 _ = MetalPipeline.runAppleLog2AccuracyTest()
                 _ = MetalPipeline.runColorMatrixValidationTest()
@@ -445,7 +448,9 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
                 _ = MetalPipeline.runAutoExposureAndWBValidationTest()
                 _ = MetalPipeline.runFlawsValidationTest()
                 _ = pipeline.runPipelineThroughputBenchmark()
-                _ = CameraViewModel.runFileNameGenerationTest()
+                await MainActor.run {
+                    _ = CameraViewModel.runFileNameGenerationTest()
+                }
             }
         }
 #endif
@@ -1026,8 +1031,11 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
             let minDur = Float(device.activeFormat.minExposureDuration.seconds)
             
             let maxAngle = min(360.0, maxDur * 360.0 * Float(activeFPS))
-            let minAngle = minDur * 360.0 * Float(activeFPS)
-            
+            let minAngle = max(1.0, minDur * 360.0 * Float(activeFPS))
+            if minAngle <= maxAngle {
+                shutterRange = minAngle...maxAngle
+            }
+
             let target: Float = 180.0 // Default 180° shutter rule
             
             // Just clamp the current shutter value to the new range, or snap to 180 if out of bounds
@@ -1204,6 +1212,15 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
         captureController.setContinuousAutoFocus()
     }
 
+    private func restoreAutoModesAfterRecording() {
+        if wasAutoFocusBeforeRecording {
+            resetToContinuousAutoFocus()
+        }
+        if wasAutoWBBeforeRecording && isAutoWBLockEnabled {
+            isAutoWhiteBalanceEnabled = true
+        }
+    }
+
     func setFocusPoint(_ point: CGPoint, lock: Bool = true) {
         if meteringMode == .spot {
             captureController.setMeteringMode(.spot, at: point)
@@ -1324,9 +1341,6 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
             errorMessage = "Recording disabled — device has no Bayer RAW."
             return
         }
-        if !controlsLocked {
-            lockControls()
-        }
         guard !isRecording, !isSaving else { return }
 
         // Clean stale temporary recordings from previous interrupted sessions in background
@@ -1339,6 +1353,14 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
         guard remainingRecordSeconds > 5 else {
             errorMessage = "Storage Full (<500MB left) — Cannot record."
             return
+        }
+
+        wasControlsLockedBeforeRecording = controlsLocked
+        wasAutoFocusBeforeRecording = isAutoFocus
+        wasAutoWBBeforeRecording = isAutoWhiteBalanceEnabled
+
+        if !controlsLocked {
+            lockControls()
         }
 
         activeEncodeWidth = selectedFormat.width
@@ -1415,6 +1437,10 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
         } catch {
             errorMessage = "Record failed: \(error.localizedDescription)"
             print("[CameraViewModel] Failed to start recording: \(error)")
+            if !wasControlsLockedBeforeRecording {
+                unlockControls()
+                restoreAutoModesAfterRecording()
+            }
         }
     }
 
@@ -1468,21 +1494,22 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
         statusText = "Saving…"
         captureController.setRecordingMode(false)
 
+        if !wasControlsLockedBeforeRecording {
+            unlockControls()
+            restoreAutoModesAfterRecording()
+        }
+
         saveBackgroundTask = UIApplication.shared.beginBackgroundTask(withName: "OwLens-FinalizeRecording") { [weak self] in
             Task { @MainActor [weak self] in
                 guard let self else { return }
-                if self.saveBackgroundTask != .invalid {
-                    let task = self.saveBackgroundTask
-                    self.saveBackgroundTask = .invalid
-                    UIApplication.shared.endBackgroundTask(task)
-                }
-                self.isSaving = false
+                self.endSaveTask()
             }
         }
 
         recordingQueue.async { [weak self] in
             guard let self else { return }
             self.videoWriter.finish { [weak self] url, error in
+                self?.metalPipeline?.trimMemory()
                 guard let url else {
                     Task { @MainActor [weak self] in
                         self?.statusText = "Save failed"
@@ -1496,7 +1523,6 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
                 }
             }
         }
-        metalPipeline?.trimMemory()
 
         frameCount = Int(frameIndex)
         let realNote = "frames=\(frameCount) drops=\(droppedFrames) fps=\(selectedFPS.label) fmt=\(selectedFormat.shortLabel)"
@@ -1513,6 +1539,10 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
             let task = saveBackgroundTask
             saveBackgroundTask = .invalid
             UIApplication.shared.endBackgroundTask(task)
+        }
+        if !wasControlsLockedBeforeRecording {
+            unlockControls()
+            restoreAutoModesAfterRecording()
         }
     }
 
@@ -1545,6 +1575,7 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
                     Task { @MainActor in
                         if success {
                             self.statusText = "Saved to Photos"
+                            self.showToast("Saved to Photos")
                         } else {
                             self.errorMessage = error?.localizedDescription ?? "Save failed"
                             self.statusText = "Save failed"
@@ -1694,6 +1725,7 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
             try FileManager.default.copyItem(at: url, to: destination)
             try? FileManager.default.removeItem(at: url)
             statusText = "Saved to Files"
+            showToast("Saved to Files")
             refreshStatusLine()
             print("[CameraViewModel] Saved recording to Files: \(destination.path)")
         } catch {

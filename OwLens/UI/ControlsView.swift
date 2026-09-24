@@ -460,7 +460,7 @@ struct ControlsView: View {
                 value: "\(viewModel.selectedBitrate.label)M",
                 subvalue: "HEVC",
                 isSelected: viewModel.activePanel == .bitrate,
-                isDisabled: viewModel.isRecording || viewModel.controlsLocked,
+                isDisabled: viewModel.isRecording || viewModel.isSaving || viewModel.controlsLocked,
                 width: 66
             ) {
                 viewModel.togglePanel(.bitrate)
@@ -478,7 +478,7 @@ struct ControlsView: View {
         AudioDeckTile(
             audioMonitor: viewModel.audioMonitor,
             isSelected: viewModel.activePanel == .mic,
-            isDisabled: viewModel.isRecording || viewModel.controlsLocked,
+            isDisabled: viewModel.isRecording || viewModel.isSaving || viewModel.controlsLocked,
             isMuted: viewModel.selectedAudioSource.portUID == nil,
             micShortName: micShortName
         ) {
@@ -534,7 +534,7 @@ struct ControlsView: View {
     }
 
     private var exposureControlsDisabled: Bool {
-        viewModel.controlsLocked || viewModel.isRecording || viewModel.isDeviceUnsupportedForLog
+        viewModel.controlsLocked || viewModel.isRecording || viewModel.isSaving || viewModel.isDeviceUnsupportedForLog
     }
 
     // MARK: - Transient Status & Floating Panels
