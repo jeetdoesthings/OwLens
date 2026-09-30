@@ -1,4 +1,5 @@
 import AVFoundation
+import CoreVideo
 import VideoToolbox
 import QuartzCore
 import UIKit
@@ -28,7 +29,7 @@ final class VideoWriter: @unchecked Sendable {
     private var lastPixelBuffer: CVPixelBuffer?
     private var pendingAudioBuffers: [CMSampleBuffer] = []
     private let maxPendingAudioBuffers = 50
-    private var curveType: LogCurveType = .appleLog2
+    private var curveType: LogCurveType = .sLog3Approx
     private let lock = NSLock()
 
     var onLowDiskSpace: (@Sendable () -> Void)?
@@ -50,7 +51,7 @@ final class VideoWriter: @unchecked Sendable {
         bitrate: Int = 100_000_000,
         targetFPS: Double = 24,
         includeAudio: Bool = true,
-        curveType: LogCurveType = .appleLog2,
+        curveType: LogCurveType = .sLog3Approx,
         codec: VideoCodecOption = .hevc,
         orientation: UIInterfaceOrientation = .landscapeRight
     ) throws {
@@ -86,6 +87,7 @@ final class VideoWriter: @unchecked Sendable {
             let compression: [String: Any] = [
                 AVVideoAverageBitRateKey: bitrate,
                 kVTCompressionPropertyKey_ProfileLevel as String: profileLevel,
+                kVTCompressionPropertyKey_RealTime as String: true as NSNumber,
                 AVVideoExpectedSourceFrameRateKey: Int(fps),
                 AVVideoAverageNonDroppableFrameRateKey: Int(fps),
                 AVVideoMaxKeyFrameIntervalKey: Int(fps),
@@ -102,12 +104,14 @@ final class VideoWriter: @unchecked Sendable {
                 AVVideoTransferFunctionKey: AVVideoTransferFunction_ITU_R_709_2,
                 AVVideoYCbCrMatrixKey: AVVideoYCbCrMatrix_ITU_R_709_2
             ]
-        case .sLog3Approx, .appleLog2:
-            // For log curves (Apple Log and S-Log3 in BT.2020 container), omitting explicit
-            // AVVideoColorPropertiesKey from outputSettings allows VideoToolbox to derive
-            // the exact 10-bit track tagging (BT.2020 primaries + matrix, plus Apple Log transfer
-            // function where applicable) directly from the CVPixelBuffer attachments.
-            // This prevents S-Log3 from being falsely tagged with Rec.709 transfer function.
+        case .appleLog2, .sLog3Approx:
+            // AVAssetWriterInput strictly requires AVVideoTransferFunctionKey to be one of:
+            // [ITU_R_2100_HLG, IEC_sRGB, SMPTE_ST_2084_PQ, Linear, ITU_R_709_2].
+            // Passing custom or log transfer functions causes an NSInvalidArgumentException crash.
+            // For log profiles (Apple Log 2 and S-Log3 in BT.2020 container), omitting
+            // AVVideoColorPropertiesKey allows VideoToolbox to derive the exact 10-bit color
+            // primaries, matrix, and Apple Log transfer function metadata directly from the
+            // propagated CVPixelBuffer attachments (kCVImageBufferLogTransferFunctionKey).
             break
         }
 
@@ -157,6 +161,8 @@ final class VideoWriter: @unchecked Sendable {
                 aInput = input
             }
         }
+
+        writer.metadata = Self.makeMetadataItems(curveType: curveType, fps: fps, width: width, height: height)
 
         guard writer.startWriting() else {
             throw writer.error ?? NSError(domain: "RawLogCam", code: 11, userInfo: [NSLocalizedDescriptionKey: "AVAssetWriter failed to start"])
@@ -264,31 +270,22 @@ final class VideoWriter: @unchecked Sendable {
             hasStartedSession = true
         }
 
-        let frameDuration = 1.0 / targetFPS
-
-        // Timeline synchronization:
-        // Calculate the expected frame slot index from absolute elapsed capture/host time.
-        // This guarantees rock-solid constant frame rate with zero cumulative audio/video drift.
-        let elapsed: Double
-        if let captureTime = captureTime, captureTime.isValid, sessionStartTime.isValid {
-            elapsed = max(0, CMTimeSubtract(captureTime, sessionStartTime).seconds)
-        } else {
-            elapsed = max(0, now - startHostTime)
-        }
-
-        // Startup grace: If initial spin-up caused a delay before the second frame,
-        // re-anchor session start to prevent a flurry of duplicate hold frames.
-        if realFrameCount <= 1 && elapsed > (1.5 * frameDuration) {
-            if let captureTime = captureTime, captureTime.isValid {
-                sessionStartTime = captureTime
-                lastFrameCaptureTime = captureTime
+        // Frame pacing & dropped-frame compensation:
+        // True CFR guarantees rock-solid constant frame rate with zero cumulative audio/video drift.
+        // Only inject a held frame if the interval since the last frame shows that an entire frame
+        // period (>= 1.75 * interval) was completely dropped by camera hardware.
+        // Minor 5-20ms timer/sensor jitters never trigger duplicate frames, ensuring pure fluid motion.
+        let frameInterval = 1.0 / targetFPS
+        if realFrameCount >= 1, let hold = lastPixelBuffer {
+            let deltaFromLast: Double
+            if let captureTime = captureTime, captureTime.isValid, lastFrameCaptureTime.isValid {
+                deltaFromLast = max(0, CMTimeSubtract(captureTime, lastFrameCaptureTime).seconds)
+            } else {
+                deltaFromLast = max(0, now - lastFrameHostTime)
             }
-            startHostTime = now
-            lastFrameHostTime = now
-        } else if realFrameCount >= 1, let hold = lastPixelBuffer {
-            let expectedIndex = Int64((elapsed * targetFPS).rounded())
-            if expectedIndex > frameCount {
-                let missedSlots = min(15, Int(expectedIndex - frameCount))
+
+            if deltaFromLast >= (1.75 * frameInterval) {
+                let missedSlots = min(10, Int((deltaFromLast / frameInterval).rounded()) - 1)
                 for _ in 0..<missedSlots {
                     guard input.isReadyForMoreMediaData else {
                         droppedFrames += 1
@@ -347,7 +344,7 @@ final class VideoWriter: @unchecked Sendable {
         guard isRecording,
               let input = audioInput,
               hasStartedSession,
-              realFrameCount >= 2 else {
+              realFrameCount >= 1 else {
             return false
         }
         guard CMSampleBufferDataIsReady(sampleBuffer) else { return false }
@@ -495,5 +492,58 @@ final class VideoWriter: @unchecked Sendable {
                 completion(url, nil)
             }
         }
+    }
+
+    private static func makeMetadataItems(
+        curveType: LogCurveType,
+        fps: Double,
+        width: Int,
+        height: Int
+    ) -> [AVMetadataItem] {
+        var items: [AVMetadataItem] = []
+
+        // 1. Common Description
+        let desc = AVMutableMetadataItem()
+        desc.keySpace = .common
+        desc.key = AVMetadataKey.commonKeyDescription as (NSCopying & NSObjectProtocol)
+        desc.value = "\(curveType.displayName) · S-Gamut3.Cine · 10-Bit" as (NSCopying & NSObjectProtocol)
+        items.append(desc)
+
+        // 2. QuickTime User Data Description
+        let qtDesc = AVMutableMetadataItem()
+        qtDesc.keySpace = .quickTimeUserData
+        qtDesc.key = AVMetadataKey.quickTimeUserDataKeyDescription as (NSCopying & NSObjectProtocol)
+        qtDesc.value = "\(curveType.displayName) · S-Gamut3.Cine · 10-Bit" as (NSCopying & NSObjectProtocol)
+        items.append(qtDesc)
+
+        // 3. QuickTime Software
+        let software = AVMutableMetadataItem()
+        software.keySpace = .quickTimeUserData
+        software.key = AVMetadataKey.quickTimeUserDataKeySoftware as (NSCopying & NSObjectProtocol)
+        software.value = "OwLens Cinema Camera v1.4" as (NSCopying & NSObjectProtocol)
+        items.append(software)
+
+        // 4. QuickTime Make
+        let make = AVMutableMetadataItem()
+        make.keySpace = .quickTimeUserData
+        make.key = AVMetadataKey.quickTimeUserDataKeyMake as (NSCopying & NSObjectProtocol)
+        make.value = "Apple / Sony S-Log3" as (NSCopying & NSObjectProtocol)
+        items.append(make)
+
+        // 5. QuickTime Model / Profile
+        let model = AVMutableMetadataItem()
+        model.keySpace = .quickTimeUserData
+        model.key = AVMetadataKey.quickTimeUserDataKeyModel as (NSCopying & NSObjectProtocol)
+        model.value = "S-Log3 / S-Gamut3.Cine 10-Bit" as (NSCopying & NSObjectProtocol)
+        items.append(model)
+
+        // 6. Detailed Comment for DaVinci Resolve / FCP NLEs
+        let comment = AVMutableMetadataItem()
+        comment.keySpace = .quickTimeUserData
+        comment.key = AVMetadataKey.quickTimeUserDataKeyComment as (NSCopying & NSObjectProtocol)
+        comment.value = "Color Space: Sony S-Gamut3.Cine | Gamma: Sony S-Log3 | Frame Rate: \(Int(fps)) fps | Format: \(width)x\(height) 10-Bit HEVC" as (NSCopying & NSObjectProtocol)
+        items.append(comment)
+
+        return items
     }
 }

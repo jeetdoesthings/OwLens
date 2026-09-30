@@ -26,6 +26,7 @@ struct RawFrameData {
     let colorMatrix: simd_float3x3?
     let sgamutMatrix: simd_float3x3?
     let timestamp: CMTime
+    var sequenceID: UInt64 = 0
 }
 
 final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
@@ -56,8 +57,8 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
 
     private var rawPixelFormat: OSType = 0
     private var formatCFAPattern: Int32 = 0
-    private var targetFPS: Double = 24
-    private var minFrameInterval: Double = 1.0 / 24.0
+    private var targetFPS: Double = 30
+    private var minFrameInterval: Double = 1.0 / 30.0
     private var lastCaptureStart: CFTimeInterval = 0
     private var selectedAudioPortUID: String?
     private var isReconfiguringAudio = false
@@ -182,13 +183,11 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
                 print("[CaptureController] Sensor FPS \(rate) not in range; leaving default")
                 return
             }
-            let maxDuration = CMTime(value: 1, timescale: CMTimeScale(rate))
-            camera.activeVideoMaxFrameDuration = maxDuration
-            if let minRange = ranges.first(where: { $0.minFrameRate <= rate && rate <= $0.maxFrameRate }) {
-                camera.activeVideoMinFrameDuration = minRange.minFrameDuration
-            }
+            let frameDuration = CMTime(value: 1, timescale: CMTimeScale(rate))
+            camera.activeVideoMinFrameDuration = frameDuration
+            camera.activeVideoMaxFrameDuration = frameDuration
             let dims = CMVideoFormatDescriptionGetDimensions(camera.activeFormat.formatDescription)
-            print("[CaptureController] Sensor \(dims.width)x\(dims.height) locked @ max \(rate)fps (preset .photo)")
+            print("[CaptureController] Sensor \(dims.width)x\(dims.height) locked @ exact \(rate)fps (preset .photo)")
         } catch {
             print("[CaptureController] lockSensorToTargetFPS: \(error)")
         }
@@ -826,13 +825,8 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
             try device.lockForConfiguration()
             if device.isFocusModeSupported(.locked) {
                 device.setFocusModeLocked(lensPosition: position, completionHandler: nil)
-            } else {
-                // Degrade to a supported AF mode instead of raising.
-                if device.isFocusModeSupported(.continuousAutoFocus) {
-                    device.focusMode = .continuousAutoFocus
-                } else if device.isFocusModeSupported(.autoFocus) {
-                    device.focusMode = .autoFocus
-                }
+            } else if device.isFocusModeSupported(.autoFocus) {
+                device.focusMode = .autoFocus
                 print("[CaptureController] Manual focus (.locked) unsupported — using auto focus")
             }
             device.unlockForConfiguration()
@@ -841,36 +835,16 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
         }
     }
 
-    func setContinuousAutoFocus() {
-        guard let device = device else { return }
-        do {
-            try device.lockForConfiguration()
-            if device.isFocusModeSupported(.continuousAutoFocus) {
-                device.focusMode = .continuousAutoFocus
-            } else if device.isFocusModeSupported(.autoFocus) {
-                device.focusMode = .autoFocus
-            }
-            device.unlockForConfiguration()
-        } catch {
-            print("[CaptureController] Error setting auto focus: \(error)")
-        }
-    }
 
-    func setFocusPointOfInterest(_ point: CGPoint, lock: Bool = false) {
+    func setFocusPointOfInterest(_ point: CGPoint) {
         guard let device = activeDevice ?? AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back) else { return }
         do {
             try device.lockForConfiguration()
             if device.isFocusPointOfInterestSupported {
                 device.focusPointOfInterest = point
             }
-            if lock {
-                if device.isFocusModeSupported(.autoFocus) {
-                    device.focusMode = .autoFocus
-                }
-            } else {
-                if device.isFocusModeSupported(.continuousAutoFocus) {
-                    device.focusMode = .continuousAutoFocus
-                }
+            if device.isFocusModeSupported(.autoFocus) {
+                device.focusMode = .autoFocus
             }
             device.unlockForConfiguration()
         } catch {

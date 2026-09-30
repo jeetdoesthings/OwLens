@@ -185,24 +185,23 @@ struct DeviceCapabilities: Sendable {
         let recBitrate: BitratePreset
         switch tier {
         case .a12a13:
-            recFPS = .fps24
+            recFPS = .fps30
             recFormat = .openGate
             recBitrate = .mbps80
         case .a14:
-            // Match existing 12 Pro defaults — do not change proven path
-            recFPS = .fps24
+            recFPS = .fps30
             recFormat = .openGate
             recBitrate = .mbps100
         case .a15:
-            recFPS = .fps24
+            recFPS = .fps30
             recFormat = .openGate
             recBitrate = .mbps100
         case .a16Plus:
             recFPS = .fps30
-            recFormat = .hd169
+            recFormat = .openGate
             recBitrate = .mbps150
         case .unknown:
-            recFPS = .fps24
+            recFPS = .fps30
             recFormat = .openGate
             recBitrate = .mbps80
         }

@@ -59,7 +59,7 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
     private var wasAutoFocusBeforeRecording = true
     private var wasAutoWBBeforeRecording = false
     @Published var thermalState: ProcessInfo.ThermalState = .nominal
-    @Published var selectedCurve: LogCurveType = .appleLog2 {
+    @Published var selectedCurve: LogCurveType = .sLog3Approx {
         didSet {
             guard !isRecording else { return }
             metalPipeline?.curveType = selectedCurve
@@ -82,7 +82,7 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
             refreshStatusLine()
         }
     }
-    @Published var selectedFPS: CaptureFrameRate = .fps24 {
+    @Published var selectedFPS: CaptureFrameRate = .fps30 {
         didSet {
             guard !controlsLocked, !isRecording else { return }
             captureController.setCaptureFPS(selectedFPS.rawValue)
@@ -154,7 +154,13 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
         }
     }
 
-    @Published var wbTint: Float = 0.0
+    @Published var wbTint: Float = 0.0 {
+        didSet {
+            guard !isAutoWhiteBalanceEnabled, !controlsLocked else { return }
+            scheduleExposureUpdate()
+        }
+    }
+
     @Published var meteringMode: MeteringMode = .matrix {
         didSet {
             captureController.setMeteringMode(meteringMode)
@@ -213,9 +219,8 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
             if isCameraReady { applyManualExposureAndWB() }
         }
     }
-    /// When true, auto white balance locks when recording starts or controls are locked.
-    /// When false (unlocked), white balance continuously adapts during recording.
-    @Published var isAutoWBLockEnabled: Bool = false
+    /// Auto white balance locks by default when recording starts to prevent color drift.
+    @Published var isAutoWBLockEnabled: Bool = true
 
     @Published private(set) var isAutoWhiteBalanceAdjusting: Bool = false
 
@@ -228,12 +233,6 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
 
     private var storageRefreshTimer: Timer?
 
-    /// User-adjustable denoise strength (0.0–1.0). Written to MetalPipeline on change.
-    @Published var denoiseStrength: Float = 1.0 {
-        didSet {
-            metalPipeline?.denoiseStrength = denoiseStrength
-        }
-    }
 
     // Focus properties
     @Published var isFocusLocked: Bool = false
@@ -242,7 +241,6 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
             guard !controlsLocked else { return }
             if isAutoFocus {
                 isFocusLocked = false
-                captureController.setContinuousAutoFocus()
             } else {
                 captureController.setManualFocus(lensPosition: focusLensPosition)
             }
@@ -399,12 +397,16 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
     private let processQueue = DispatchQueue(label: "raw.process.queue", qos: .userInteractive)
     private let recordingQueue = DispatchQueue(label: "com.owlens.recording", qos: .userInteractive)
     nonisolated private let processLock = NSLock()
-    nonisolated(unsafe) private var inFlightProcessCount = 0
-    nonisolated(unsafe) private var processSlotIndex = 0
+    nonisolated(unsafe) private var freeSlots: Set<Int> = [0, 1, 2]
+
+    // Sequencer for guaranteeing strictly monotonic frame ordering during recording
+    nonisolated(unsafe) private var nextDispatchSequenceID: UInt64 = 0
+    nonisolated(unsafe) private var nextOutputSequenceID: UInt64 = 0
+    nonisolated(unsafe) private var reorderBuffer: [UInt64: (MTLTexture?, CVPixelBuffer?, RawFrameData)] = [:]
 
     nonisolated(unsafe) private var activeEncodeWidth = 1920
     nonisolated(unsafe) private var activeEncodeHeight = 1440
-    nonisolated(unsafe) private var activeFPS: Double = 24
+    nonisolated(unsafe) private var activeFPS: Double = 30
     nonisolated(unsafe) private var isRecordingUnsafe = false
     nonisolated(unsafe) private var isAudioMutedUnsafe = false
     nonisolated(unsafe) private var showScopesUnsafe = true
@@ -417,14 +419,12 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
     nonisolated(unsafe) private var noiseCoeffs: (shot: Float, read: Float) = (0.012, 0.0004)
     /// Noise profile for per-ISO coefficient lookup (nil on unknown device).
     nonisolated(unsafe) private var noiseProfileForISO: NoiseProfile?
-    /// Last ISO seen by processFrame; used to detect scene-cut ISO jumps.
-    nonisolated(unsafe) private var lastProcessedISO: Float = 0
     /// Latest calibrated color matrices extracted from DNG metadata.
     nonisolated(unsafe) private var latestColorMatrix: simd_float3x3?
     nonisolated(unsafe) private var latestSGamutMatrix: simd_float3x3?
 
     enum ControlPanel: String, Identifiable {
-        case exposure, iso, shutter, wb, focus, fps, format, bitrate, denoise, mic, lens, save, logCurve
+        case exposure, iso, shutter, wb, focus, fps, format, bitrate, mic, lens, save, logCurve
         var id: String { rawValue }
     }
 
@@ -456,7 +456,6 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
 #endif
         loadFilesFolderBookmark()
         metalPipeline?.curveType = selectedCurve
-        metalPipeline?.denoiseStrength = denoiseStrength
         metalPipeline?.thermalState = ProcessInfo.processInfo.thermalState
         activeEncodeWidth = selectedFormat.width
         activeEncodeHeight = selectedFormat.height
@@ -587,7 +586,6 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
         // Stop stills + drain queue so no Metal submits after background
         captureController.stopSession()
         frameBuffer.flush()
-        metalPipeline?.clearTemporalHistory()
         if isRecording {
             stopRecording()
         }
@@ -603,7 +601,6 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
         if captureController.activeDevice != nil {
             captureController.setCaptureFPS(selectedFPS.rawValue)
             captureController.startSession()
-            metalPipeline?.clearTemporalHistory()
             if !controlsLocked {
                 applyManualExposureAndWB()
             }
@@ -926,7 +923,7 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
             let nextIdx = (idx + 1) % cases.count
             selectedCurve = cases[nextIdx]
         } else {
-            selectedCurve = cases.first ?? .appleLog2
+            selectedCurve = cases.first ?? .sLog3Approx
         }
         showToast("\(selectedCurve.displayName) · 10-Bit")
     }
@@ -994,7 +991,6 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
                     // ISO/shutter ranges can change per lens
                     self.seedControlRanges()
 
-                    self.metalPipeline?.clearTemporalHistory()
                     self.applyManualExposureAndWB()
                     self.refreshStatusLine()
                 }
@@ -1053,20 +1049,42 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
         isoStopIndex = ExposureStops.clampIndex(isoStopIndex + delta, count: isoStops.count)
     }
 
+    func nudgeShutterAngle(_ direction: Int) {
+        guard !controlsLocked else { return }
+        let snapTargets: [Float] = [11.25, 22.5, 45.0, 90.0, 144.0, 172.8, 180.0, 270.0, 360.0]
+            .filter { shutterRange.contains($0) }
+        if direction > 0 {
+            if let next = snapTargets.first(where: { $0 > shutterValue + 0.5 }) {
+                setShutterAngleWithSnapping(next)
+            } else {
+                setShutterAngleWithSnapping(min(shutterRange.upperBound, shutterValue + 5.0))
+            }
+        } else {
+            if let prev = snapTargets.last(where: { $0 < shutterValue - 0.5 }) {
+                setShutterAngleWithSnapping(prev)
+            } else {
+                setShutterAngleWithSnapping(max(shutterRange.lowerBound, shutterValue - 5.0))
+            }
+        }
+    }
+
     func nudgeWB(_ delta: Int) {
         guard !controlsLocked, !isAutoWhiteBalanceEnabled else { return }
         wbStopIndex = ExposureStops.clampIndex(wbStopIndex + delta, count: wbStops.count)
     }
 
-    // MARK: - Manual Controls (live when unlocked)
-
-    /// Push the user's denoiseStrength to the Metal pipeline.
-    /// Called when recording starts or controls lock state changes.
-    private func updateDenoiseStrength() {
-        guard let pipeline = metalPipeline else { return }
-        pipeline.denoiseStrength = denoiseStrength
-        print("[CameraViewModel] denoiseStrength=\(pipeline.denoiseStrength) mode=\(controlsLocked ? "record" : "preview")")
+    func nudgeTint(_ delta: Float) {
+        guard !controlsLocked, !isAutoWhiteBalanceEnabled else { return }
+        wbTint = max(-50.0, min(50.0, (wbTint + delta).rounded()))
     }
+
+    func nudgeFocus(_ delta: Float) {
+        guard !controlsLocked else { return }
+        isAutoFocus = false
+        focusLensPosition = max(0.0, min(1.0, focusLensPosition + delta * 0.05))
+    }
+
+    // MARK: - Manual Controls (live when unlocked)
 
     /// Debounced exposure/WB push — coalesces rapid slider changes into one hardware call.
     /// Cancels any pending update and schedules a new one 100ms out.
@@ -1141,30 +1159,21 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
     }
 
     /// Freeze active auto white balance directly on hardware at its current values,
-    /// ensuring that locking controls or starting recording prevents color drift if WB lock is enabled.
+    /// ensuring that locking controls or starting recording prevents color drift.
     private func freezeAutoWhiteBalance(on device: AVCaptureDevice) {
-        // Lock white balance if auto and lock enabled: preserve exact device gains and tint
-        if isAutoWhiteBalanceEnabled {
-            if isAutoWBLockEnabled {
-                let currentGains = device.deviceWhiteBalanceGains
-                let tempTint = device.temperatureAndTintValues(for: currentGains)
-                wbKelvin = max(2000, min(10000, tempTint.temperature))
-                wbStopIndex = ExposureStops.nearestIndex(in: wbStops, to: wbKelvin)
-                wbTint = tempTint.tint
-                isAutoWhiteBalanceEnabled = false
-                isAutoWhiteBalanceAdjusting = false
-                let clamped = clampWhiteBalanceGains(currentGains, for: device)
-                if device.isWhiteBalanceModeSupported(.locked) {
-                    device.setWhiteBalanceModeLocked(with: clamped)
-                }
-                updateWBParams(from: device, explicitGains: clamped)
-            } else {
-                if device.isWhiteBalanceModeSupported(.continuousAutoWhiteBalance) {
-                    device.whiteBalanceMode = .continuousAutoWhiteBalance
-                }
-                metalPipeline?.isAutoWBEnabled = true
-            }
+        guard isAutoWhiteBalanceEnabled else { return }
+        let currentGains = device.deviceWhiteBalanceGains
+        let tempTint = device.temperatureAndTintValues(for: currentGains)
+        wbKelvin = max(2000, min(10000, tempTint.temperature))
+        wbStopIndex = ExposureStops.nearestIndex(in: wbStops, to: wbKelvin)
+        wbTint = tempTint.tint
+        isAutoWhiteBalanceEnabled = false
+        isAutoWhiteBalanceAdjusting = false
+        let clamped = clampWhiteBalanceGains(currentGains, for: device)
+        if device.isWhiteBalanceModeSupported(.locked) {
+            device.setWhiteBalanceModeLocked(with: clamped)
         }
+        updateWBParams(from: device, explicitGains: clamped)
     }
 
     func lockControls() {
@@ -1179,10 +1188,8 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
             print("[CameraViewModel] lockControls: \(error)")
         }
 
-        // Push manual exposure and WB settings (if WB is locked)
-        if !isAutoWhiteBalanceEnabled || isAutoWBLockEnabled {
-            applyManualExposureAndWB()
-        }
+        // Push manual exposure and WB settings
+        applyManualExposureAndWB()
 
         if let device = captureController.activeDevice {
             isoRange = device.activeFormat.minISO...device.activeFormat.maxISO
@@ -1190,7 +1197,6 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
 
         controlsLocked = true
         metalPipeline?.curveType = selectedCurve
-        updateDenoiseStrength()
         activePanel = nil
         refreshStatusLine()
         print("[CameraViewModel] Controls locked (curve=\(selectedCurve.displayName))")
@@ -1200,23 +1206,12 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
         controlsLocked = false
         isFocusLocked = false
         metalPipeline?.curveType = selectedCurve
-        updateDenoiseStrength()
         refreshStatusLine()
         print("[CameraViewModel] Controls unlocked (curve=\(selectedCurve.displayName))")
     }
 
-    func resetToContinuousAutoFocus() {
-        guard !controlsLocked else { return }
-        isAutoFocus = true
-        isFocusLocked = false
-        captureController.setContinuousAutoFocus()
-    }
-
     private func restoreAutoModesAfterRecording() {
-        if wasAutoFocusBeforeRecording {
-            resetToContinuousAutoFocus()
-        }
-        if wasAutoWBBeforeRecording && isAutoWBLockEnabled {
+        if wasAutoWBBeforeRecording {
             isAutoWhiteBalanceEnabled = true
         }
     }
@@ -1227,7 +1222,8 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
         }
         isAutoFocus = true
         isFocusLocked = lock
-        captureController.setFocusPointOfInterest(point, lock: lock)
+        captureController.setFocusPointOfInterest(point)
+        showToast("AF Locked")
     }
 
     private func clampWhiteBalanceGains(_ gains: AVCaptureDevice.WhiteBalanceGains, for device: AVCaptureDevice) -> AVCaptureDevice.WhiteBalanceGains {
@@ -1252,7 +1248,7 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
         case .sLog3Approx:
             cMatrix = latestSGamutMatrix ?? WhiteBalanceParams.defaultSensorToSGamut3Cine
         }
-        metalPipeline?.headroomScale = LogCurve.defaultRMax(for: selectedCurve)
+        metalPipeline?.headroomScale = 1.0
         metalPipeline?.wbParams = WhiteBalanceParams(
             gains: SIMD3<Float>(
                 max(gains.redGain / g, 0.01),
@@ -1356,7 +1352,6 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
         }
 
         wasControlsLockedBeforeRecording = controlsLocked
-        wasAutoFocusBeforeRecording = isAutoFocus
         wasAutoWBBeforeRecording = isAutoWhiteBalanceEnabled
 
         if !controlsLocked {
@@ -1367,9 +1362,7 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
         activeEncodeHeight = selectedFormat.height
         activeFPS = selectedFPS.rawValue
         lockAutoModesForRecording()
-        updateDenoiseStrength()
         metalPipeline?.curveType = selectedCurve
-        metalPipeline?.clearTemporalHistory()
         metalPipeline?.prewarm(width: selectedFormat.width, height: selectedFormat.height, curveType: selectedCurve)
         frameBuffer.flush()
         captureController.setRecordingMode(true)
@@ -1420,6 +1413,11 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
             )
             isRecording = true
             isRecordingUnsafe = true
+            processLock.lock()
+            nextDispatchSequenceID = 0
+            nextOutputSequenceID = 0
+            reorderBuffer.removeAll()
+            processLock.unlock()
             frameIndex = 0
             frameCount = 0
             recordingStartTime = recordingDate
@@ -1449,7 +1447,7 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
 
         // If white balance and focus are already locked (e.g. via lockControls()),
         // skip locking hardware configuration to avoid stalling the capture pipeline.
-        let needsWB = isAutoWhiteBalanceEnabled && isAutoWBLockEnabled
+        let needsWB = isAutoWhiteBalanceEnabled
         let needsFocus = isAutoFocus
         guard needsWB || needsFocus else { return }
 
@@ -1506,10 +1504,26 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
             }
         }
 
+        processLock.lock()
+        let bufferedKeys = reorderBuffer.keys.sorted()
+        var remaining: [(MTLTexture?, CVPixelBuffer?, RawFrameData)] = []
+        for k in bufferedKeys {
+            if let item = reorderBuffer.removeValue(forKey: k) {
+                remaining.append(item)
+            }
+        }
+        processLock.unlock()
+
+        for item in remaining {
+            dispatchOrderedRecordedFrame(item.0, bgraPB: item.1, frameData: item.2)
+        }
+
         recordingQueue.async { [weak self] in
             guard let self else { return }
             self.videoWriter.finish { [weak self] url, error in
-                self?.metalPipeline?.trimMemory()
+                self?.processQueue.async {
+                    self?.metalPipeline?.trimMemory()
+                }
                 guard let url else {
                     Task { @MainActor [weak self] in
                         self?.statusText = "Save failed"
@@ -1811,7 +1825,7 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
 
     nonisolated private func scheduleProcess() {
         processLock.lock()
-        guard inFlightProcessCount < 3 else {
+        guard !freeSlots.isEmpty else {
             processLock.unlock()
             return
         }
@@ -1819,9 +1833,10 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
             processLock.unlock()
             return
         }
-        inFlightProcessCount += 1
-        let slot = processSlotIndex
-        processSlotIndex = (processSlotIndex + 1) % 3
+        guard let slot = freeSlots.popFirst() else {
+            processLock.unlock()
+            return
+        }
         processLock.unlock()
 
         processQueue.async { [weak self] in
@@ -1830,32 +1845,39 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
     }
 
     nonisolated private func drainBuffer(slot: Int) {
-        let frame: RawFrameData?
+        var frame: RawFrameData?
         if isRecordingUnsafe {
             // FIFO during recording: process every single captured frame in order without skipping
             frame = frameBuffer.dequeue()
+            if var f = frame {
+                processLock.lock()
+                f.sequenceID = nextDispatchSequenceID
+                nextDispatchSequenceID &+= 1
+                processLock.unlock()
+                frame = f
+            }
         } else {
             // Preview only: drop older backlog frames to keep viewfinder latency minimal
             frame = frameBuffer.dequeueLatest()
         }
         guard let frame else {
             processLock.lock()
-            inFlightProcessCount = max(0, inFlightProcessCount - 1)
+            freeSlots.insert(slot)
             processLock.unlock()
             return
         }
 
-        // Check if another frame can begin encoding concurrently in the other slot
+        // Check if another frame can begin encoding concurrently in another available slot
         scheduleProcess()
 
         processFrame(frame, slot: slot) { [weak self] in
             guard let self else { return }
-            processLock.lock()
-            inFlightProcessCount = max(0, inFlightProcessCount - 1)
-            let remaining = frameBuffer.currentCount
-            processLock.unlock()
+            self.processLock.lock()
+            self.freeSlots.insert(slot)
+            let remaining = self.frameBuffer.currentCount
+            self.processLock.unlock()
             if remaining > 0 {
-                scheduleProcess()
+                self.scheduleProcess()
             }
         }
     }
@@ -1890,16 +1912,6 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
         pipeline.noiseShotCoeff = noiseCoeffs.shot
         pipeline.noiseReadCoeff = noiseCoeffs.read
 
-        // Scene-cut detection: symmetric ISO ratio check (>= 3.0 ratio = >1.58 stops).
-        // Primary motion detection happens inside the temporal kernel via a global frame metric.
-        if lastProcessedISO > 0 {
-            let isoRatio = max(frameData.iso, lastProcessedISO) / max(1.0, min(frameData.iso, lastProcessedISO))
-            if isoRatio >= 3.0 {
-                pipeline.clearTemporalHistory()
-            }
-        }
-        lastProcessedISO = frameData.iso
-
         if let cm = frameData.colorMatrix { latestColorMatrix = cm }
         if let sm = frameData.sgamutMatrix { latestSGamutMatrix = sm }
 
@@ -1910,10 +1922,10 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
             pipeline.headroomScale = 1.0
         case .appleLog2:
             cMatrix = latestColorMatrix ?? WhiteBalanceParams.defaultSensorToBT2020
-            pipeline.headroomScale = LogCurve.defaultRMax(for: .appleLog2)
+            pipeline.headroomScale = 1.0
         case .sLog3Approx:
             cMatrix = latestSGamutMatrix ?? WhiteBalanceParams.defaultSensorToSGamut3Cine
-            pipeline.headroomScale = LogCurve.defaultRMax(for: .sLog3Approx)
+            pipeline.headroomScale = 1.0
         }
 
         if pipeline.isAutoWBEnabled, let gains = frameData.whiteBalanceGains {
@@ -1936,8 +1948,6 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
 
         if isRecordingUnsafe {
             // ── Recording ──
-            // Elevated thermal state: use previewFast (radius=2, no local-sigma stats, no chroma history store)
-            // to keep GPU cool and responsive. Under normal thermals: recordQuality.
             let isThermalElevated = (metalPipeline?.thermalState.rawValue ?? 0) >= ProcessInfo.ThermalState.serious.rawValue
             pipeline.processingQuality = isThermalElevated ? .previewFast : .recordQuality
             pipeline.process(frameData.pixelBuffer, encodeWidth: w, encodeHeight: h, encodeAsBGRA: true, slot: slot) { [weak self] framed, bgraPB in
@@ -1945,7 +1955,7 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
                 handleRecordedFrame(framed, bgraPB: bgraPB, frameData: frameData, completion: completion)
             }
         } else {
-            // ── Preview (non-recording): lightweight path, no denoise ──
+            // ── Preview (non-recording): lightweight path ──
             pipeline.processingQuality = .previewFast
             // Cap preview resolution to max 1920 (preserving exact aspect ratio) to avoid
             // rendering excessive resolution just for on-screen viewfinder rendering.
@@ -2013,6 +2023,31 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
         // Immediately release the Metal pipeline slot so the next frame can begin GPU work concurrently!
         completion()
 
+        guard let framed else { return }
+
+        if isRecordingUnsafe {
+            processLock.lock()
+            reorderBuffer[frameData.sequenceID] = (framed, bgraPB, frameData)
+            var readyFrames: [(MTLTexture?, CVPixelBuffer?, RawFrameData)] = []
+            while let next = reorderBuffer.removeValue(forKey: nextOutputSequenceID) {
+                readyFrames.append(next)
+                nextOutputSequenceID &+= 1
+            }
+            processLock.unlock()
+
+            for item in readyFrames {
+                dispatchOrderedRecordedFrame(item.0, bgraPB: item.1, frameData: item.2)
+            }
+        } else {
+            dispatchOrderedRecordedFrame(framed, bgraPB: bgraPB, frameData: frameData)
+        }
+    }
+
+    nonisolated private func dispatchOrderedRecordedFrame(
+        _ framed: MTLTexture?,
+        bgraPB: CVPixelBuffer?,
+        frameData: RawFrameData
+    ) {
         guard let framed else { return }
 
         let cfaName: String

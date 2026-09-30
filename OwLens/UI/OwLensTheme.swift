@@ -1,64 +1,58 @@
 import SwiftUI
 import UIKit
 
-// MARK: - Typography
+// MARK: - Typography (Apple System San Francisco)
 
-enum GeistWeight {
-    case regular
-    case medium
-    case semiBold
-    case bold
-
-    var systemWeight: Font.Weight {
-        switch self {
-        case .regular:  return .regular
-        case .medium:   return .medium
-        case .semiBold: return .semibold
-        case .bold:     return .bold
-        }
-    }
+extension Font.Weight {
+    static let semiBold: Font.Weight = .semibold
 }
 
 extension Font {
-    static func geist(_ weight: GeistWeight = .regular, size: CGFloat) -> Font {
-        .system(size: size, weight: weight.systemWeight)
+    static func appFont(_ weight: Font.Weight = .regular, size: CGFloat) -> Font {
+        .system(size: size, weight: weight)
     }
 
-    static func geistMono(_ weight: GeistWeight = .regular, size: CGFloat) -> Font {
-        .system(size: size, weight: weight.systemWeight, design: .monospaced).monospacedDigit()
+    static func appMono(_ weight: Font.Weight = .regular, size: CGFloat) -> Font {
+        .system(size: size, weight: weight, design: .monospaced).monospacedDigit()
+    }
+
+    // Compatibility aliases using default system font
+    static func geist(_ weight: Font.Weight = .regular, size: CGFloat) -> Font {
+        .system(size: size, weight: weight)
+    }
+
+    static func geistMono(_ weight: Font.Weight = .regular, size: CGFloat) -> Font {
+        .system(size: size, weight: weight, design: .monospaced).monospacedDigit()
     }
 }
 
 // MARK: - Theme & Color Tokens
 
 enum OwLensTheme {
-    // ── Monochromatic Accent: Pure White ──
-    // Single neutral accent — no amber/gold. The UI speaks through
-    // hierarchy (opacity) and spatial rhythm rather than colour.
+    // Monochromatic Accent
     static let accent = Color.white
     
-    // Legacy aliases kept so the rest of the codebase compiles without
-    // a rename-everywhere pass. Every path converges to the same white.
-    static let cinemaAmber = accent
-    static let amberWarning = Color.white.opacity(0.85)
-    static let cinemaGreen = accent
-    static let cinemaCyan = accent
-    static let cinemaAccent = accent
+    // Cinema Amber / Gold (Reserved for Horizon Level Lock & IRE Guides)
+    static let cinemaAmber = Color(red: 1.0, green: 0.82, blue: 0.25)
+    static let levelAligned = cinemaAmber
+    static let levelUnfinished = Color.white.opacity(0.50)
+    static let amberWarning = Color(red: 1.0, green: 0.78, blue: 0.20)
+    static let thermalWarning = Color(red: 1.0, green: 0.72, blue: 0.18)
 
     // Active Recording Indicator (Red — strictly reserved for REC tally)
     static let recordingRed = Color(red: 245/255, green: 45/255, blue: 45/255)
+    static let thermalCritical = recordingRed
 
     // Audio VU Meter Colors
     static let audioNominal = Color(red: 0.25, green: 0.88, blue: 0.45)
     static let audioWarning = Color(red: 1.0, green: 0.78, blue: 0.20)
     static let audioPeak = Color(red: 1.0, green: 0.25, blue: 0.25)
 
-    // Lock / Unlock Indicators (Green = Unlocked, Red = Locked)
+    // Lock / Unlock Indicators
     static let lockUnlocked = Color(red: 0.25, green: 0.88, blue: 0.40)
     static let lockLocked = recordingRed
 
     // ── Glass HUD Surfaces ──
-    // Modern iOS backdrop blur with subtle dark tint for maximum contrast over any scene
     static let glassBase = Color.black.opacity(0.40)
     static let glassBaseLight = Color.black.opacity(0.20)
     static let glassBaseHeavy = Color.black.opacity(0.60)
@@ -66,11 +60,10 @@ enum OwLensTheme {
     static let glassActiveBg = Color.white.opacity(0.12)
 
     // ── Borders & Strokes ──
-    // Clean, crisp micro-strokes with specular highlights
     static let glassBorder = Color.white.opacity(0.12)
     static let glassBorderSubtle = Color.white.opacity(0.06)
     static let glassBorderActive = Color.white.opacity(0.28)
-    static let glassBorderAmber = Color.white.opacity(0.22)
+    static let glassBorderAmber = cinemaAmber.opacity(0.50)
     static let glassBorderRed = recordingRed.opacity(0.6)
 
     // ── Text & Content Hierarchies ──
@@ -79,13 +72,14 @@ enum OwLensTheme {
     static let textMuted = Color.white.opacity(0.38)
     static let textDisabled = Color.white.opacity(0.20)
 
-    // ── Dimensions (Unified Curved-Rectangular Design) ──
+    // ── Dimensions ──
     static let radiusCard: CGFloat = 10
     static let radiusSm: CGFloat = 6
     static let radiusMd: CGFloat = 10
     static let radiusLg: CGFloat = 12
     static let radiusXl: CGFloat = 16
     static let radiusPill: CGFloat = 10
+    static let touchTargetMin: CGFloat = 44
 }
 
 // MARK: - Haptic Feedback

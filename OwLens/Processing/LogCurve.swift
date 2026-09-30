@@ -27,8 +27,16 @@ enum LogCurveType: Int, CaseIterable, Identifiable {
         }
     }
 
+    var shortLabel: String {
+        switch self {
+        case .linear: return "LINEAR"
+        case .sLog3Approx: return "S-LOG3"
+        case .appleLog2: return "APPLE LOG"
+        }
+    }
+
     /// The curves exposed in the UI (hide linear unless debugging).
-    static var uiCases: [LogCurveType] { [.appleLog2, .sLog3Approx] }
+    static var uiCases: [LogCurveType] { [.sLog3Approx, .appleLog2] }
 }
 
 /// CPU-side log curve math — used for LUT generation and validation.
@@ -130,15 +138,7 @@ enum LogCurve {
         guard rMax > rKnee + 1e-4, peak > rKnee else { return rgb }
         let peakShoulder = applyHighlightShoulder(peak, rKnee: rKnee, rMax: rMax)
         let scale = peakShoulder / max(peak, 1e-6)
-        let scaled = rgb * scale
-
-        // Smooth C¹ cubic highlight desaturation to pure neutral white as scene intensity
-        // approaches sensor clipping / peak dynamic range (peak >= 0.85 -> 1.65).
-        // Eliminates the Bayer clipping magenta/pink cast on the sky and clouds while
-        // maintaining 100% color fidelity in midtones, skin tones, and rich sunsets.
-        let u = simd_clamp((peak - 0.85) * 1.25, 0.0, 1.0)
-        let desat = u * u * (3.0 - 2.0 * u)
-        return simd_mix(scaled, SIMD3<Float>(repeating: peakShoulder), SIMD3<Float>(repeating: desat))
+        return rgb * scale
     }
 
     static func apply(_ rgb: SIMD3<Float>, type: LogCurveType, headroomScale: Float = 1.0) -> SIMD3<Float> {

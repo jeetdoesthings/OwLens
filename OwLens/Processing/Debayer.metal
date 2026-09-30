@@ -51,16 +51,17 @@ kernel void correctDefectPixelsBayer(
 
     float center = src.read(gid).r;
 
-    // Direct O(1) unrolled sampling of same-color Bayer neighbors (4 diagonals)
+    // Direct O(1) unrolled sampling of true same-color Bayer neighbors (distance 2 cross)
+    // with boundary reflection preserving exact Bayer CFA phase parity.
     int w = int(src.get_width()) - 1;
     int h = int(src.get_height()) - 1;
     int x = int(gid.x);
     int y = int(gid.y);
 
-    float n0 = src.read(uint2(clamp(x - 1, 0, w), clamp(y - 1, 0, h))).r;
-    float n1 = src.read(uint2(clamp(x + 1, 0, w), clamp(y - 1, 0, h))).r;
-    float n2 = src.read(uint2(clamp(x - 1, 0, w), clamp(y + 1, 0, h))).r;
-    float n3 = src.read(uint2(clamp(x + 1, 0, w), clamp(y + 1, 0, h))).r;
+    float n0 = sampleBayerRaw(src, w, h, x, y, -2,  0);
+    float n1 = sampleBayerRaw(src, w, h, x, y,  2,  0);
+    float n2 = sampleBayerRaw(src, w, h, x, y,  0, -2);
+    float n3 = sampleBayerRaw(src, w, h, x, y,  0,  2);
 
     // Fast 4-element sorting network: 5 min/max operations, zero loops, zero register spills
     float min01 = min(n0, n1);
@@ -134,15 +135,7 @@ static inline float3 applyHighlightShoulder3(float3 rgb, float rKnee, float rMax
 
     float peakShoulder = applyHighlightShoulderMetal(peak, rKnee, rMax);
     float scale = peakShoulder / max(peak, 1e-6f);
-    float3 scaled = rgb * scale;
-
-    // Smooth C¹ cubic highlight desaturation to pure neutral white as scene intensity
-    // approaches sensor clipping / peak dynamic range (peak >= 0.85 -> 1.65).
-    // Eliminates the Bayer clipping magenta/pink cast on the sky and clouds while
-    // maintaining 100% color fidelity in midtones, skin tones, and rich sunsets.
-    float u = clamp((peak - 0.85f) * 1.25f, 0.0f, 1.0f);
-    float desat = u * u * (3.0f - 2.0f * u);
-    return mix(scaled, float3(peakShoulder), desat);
+    return rgb * scale;
 }
 
 static inline float3 encodeLogCurve(float3 rgb, int curveType, float headroomScale = 1.0f) {
@@ -200,23 +193,6 @@ static inline float3 encodeLogCurve(float3 rgb, int curveType, float headroomSca
     return saturate(result);
 }
 
-struct LogOnlyParams {
-    int   curveType;
-    float headroomScale;
-};
-
-kernel void applyLogOnly(
-    texture2d<float, access::read> inTexture [[texture(0)]],
-    texture2d<float, access::write> outTexture [[texture(1)]],
-    constant LogOnlyParams &params [[buffer(0)]],
-    uint2 gid [[thread_position_in_grid]])
-{
-    if (gid.x >= outTexture.get_width() || gid.y >= outTexture.get_height()) return;
-
-    float4 pixel = inTexture.read(gid);
-    float3 result = encodeLogCurve(float3(pixel.r, pixel.g, pixel.b), params.curveType, params.headroomScale);
-    outTexture.write(float4(result, pixel.a), gid);
-}
 
 // ──────────────────────────────────────────────────────────────────────
 // FUSED: demosaic + WB + log in ONE kernel (eliminates 2 texture
@@ -286,106 +262,11 @@ static inline BayerNeighborhood fetchBayerNeighborhood(texture2d<float, access::
     return nb;
 }
 
-// ──────────────────────────────────────────────────────────────────────
-// LINEAR OUTPUT: demosaic + LSC + WB — NO log curve.
-// Used by the linear denoise pipeline before luma/chroma split and log encoding.
-// ──────────────────────────────────────────────────────────────────────
-
-kernel void debayerWBLinear(
-    texture2d<float, access::read>  rawTexture [[texture(0)]],
-    texture2d<float, access::write> outTexture [[texture(1)]],
-    constant FusedParams &params   [[buffer(0)]],
-    constant LSCParams &lsc       [[buffer(1)]],
-    constant float3x3 &colorMatrix [[buffer(2)]],
-    uint2 gid [[thread_position_in_grid]])
-{
-    if (gid.x >= outTexture.get_width() || gid.y >= outTexture.get_height()) return;
-
-    int x = int(gid.x);
-    int y = int(gid.y);
-
-    int pattern = params.bayerPattern;
-    bool xEven = ((x ^ pattern) & 1) == 0;
-    bool yEven = ((y ^ (pattern >> 1)) & 1) == 0;
-
-    float black = params.blackLevel;
-    float white = params.whiteLevel;
-    float invDenom = 1.0f / max(white - black, 1e-6f);
-    int maxW = int(rawTexture.get_width()) - 1;
-    int maxH = int(rawTexture.get_height()) - 1;
-
-    // ── Directional Demosaic (Malvar-He-Cutler) on raw DNs ──
-    BayerNeighborhood nb = fetchBayerNeighborhood(rawTexture, maxW, maxH, x, y);
-
-    float r, g, b;
-    if (xEven == yEven) {
-        float G_at_RB = (2.0f * (nb.cN1 + nb.cS1 + nb.cE1 + nb.cW1) + 4.0f * nb.c00 - (nb.cN2 + nb.cS2 + nb.cE2 + nb.cW2)) * 0.125f;
-        float Color_at_Diag = (2.0f * (nb.cNE + nb.cNW + nb.cSE + nb.cSW) + 6.0f * nb.c00 - 1.5f * (nb.cN2 + nb.cS2 + nb.cE2 + nb.cW2)) * 0.125f;
-        if (yEven) {
-            r = nb.c00; g = G_at_RB; b = Color_at_Diag;
-        } else {
-            b = nb.c00; g = G_at_RB; r = Color_at_Diag;
-        }
-    } else {
-        float Color_at_G_H = (4.0f * (nb.cE1 + nb.cW1) + 5.0f * nb.c00 - (nb.cE2 + nb.cW2) + 0.5f * (nb.cN2 + nb.cS2) - (nb.cNE + nb.cNW + nb.cSE + nb.cSW)) * 0.125f;
-        float Color_at_G_V = (4.0f * (nb.cN1 + nb.cS1) + 5.0f * nb.c00 - (nb.cN2 + nb.cS2) + 0.5f * (nb.cE2 + nb.cW2) - (nb.cNE + nb.cNW + nb.cSE + nb.cSW)) * 0.125f;
-        if (yEven) {
-            r = Color_at_G_H; g = nb.c00; b = Color_at_G_V;
-        } else {
-            b = Color_at_G_H; g = nb.c00; r = Color_at_G_V;
-        }
-    }
-
-    // ── Single Post-Demosaic Linearization: (DN - black) * invDenom ──
-    r = max((r - black) * invDenom, 0.0f);
-    g = max((g - black) * invDenom, 0.0f);
-    b = max((b - black) * invDenom, 0.0f);
-
-    // Gr/Gb green balance before LSC/WB.
-    g *= params.greenBalance;
-
-    // Fast Lens Shading Correction (LSC): true cos⁴θ optical inverse model
-    float outW = float(outTexture.get_width());
-    float outH = float(outTexture.get_height());
-    float dx = float(x) + 0.5f - 0.5f * outW;
-    float dy = float(y) + 0.5f - 0.5f * outH;
-    float invCornerDistSq = 4.0f / max(outW * outW + outH * outH, 1e-4f);
-    float rNormSq = (dx * dx + dy * dy) * invCornerDistSq;
-
-    // Exact cos⁴θ inverse gain: (1.0 + alpha * rNormSq)^2
-    float3 alphaGain = float3(lsc.radialR, lsc.radialG, lsc.radialB);
-    float3 baseGain = float3(1.0f) + alphaGain * rNormSq;
-    float3 gain = baseGain * baseGain;
-    if (lsc.radial4R != 0.0f || lsc.radial4G != 0.0f || lsc.radial4B != 0.0f) {
-        gain += float3(lsc.radial4R, lsc.radial4G, lsc.radial4B) * (rNormSq * rNormSq);
-    }
-    if (lsc.azimuthR != 0.0f || lsc.azimuthG != 0.0f || lsc.azimuthB != 0.0f) {
-        float cos2Theta = (dx * dx - dy * dy) / max(dx * dx + dy * dy, 1e-6f);
-        gain += float3(lsc.azimuthR, lsc.azimuthG, lsc.azimuthB) * cos2Theta;
-    }
-    float3 rgb = min(float3(r, g, b) * gain, float3(8.0f));
-
-    // ── White Balance ──
-    rgb *= params.wbGains;
-    rgb = max(rgb, float3(0.0));
-
-    // ── Color Correction Matrix (Sensor Native → Target Gamut e.g. BT.2020) ──
-    rgb = colorMatrix * rgb;
-    rgb = max(rgb, float3(0.0));
-
-    // Clipping flag on raw demosaiced values (sensor saturation)
-    bool isClipped = (r >= 0.98 || g >= 0.98 || b >= 0.98);
-    float alpha = isClipped ? 0.0 : 1.0;
-
-    // Output scene-linear RGB (NO log curve)
-    outTexture.write(float4(rgb, alpha), gid);
-}
 
 // ──────────────────────────────────────────────────────────────────────
 // FUSED: demosaic + LSC + WB + CCM + Log OETF in ONE kernel.
-// Used for 4K recording, OpenGate fast path, and live viewfinder preview
-// when spatial/chroma denoise is bypassed. Eliminates 1 full GPU pass
-// and ~196 MB/frame of intermediate memory traffic.
+// Used for all recording and live viewfinder preview paths.
+// Eliminates intermediate passes and ~196 MB/frame of memory traffic.
 // ──────────────────────────────────────────────────────────────────────
 kernel void debayerFusedLog(
     texture2d<float, access::read>  rawTexture [[texture(0)]],
@@ -469,9 +350,18 @@ kernel void debayerFusedLog(
     rgb = colorMatrix * rgb;
     rgb = max(rgb, float3(0.0));
 
-    // Clipping flag on raw demosaiced values (sensor saturation)
-    bool isClipped = (r >= 0.98 || g >= 0.98 || b >= 0.98);
-    float alpha = isClipped ? 0.0 : 1.0;
+    // Clipping flag and smooth highlight desaturation on raw demosaiced photosites (sensor saturation)
+    // Evaluated on native sensor DNs before LSC/WB so that lens vignetting gains never bleach corner colors.
+    float rawPeak = max(r, max(g, b));
+    bool isClipped = (rawPeak >= 0.98f);
+    float alpha = isClipped ? 0.0f : 1.0f;
+
+    if (rawPeak >= 0.92f) {
+        float u = clamp((rawPeak - 0.92f) * 12.5f, 0.0f, 1.0f);
+        float desat = u * u * (3.0f - 2.0f * u);
+        float luma = dot(rgb, float3(0.2627f, 0.6780f, 0.0593f));
+        rgb = mix(rgb, float3(luma), desat);
+    }
 
     // ── Direct Log OETF Encoding ──
     float3 logRGB = encodeLogCurve(rgb, params.curveType, params.headroomScale);
@@ -573,9 +463,11 @@ kernel void convertRgbTo420YpCbCr10(
         }
     }
 
-    // 4:2:0 Box-filtered chroma:
-    float3 avgRGB = 0.25f * (p00 + p10 + p01 + p11);
-    float avgY = 0.25f * (y00 + y10 + y01 + y11);
+    // ITU-R BT.2020 / HEVC Type 0 horizontally left-cosited chroma sampling:
+    // Aligns chroma phase with the left luma column (x = 0, y = 0.5) to eliminate
+    // 0.5-pixel color fringing on high-contrast vertical transitions.
+    float3 avgRGB = 0.375f * (p00 + p01) + 0.125f * (p10 + p11);
+    float avgY = 0.375f * (y00 + y01) + 0.125f * (y10 + y11);
     float cb = (avgRGB.b - avgY) * kInvChromaB;
     float cr = (avgRGB.r - avgY) * kInvChromaR;
 
@@ -626,13 +518,18 @@ kernel void unsharpMaskAdaptive(
     ) * (1.0f / 16.0f);
 
     float3 highPass = center.rgb - blur;
-    float detailLuma = abs(dot(highPass, float3(0.2126f, 0.7152f, 0.0722f)));
+    float detailLuma = abs(dot(highPass, float3(0.2627f, 0.6780f, 0.0593f)));
 
     // Adaptive coring: only sharpen true edge detail, not low-amplitude shadow noise
     float coringThreshold = 0.006f;
     float coringFactor = smoothstep(0.001f, coringThreshold, detailLuma);
 
-    float3 sharpened = center.rgb + highPass * (strength * coringFactor);
+    // Suppress sharpening in deep shadows where the log transfer function has high derivative
+    // to prevent noise floor amplification, while delivering crisp cinema sharpness to midtones and highlights.
+    float centerLuma = dot(center.rgb, float3(0.2627f, 0.6780f, 0.0593f));
+    float shadowMask = smoothstep(0.18f, 0.38f, centerLuma);
+
+    float3 sharpened = center.rgb + highPass * (strength * coringFactor * shadowMask);
     sharpened = max(sharpened, float3(0.0f));
 
     outTexture.write(float4(sharpened, center.a), gid);
@@ -738,11 +635,13 @@ fragment float4 displayFragment(
         }
         rgb709 = max(rgb709, float3(0.0));
 
-        // Filmic tone mapping (Reinhard with highlight shoulder)
-        rgb709 = rgb709 / (rgb709 + 1.0f) * 1.15f;
-
-        // sRGB gamma approximation for display
-        finalColor = metal::pow(saturate(rgb709), float3(1.0f / 2.2f));
+        // Calibrated cinema display tone curve (Hill/ACES fitted filmic response):
+        // Maps 18% middle gray (0.18) -> ~41% display IRE, 90% diffuse white (0.90) -> ~88% display IRE,
+        // with smooth highlight shoulder rolling off specular highlights to 100% display IRE.
+        float3 a = rgb709 * (rgb709 + 0.0245786f) - 0.000090537f;
+        float3 b = rgb709 * (0.983729f * rgb709 + 0.4329510f) + 0.238081f;
+        float3 mapped = saturate(a / max(b, 1e-4f));
+        finalColor = metal::pow(mapped, float3(1.0f / 2.2f));
     }
 
     // ── Cinema Diagonal Zebra Stripes for Highlight Clipping ──
@@ -762,7 +661,7 @@ fragment float4 displayFragment(
         // Tight single-pixel sampling at source texture resolution ensures
         // only razor-sharp high spatial frequency transitions are captured.
         float2 texel = 1.0f / float2(tex.get_width(), tex.get_height());
-        constexpr float3 lumaW = float3(0.2126f, 0.7152f, 0.0722f);
+        constexpr float3 lumaW = float3(0.2627f, 0.6780f, 0.0593f);
 
         float tl = dot(tex.sample(s, uv + float2(-texel.x, -texel.y)).rgb, lumaW);
         float tc = dot(tex.sample(s, uv + float2( 0.0f,    -texel.y)).rgb, lumaW);
@@ -777,9 +676,13 @@ fragment float4 displayFragment(
         float gy = (bl + 2.0f * bc + br) - (tl + 2.0f * tc + tr);
         float edgeMag = length(float2(gx, gy));
 
+        // Normalize edge magnitude by local luminance to compensate for log compression in highlights
+        float localLuma = max(tc, 0.10f);
+        float normEdge = edgeMag / localLuma;
+
         // Minimalist threshold: rejects surfaces, soft gradients, and noise,
         // delivering delicate hairline outlines strictly on critical focus edges.
-        float peakStrength = smoothstep(0.065f, 0.160f, edgeMag);
+        float peakStrength = smoothstep(0.08f, 0.24f, normEdge);
         peakAlpha = peakStrength * peakStrength * 0.85f;
     }
 
@@ -789,11 +692,11 @@ fragment float4 displayFragment(
         float overlayAlpha = 0.0f;
 
         if (zebraAlpha > 0.0f) {
-            overlayRGB = zebraColor;
+            overlayRGB = zebraColor * zebraAlpha;
             overlayAlpha = zebraAlpha;
         }
         if (peakAlpha > 0.0f) {
-            overlayRGB = mix(overlayRGB, peakColor, peakAlpha);
+            overlayRGB = mix(overlayRGB, peakColor * peakAlpha, peakAlpha);
             overlayAlpha = max(overlayAlpha, peakAlpha);
         }
         return float4(overlayRGB, overlayAlpha);
@@ -810,520 +713,6 @@ fragment float4 displayFragment(
     return float4(finalColor, 1.0f);
 }
 
-// ──────────────────────────────────────────────────────────────────────
-// PHASE 3: CHROMA BILATERAL DENOISING
-// ──────────────────────────────────────────────────────────────────────
-
-static inline float3 rgb2yuv(float3 rgb) {
-    float y  = dot(rgb, float3(0.2627f, 0.6780f, 0.0593f));
-    float u  = (rgb.b - y) / 1.8814f + 0.5f;
-    float v  = (rgb.r - y) / 1.4746f + 0.5f;
-    return float3(y, u, v);
-}
-
-static inline float3 yuv2rgb(float3 yuv) {
-    float y  = yuv.x;
-    float u  = yuv.y - 0.5f;
-    float v  = yuv.z - 0.5f;
-    float r  = y + 1.4746f * v;
-    float b  = y + 1.8814f * u;
-    float g  = (y - 0.2627f * r - 0.0593f * b) / 0.6780f;
-    return float3(r, g, b);
-}
-
-// ──────────────────────────────────────────────────────────────────────
-// SPATIAL DENOISING (Linear Space)
-// Bilateral filter on luma with ISO-adaptive strength.
-// Operates before log curve for better noise statistics.
-// ──────────────────────────────────────────────────────────────────────
-
-struct DenoiseParams {
-    float iso;
-    int   radius;
-    float shotCoeff;
-    float readCoeff;
-    float strength;  // 0.0–1.0 adaptive boost from frame-time budget
-};
-
-struct RingTemporalParams {
-    float iso;
-    float maxBlend;
-    int   slotCount;
-    int   validSlots;
-    int   chromaW;
-    int   chromaH;
-    int   cursor;
-    float lambda;
-    float shotCoeff;
-    float readCoeff;
-};
-
-kernel void spatialDenoise(
-    texture2d<float, access::read>  inTexture [[texture(0)]],
-    texture2d<float, access::write> outTexture [[texture(1)]],
-    texture2d<float, access::read>  statsTexture [[texture(2)]],
-    constant DenoiseParams &params [[buffer(0)]],
-    uint2 gid [[thread_position_in_grid]])
-{
-    if (gid.x >= outTexture.get_width() || gid.y >= outTexture.get_height()) return;
-    
-    float4 centerPx = inTexture.read(gid);
-    float3 centerRGB = centerPx.rgb;
-    float3 centerYUV = rgb2yuv(centerRGB);
-    
-    float iso = max(params.iso, 33.0);
-    int radius = params.radius;
-    float maxDist2 = float(radius * radius);
-    
-    // ISO-adaptive sigma values (tuned for linear-space data)
-    // Calibrated path: use measured shot/read coefficients when available.
-    // Fallback: sqrt(iso/33) heuristic.
-    float isoScale = sqrt(iso / 33.0);
-    float sigmaRef;  // noise std-dev at mid-gray reference signal (0.5)
-    if (params.shotCoeff > 0.0) {
-        sigmaRef = sqrt(params.shotCoeff * 0.5 + params.readCoeff);
-    } else {
-        sigmaRef = 0.012 * isoScale;  // legacy hardcoded proxy
-    }
-    float luma01 = saturate(centerYUV.x);
-
-    // Per-pixel local-sigma guide: stronger denoise where local variance is low,
-    // lighter denoise on edges/high-variance regions. Falls back to signal-based
-    // shadowBoost at 4K where the stats pass is skipped.
-    float shadowBoost;
-    if (statsTexture.get_width() > 1) {
-        float localSigma = max(statsTexture.read(gid).y, 1e-4);
-        shadowBoost = clamp(localSigma / sigmaRef, 0.5, 2.0);
-    } else {
-        shadowBoost = mix(1.45, 0.8, luma01);
-    }
-
-    // Luma bilateral radius: sigmaRef * shadowBoost, scaled by adaptive strength.
-    // strength=0 → normal sigma; strength=1 → 2× sigma (heavier denoise when
-    // frame time is well under budget). Clamped to prevent pathological values.
-    float adaptiveScale = 1.0 + min(max(params.strength, 0.0), 1.0);
-    float lumaRS = sigmaRef * shadowBoost * adaptiveScale;
-    float lumaRS2 = lumaRS * lumaRS;
-    
-    // Spatial sigma adapts to kernel radius
-    float spatialS2 = float(radius) * float(radius) * 0.5;
-    
-    int w = inTexture.get_width();
-    int h = inTexture.get_height();
-    int cx = int(gid.x);
-    int cy = int(gid.y);
-    
-    float sumLuma = 0.0;
-    float sumLumaW = 0.0;
-    
-    for (int dy = -radius; dy <= radius; dy++) {
-        for (int dx = -radius; dx <= radius; dx++) {
-            float dist2 = float(dx*dx + dy*dy);
-            if (dist2 > maxDist2) continue; // Diamond pattern
-            
-            uint2 pid = uint2(clamp(cx + dx, 0, w - 1), clamp(cy + dy, 0, h - 1));
-            float3 sRGB = inTexture.read(pid).rgb;
-            float sY = dot(sRGB, float3(0.2627f, 0.6780f, 0.0593f));
-            
-            float spatialW = exp(-dist2 / (2.0 * spatialS2));
-            float lumaDiff = sY - centerYUV.x;
-            
-            // Luma bilateral: edge-stopped by luma difference (tight threshold)
-            float lumaW = spatialW * exp(-(lumaDiff * lumaDiff) / (2.0 * lumaRS2));
-            sumLumaW += lumaW;
-            sumLuma += sY * lumaW;
-            // NOTE: Chroma is NOT smoothed here. The dedicated half-res chroma
-            // pipeline (extractHalfResChroma -> denoiseHalfResChroma -> recombine)
-            // handles all chroma denoising. Any chroma work in this pass would
-            // be discarded by the recombine kernel which reads UV exclusively
-            // from chromaDenoisedOut.
-        }
-    }
-    
-    float finalY = (sumLumaW > 1e-4) ? (sumLuma / sumLumaW) : centerYUV.x;
-    float3 finalRGB = max(yuv2rgb(float3(finalY, centerYUV.y, centerYUV.z)), float3(0.0));
-    outTexture.write(float4(finalRGB, centerPx.a), gid);
-}
-
-kernel void extractHalfResChroma(
-    texture2d<float, access::read>  inTexture [[texture(0)]],
-    texture2d<float, access::write> outTexture [[texture(1)]],
-    uint2 gid [[thread_position_in_grid]])
-{
-    if (gid.x >= outTexture.get_width() || gid.y >= outTexture.get_height()) return;
-
-    int w = int(inTexture.get_width());
-    int h = int(inTexture.get_height());
-    int baseX = int(gid.x) * 2;
-    int baseY = int(gid.y) * 2;
-
-    float2 sumUV = float2(0.0);
-    float count = 0.0;
-    for (int dy = 0; dy < 2; dy++) {
-        for (int dx = 0; dx < 2; dx++) {
-            int sx = baseX + dx;
-            int sy = baseY + dy;
-            if (sx >= w || sy >= h) continue;
-            sumUV += rgb2yuv(inTexture.read(uint2(sx, sy)).rgb).yz;
-            count += 1.0;
-        }
-    }
-
-    float2 uv = (count > 0.0) ? (sumUV / count) : float2(0.5);
-    outTexture.write(float4(uv.x, uv.y, 0.0, 1.0), gid);
-}
-
-kernel void denoiseHalfResChroma(
-    texture2d<float, access::read>  chromaTexture [[texture(0)]],
-    texture2d<float, access::read>  lumaGuideTexture [[texture(1)]],
-    texture2d<float, access::write> outTexture [[texture(2)]],
-    texture2d<float, access::read>  statsTexture [[texture(3)]],
-    constant DenoiseParams &params [[buffer(0)]],
-    uint2 gid [[thread_position_in_grid]])
-{
-    if (gid.x >= outTexture.get_width() || gid.y >= outTexture.get_height()) return;
-
-    float iso = max(params.iso, 33.0);
-    float isoScale = sqrt(iso / 33.0);
-    // Use a slightly wider chroma radius because chroma noise is coarser than luma.
-    int radius = params.radius + 1;
-    float maxDist2 = float(radius * radius);
-    float spatialS2 = float(radius) * float(radius) * 0.5;
-
-    int chromaW = int(chromaTexture.get_width());
-    int chromaH = int(chromaTexture.get_height());
-    int guideW = int(lumaGuideTexture.get_width());
-    int guideH = int(lumaGuideTexture.get_height());
-    int cx = int(gid.x);
-    int cy = int(gid.y);
-
-    int centerGuideX = clamp(cx * 2 + 1, 0, guideW - 1);
-    int centerGuideY = clamp(cy * 2 + 1, 0, guideH - 1);
-    float3 centerGuideRGB = lumaGuideTexture.read(uint2(centerGuideX, centerGuideY)).rgb;
-    float centerY = dot(centerGuideRGB, float3(0.2627f, 0.6780f, 0.0593f));
-    float luma01 = saturate(centerY);
-    // Calibrated chroma sigma: use measured coefficients when available.
-    float chromaSigmaRef;
-    if (params.shotCoeff > 0.0) {
-        chromaSigmaRef = sqrt(params.shotCoeff * 0.5 + params.readCoeff);
-    } else {
-        chromaSigmaRef = 0.045 * isoScale;
-    }
-    float shadowBoost;
-    if (statsTexture.get_width() > 1) {
-        uint2 statsCoord = uint2(
-            min(uint(centerGuideX), uint(statsTexture.get_width())  - 1),
-            min(uint(centerGuideY), uint(statsTexture.get_height()) - 1));
-        float localSigma = max(statsTexture.read(statsCoord).y, 1e-4);
-        shadowBoost = clamp(localSigma / chromaSigmaRef, 0.5, 2.0);
-    } else {
-        shadowBoost = mix(1.55, 0.9, luma01);
-    }
-    float chromaRS = chromaSigmaRef * shadowBoost * (1.0 + min(max(params.strength, 0.0), 1.0));
-    float chromaRS2 = chromaRS * chromaRS;
-
-    float2 sumUV = float2(0.0);
-    float sumW = 0.0;
-    for (int dy = -radius; dy <= radius; dy++) {
-        for (int dx = -radius; dx <= radius; dx++) {
-            float dist2 = float(dx * dx + dy * dy);
-            if (dist2 > maxDist2) continue;
-
-            int px = clamp(cx + dx, 0, chromaW - 1);
-            int py = clamp(cy + dy, 0, chromaH - 1);
-            int guideX = clamp(px * 2 + 1, 0, guideW - 1);
-            int guideY = clamp(py * 2 + 1, 0, guideH - 1);
-            float3 sampleRGB = lumaGuideTexture.read(uint2(guideX, guideY)).rgb;
-            float sampleY = dot(sampleRGB, float3(0.2627f, 0.6780f, 0.0593f));
-            float lumaDiff = sampleY - centerY;
-            float spatialW = exp(-dist2 / (2.0 * spatialS2));
-            float chromaWgt = spatialW * exp(-(lumaDiff * lumaDiff) / (2.0 * chromaRS2));
-
-            sumUV += chromaTexture.read(uint2(px, py)).rg * chromaWgt;
-            sumW += chromaWgt;
-        }
-    }
-
-    float2 centerUV = chromaTexture.read(gid).rg;
-    float2 finalUV = (sumW > 1e-4) ? (sumUV / sumW) : centerUV;
-    outTexture.write(float4(finalUV.x, finalUV.y, 0.0, 1.0), gid);
-}
-
-kernel void estimateLumaVariance(
-    texture2d<float, access::read>  lumaIn   [[texture(0)]],
-    texture2d<float, access::write> statsOut [[texture(1)]],
-    uint2 gid [[thread_position_in_grid]])
-{
-    if (gid.x >= statsOut.get_width() || gid.y >= statsOut.get_height()) return;
-
-    int maxW = int(lumaIn.get_width()) - 1;
-    int maxH = int(lumaIn.get_height()) - 1;
-    int gx = int(gid.x);
-    int gy = int(gid.y);
-
-    float sum = 0.0f, sum2 = 0.0f;
-    for (int dy = -1; dy <= 1; dy++) {
-        int sy = clamp(gy + dy, 0, maxH);
-        for (int dx = -1; dx <= 1; dx++) {
-            int sx = clamp(gx + dx, 0, maxW);
-            float y = rgb2yuv(lumaIn.read(uint2(sx, sy)).rgb).x;
-            sum  += y;
-            sum2 += y * y;
-        }
-    }
-    constexpr float kInv9 = 1.0f / 9.0f;
-    float mean = sum * kInv9;
-    float variance = max(sum2 * kInv9 - mean * mean, 0.0f);
-    float sigma = sqrt(variance);
-    statsOut.write(float4(mean, sigma, 0.0f, 1.0f), gid);
-}
-
-static inline float2 readChromaClamped(texture2d<float, access::read> chromaTexture, int x, int y) {
-    int w = int(chromaTexture.get_width());
-    int h = int(chromaTexture.get_height());
-    return chromaTexture.read(uint2(clamp(x, 0, w - 1), clamp(y, 0, h - 1))).rg;
-}
-
-kernel void recombineLumaWithHalfResChroma(
-    texture2d<float, access::read>  lumaTexture [[texture(0)]],
-    texture2d<float, access::read>  chromaTexture [[texture(1)]],
-    texture2d<float, access::write> outTexture [[texture(2)]],
-    uint2 gid [[thread_position_in_grid]])
-{
-    if (gid.x >= outTexture.get_width() || gid.y >= outTexture.get_height()) return;
-
-    float4 lumaPx = lumaTexture.read(gid);
-    float y = dot(lumaPx.rgb, float3(0.2627f, 0.6780f, 0.0593f));
-
-    float2 chromaCoord = (float2(gid) + 0.5) * 0.5 - 0.5;
-    int2 p0 = int2(floor(chromaCoord));
-    float2 f = fract(chromaCoord);
-
-    float2 uv00 = readChromaClamped(chromaTexture, p0.x,     p0.y);
-    float2 uv10 = readChromaClamped(chromaTexture, p0.x + 1, p0.y);
-    float2 uv01 = readChromaClamped(chromaTexture, p0.x,     p0.y + 1);
-    float2 uv11 = readChromaClamped(chromaTexture, p0.x + 1, p0.y + 1);
-
-    float2 uv0 = mix(uv00, uv10, f.x);
-    float2 uv1 = mix(uv01, uv11, f.x);
-    float2 uv = mix(uv0, uv1, f.y);
-
-    float3 rgb = max(yuv2rgb(float3(y, uv.x, uv.y)), float3(0.0));
-    outTexture.write(float4(rgb, lumaPx.a), gid);
-}
-
-
-// ──────────────────────────────────────────────────────────────────────
-// TEMPORAL DENOISE — RING BUFFER (N-slot weighted average)
-// texture(0) = current (full-res RGBA)
-// texture(1) = output   (full-res RGBA)
-// texture(2) = lumaHistory   (full-res 2D-array RGBA)
-// texture(3) = chromaHistory  (half-res 2D-array RG16Float)
-// buffer(0) = RingTemporalParams
-// Dispatched at full luma resolution; chroma history is read at half-res coordinates.
-// ──────────────────────────────────────────────────────────────────────
-
-kernel void temporalDenoiseRing(
-    texture2d<float, access::read>  currentTexture [[texture(0)]],
-    texture2d<float, access::write> outTexture     [[texture(1)]],
-    texture2d_array<float, access::read> lumaHistory   [[texture(2)]],
-    texture2d_array<float, access::read> chromaHistory  [[texture(3)]],
-    constant RingTemporalParams &params [[buffer(0)]],
-    device const float* globalMotionMetric [[buffer(1)]],
-    uint2 gid [[thread_position_in_grid]])
-{
-    if (gid.x >= outTexture.get_width() || gid.y >= outTexture.get_height()) return;
-
-    float4 currentPx = currentTexture.read(gid);
-
-    // If global motion is high, skip temporal blending entirely for this frame.
-    // Threshold 0.02 catches moderate camera pans and partial-frame motion.
-    if (globalMotionMetric != nullptr && *globalMotionMetric > 0.02) {
-        outTexture.write(currentPx, gid);
-        return;
-    }
-    float3 currentYUV = rgb2yuv(currentPx.rgb);
-
-    float iso = max(params.iso, 33.0);
-    float isoScale = sqrt(iso / 33.0);
-    float luma01 = saturate(currentYUV.x);
-    // Tighten the shadow/highlight boost so the motion threshold is smaller; small
-    // frame-to-frame differences then register as motion and do not get averaged.
-    float shadowBoost = mix(1.0, 0.65, luma01);
-
-    float sigmaRef = (params.shotCoeff > 0.0)
-        ? sqrt(params.shotCoeff * 0.5 + params.readCoeff)
-        : 0.01 * isoScale;
-    // Tighten motion thresholds so small frame-to-frame differences register as motion
-    // and do not get averaged into ghost trails.
-    float lumaThreshold   = max(sigmaRef * shadowBoost, 1e-5);
-    float chromaThreshold = max(sigmaRef * 1.5 * shadowBoost, 1e-5);
-
-    float totalWeight = 1.0;
-    float3 weightedRGB = currentPx.rgb;
-
-    int lumaW = int(lumaHistory.get_width());
-    int lumaH = int(lumaHistory.get_height());
-
-    for (int i = 0; i < params.slotCount; i++) {
-        if (i >= params.validSlots) break;
-
-        // Newest slot is (cursor - 1) mod slotCount; oldest is cursor.
-        int slot = (int(params.cursor) - 1 - i + params.slotCount) % params.slotCount;
-
-        // Luma history at full resolution
-        uint2 lumaCoord = uint2(
-            clamp(int(gid.x), 0, lumaW - 1),
-            clamp(int(gid.y), 0, lumaH - 1));
-        float histY = lumaHistory.read(lumaCoord, slot).r;
-
-        // Chroma history at half resolution — map full-res thread coords to half-res.
-        // The chroma ring stores half-resolution UV produced by averaging 2x2 full-res blocks.
-        uint2 chromaCoord = uint2(
-            min(uint(gid.x) / 2u, uint(params.chromaW - 1)),
-            min(uint(gid.y) / 2u, uint(params.chromaH - 1)));
-        float2 chromaUV = chromaHistory.read(chromaCoord, slot).rg;
-        float3 histYUV = float3(histY, chromaUV.x, chromaUV.y);
-
-        float lumaDiff   = abs(currentYUV.x - histYUV.x);
-        float chromaDiff = length(currentYUV.yz - histYUV.yz);
-
-        float lumaMotion   = saturate(lumaDiff / lumaThreshold);
-        float chromaMotion = saturate(chromaDiff / chromaThreshold);
-        float motion = max(lumaMotion, chromaMotion);
-
-        // i=0 newest gets λ^0 = 1; older slots decay (lambda^i).
-        // slotCount == 3 (validSlots <= 3), so i ∈ {0,1,2}: compute powers
-        // directly instead of pow() — GPU pow() expands to a costly
-        // fexp(flog(x)*y) per thread. This is numerically identical.
-        float recency;
-        if (i == 1) { recency = params.lambda; }
-        else if (i == 2) { recency = params.lambda * params.lambda; }
-        else { recency = 1.0f; }
-        float slotWeight = params.maxBlend * (1.0 - motion) * recency;
-        // Soft motion gate: smooth taper replaces hard binary cutoff to eliminate
-        // ghosting from threshold-edge content. At motion=0.15 the gate starts
-        // reducing weight, reaching zero by motion=0.35. This replaces the old
-        // motion > 0.25 hard gate which created visible ghosting on pixels that
-        // straddled the threshold between adjacent frames.
-        float motionGate = 1.0 - smoothstep(0.15, 0.35, motion);
-        slotWeight *= motionGate;
-        slotWeight = clamp(slotWeight, 0.0, 0.95);
-
-        // Reconstruct RGB from luma history Y and chroma history UV
-        float3 histRGB = max(yuv2rgb(histYUV), float3(0.0));
-        weightedRGB += histRGB * slotWeight;
-        totalWeight += slotWeight;
-    }
-
-    float3 result = weightedRGB / max(totalWeight, 1e-6);
-    outTexture.write(float4(max(result, float3(0.0)), currentPx.a), gid);
-}
-
-// ──────────────────────────────────────────────────────────────────────
-// GLOBAL MOTION ESTIMATE — coarse frame-to-frame luma difference metric.
-// texture(0) = current pre-temporal RGB
-// texture(1) = luma history array (newest slot is (cursor-1) mod slotCount)
-// buffer(0) = device float* where the metric is written
-// buffer(1) = cursor int
-// buffer(2) = slotCount int
-// Single-threaded 16x12 grid sampling to avoid atomics; metric is ~O(200) reads.
-// ──────────────────────────────────────────────────────────────────────
-
-kernel void estimateGlobalMotion(
-    texture2d<float, access::read> currentRGB [[texture(0)]],
-    texture2d_array<float, access::read> lumaHistory [[texture(1)]],
-    device float* motionMetric [[buffer(0)]],
-    constant int &cursor [[buffer(1)]],
-    constant int &slotCount [[buffer(2)]],
-    uint2 gid [[thread_position_in_grid]])
-{
-    // Single thread computes the metric to avoid atomics.
-    if (gid.x != 0 || gid.y != 0) return;
-
-    int w = int(currentRGB.get_width());
-    int h = int(currentRGB.get_height());
-    if (w <= 0 || h <= 0 || slotCount <= 0) {
-        *motionMetric = 0.0;
-        return;
-    }
-
-    int newestSlot = (cursor - 1 + slotCount) % slotCount;
-
-    const int gridW = 32;
-    const int gridH = 24;
-    float sumDiff = 0.0;
-    int count = 0;
-
-    for (int gy = 0; gy < gridH; gy++) {
-        for (int gx = 0; gx < gridW; gx++) {
-            int x = (w * gx) / gridW;
-            int y = (h * gy) / gridH;
-            uint2 coord = uint2(clamp(x, 0, w - 1), clamp(y, 0, h - 1));
-            float curY = dot(currentRGB.read(coord).rgb, float3(0.2627f, 0.6780f, 0.0593f));
-            float histY = lumaHistory.read(coord, newestSlot).r;
-            sumDiff += abs(curY - histY);
-            count++;
-        }
-    }
-
-    // Mean across all tiles. With a properly tuned threshold this catches
-    // both full-frame and partial motion adequately without expensive sorting.
-    *motionMetric = (count > 0) ? (sumDiff / float(count)) : 0.0;
-}
-
-// ──────────────────────────────────────────────────────────────────────
-// STORE CHROMA HISTORY — Extract half-res UV from full-res denoised RGB
-// for the temporal chroma ring buffer.
-// texture(0) = full-res denoised RGB input
-// texture(1) = half-res 2D-array UV output (chroma ring slot)
-// buffer(0) = StoreChromaParams { int slice; }
-// ──────────────────────────────────────────────────────────────────────
-
-struct StoreChromaParams {
-    int slice;
-};
-
-kernel void storeChromaHistory(
-    texture2d<float, access::read>  fullResRGB [[texture(0)]],
-    texture2d_array<float, access::write> halfResUVArray [[texture(1)]],
-    constant StoreChromaParams &params [[buffer(0)]],
-    uint2 gid [[thread_position_in_grid]])
-{
-    if (gid.x >= halfResUVArray.get_width() || gid.y >= halfResUVArray.get_height()) return;
-
-    int w = int(fullResRGB.get_width());
-    int h = int(fullResRGB.get_height());
-    int baseX = int(gid.x) * 2;
-    int baseY = int(gid.y) * 2;
-
-    float2 sumUV = float2(0.0);
-    float count = 0.0;
-    for (int dy = 0; dy < 2; dy++) {
-        for (int dx = 0; dx < 2; dx++) {
-            int sx = baseX + dx;
-            int sy = baseY + dy;
-            if (sx >= w || sy >= h) continue;
-            sumUV += rgb2yuv(fullResRGB.read(uint2(sx, sy)).rgb).yz;
-            count += 1.0;
-        }
-    }
-
-    float2 uv = (count > 0.0) ? (sumUV / count) : float2(0.5);
-    halfResUVArray.write(float4(uv.x, uv.y, 0.0, 1.0), gid, params.slice);
-}
-
-kernel void storeLumaHistory(
-    texture2d<float, access::read>  fullResRGB [[texture(0)]],
-    texture2d_array<float, access::write> lumaArray [[texture(1)]],
-    constant StoreChromaParams &params [[buffer(0)]],
-    uint2 gid [[thread_position_in_grid]])
-{
-    if (gid.x >= lumaArray.get_width() || gid.y >= lumaArray.get_height()) return;
-    float4 px = fullResRGB.read(gid);
-    float y = dot(px.rgb, float3(0.2627f, 0.6780f, 0.0593f));
-    lumaArray.write(float4(y, 0.0, 0.0, 1.0), gid, params.slice);
-}
 
 // ──────────────────────────────────────────────────────────────────────
 // HARDWARE BILINEAR CROP AND RESAMPLE

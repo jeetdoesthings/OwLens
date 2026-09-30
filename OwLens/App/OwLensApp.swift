@@ -17,7 +17,7 @@ struct RootView: View {
     @State private var showSilentModeWarning = false
     @State private var tapFocusPoint: CGPoint? = nil
     @State private var focusReticleOpacity: Double = 0
-    @State private var focusReticleScale: CGFloat = 1.3
+    @State private var focusReticleWorkItem: DispatchWorkItem? = nil
 
     var body: some View {
         ZStack {
@@ -66,42 +66,60 @@ struct RootView: View {
                         if let focusPt = tapFocusPoint {
                             cinemaFocusReticle
                                 .position(focusPt)
-                                .scaleEffect(focusReticleScale)
                                 .opacity(focusReticleOpacity)
                                 .allowsHitTesting(false)
                         }
                     }
                     .contentShape(Rectangle())
-                    .gesture(
-                        DragGesture(minimumDistance: 0)
-                            .onEnded { value in
-                                let loc = value.location
-                                guard videoRect.contains(loc) else { return }
-                                let x = (loc.x - videoRect.minX) / videoRect.width
-                                let y = (loc.y - videoRect.minY) / videoRect.height
-                                
-                                Haptics.impact(.medium)
-                                viewModel.setFocusPoint(CGPoint(x: x, y: y), lock: true)
-                                
-                                tapFocusPoint = loc
-                                focusReticleScale = 1.15
-                                focusReticleOpacity = 1.0
-                                
-                                withAnimation(.spring(response: 0.16, dampingFraction: 0.8)) {
-                                    focusReticleScale = 1.0
-                                }
-                                
-                                withAnimation(.easeOut(duration: 0.2).delay(1.5)) {
-                                    focusReticleOpacity = 0
-                                }
+                    .onTapGesture(count: 1, coordinateSpace: .local) { loc in
+                        if viewModel.activePanel != nil {
+                            withAnimation {
+                                viewModel.activePanel = nil
                             }
-                    )
+                            return
+                        }
+                        guard videoRect.contains(loc) else { return }
+                        let nx = (loc.x - videoRect.minX) / videoRect.width
+                        let ny = (loc.y - videoRect.minY) / videoRect.height
+
+                        let interfaceOrientation = UIApplication.shared.connectedScenes
+                            .compactMap { $0 as? UIWindowScene }
+                            .first?.interfaceOrientation ?? .landscapeRight
+
+                        let sensorX: CGFloat
+                        let sensorY: CGFloat
+                        if interfaceOrientation == .landscapeLeft {
+                            sensorX = ny
+                            sensorY = 1.0 - nx
+                        } else {
+                            sensorX = 1.0 - ny
+                            sensorY = nx
+                        }
+                        let clampedPoint = CGPoint(
+                            x: max(0.0, min(1.0, sensorX)),
+                            y: max(0.0, min(1.0, sensorY))
+                        )
+
+                        Haptics.impact(.medium)
+                        viewModel.setFocusPoint(clampedPoint, lock: true)
+
+                        tapFocusPoint = loc
+                        focusReticleWorkItem?.cancel()
+                        focusReticleOpacity = 1.0
+
+                        let work = DispatchWorkItem {
+                            withAnimation(.easeOut(duration: 0.25)) {
+                                focusReticleOpacity = 0
+                            }
+                        }
+                        focusReticleWorkItem = work
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.9, execute: work)
+                    }
                 }
                 .ignoresSafeArea()
 
-                // Interactive HUD Controls & Panels
+                // Interactive HUD Controls & Panels (docked to edges on iPad and iPhone)
                 ControlsView(viewModel: viewModel)
-                    .frame(maxWidth: UIDevice.current.userInterfaceIdiom == .pad ? 750 : .infinity)
                     .ignoresSafeArea(edges: .vertical)
             } else if viewModel.metalPipeline == nil {
                 metalUnavailableView
@@ -114,17 +132,28 @@ struct RootView: View {
             if showSilentModeWarning {
                 VStack {
                     Spacer()
-                    HStack(spacing: 6) {
+                    HStack(spacing: 8) {
                         Image(systemName: "bell.slash.fill")
                             .font(.system(size: 11, weight: .medium))
-                        Text("Mute your device for silent recording shutter")
-                            .font(.geist(.regular, size: 12))
+                        Text("Mute device for silent recording shutter")
+                            .font(.appFont(.regular, size: 12))
+                        Button {
+                            withAnimation {
+                                showSilentModeWarning = false
+                            }
+                        } label: {
+                            Image(systemName: "xmark")
+                                .font(.system(size: 10, weight: .bold))
+                                .foregroundColor(OwLensTheme.textSecondary)
+                                .padding(4)
+                        }
+                        .buttonStyle(.plain)
                     }
                     .foregroundColor(OwLensTheme.textPrimary)
                     .padding(.vertical, 8)
-                    .padding(.horizontal, 16)
+                    .padding(.horizontal, 14)
                     .glassPanel(cornerRadius: OwLensTheme.radiusCard, border: OwLensTheme.glassBorderActive, background: OwLensTheme.glassBaseHeavy)
-                    .padding(.bottom, 80)
+                    .padding(.bottom, 72)
                 }
                 .transition(.move(edge: .bottom).combined(with: .opacity))
                 .zIndex(5)
@@ -139,7 +168,7 @@ struct RootView: View {
                     withAnimation {
                         showSilentModeWarning = true
                     }
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 4.0) {
                         withAnimation {
                             showSilentModeWarning = false
                         }
@@ -155,13 +184,12 @@ struct RootView: View {
     // MARK: - Focus Reticle View
 
     private var cinemaFocusReticle: some View {
-        let isLocked = viewModel.isFocusLocked
         let reticleColor = Color.white
-        let bracketLen: CGFloat = 7
-        let size: CGFloat = 44
+        let bracketLen: CGFloat = 8
+        let size: CGFloat = 46
 
         return ZStack {
-            // 4 Corner brackets
+            // 4 Corner brackets with drop shadow
             Path { path in
                 // Top-Left
                 path.move(to: CGPoint(x: 0, y: bracketLen))
@@ -183,21 +211,20 @@ struct RootView: View {
                 path.addLine(to: CGPoint(x: size, y: size))
                 path.addLine(to: CGPoint(x: size, y: size - bracketLen))
             }
-            .stroke(reticleColor.opacity(0.9), lineWidth: 0.75)
-            .shadow(color: .black.opacity(0.5), radius: 1, x: 0, y: 0)
+            .stroke(reticleColor, lineWidth: 1.25)
+            .shadow(color: .black.opacity(0.8), radius: 1.5, x: 0, y: 0.5)
             .frame(width: size, height: size)
 
-            // AF LOCK badge if locked
-            if isLocked {
-                Text("LOCK")
-                    .font(.geistMono(.semiBold, size: 7))
-                    .foregroundColor(.black)
-                    .padding(.horizontal, 4)
-                    .padding(.vertical, 1.5)
-                    .background(Color.white.opacity(0.9))
-                    .clipShape(RoundedRectangle(cornerRadius: 2, style: .continuous))
-                    .offset(y: -size / 2 - 9)
-            }
+            // AF LOCK badge illuminated in White
+            Text("LOCK")
+                .font(.appMono(.bold, size: 7.5))
+                .foregroundColor(.black)
+                .padding(.horizontal, 4.5)
+                .padding(.vertical, 1.5)
+                .background(Color.white)
+                .clipShape(RoundedRectangle(cornerRadius: 2.5, style: .continuous))
+                .shadow(color: .black.opacity(0.6), radius: 1.5, x: 0, y: 0.5)
+                .offset(y: -size / 2 - 10)
         }
     }
 
@@ -225,13 +252,28 @@ struct RootView: View {
                 .font(.system(size: 40))
                 .foregroundColor(OwLensTheme.textMuted)
             Text("Camera Access Required")
-                .font(.geist(.semiBold, size: 20))
+                .font(.appFont(.semiBold, size: 20))
                 .foregroundColor(.white)
             Text("OwLens requires camera permission to capture uncompressed Bayer RAW sensor streams.")
-                .font(.geist(.regular, size: 13))
+                .font(.appFont(.regular, size: 13))
                 .foregroundColor(OwLensTheme.textSecondary)
                 .multilineTextAlignment(.center)
                 .padding(.horizontal, 40)
+
+            Button {
+                if let url = URL(string: UIApplication.openSettingsURLString) {
+                    UIApplication.shared.open(url)
+                }
+            } label: {
+                Text("Open Settings")
+                    .font(.appFont(.semiBold, size: 13))
+                    .foregroundColor(.black)
+                    .padding(.horizontal, 18)
+                    .padding(.vertical, 9)
+                    .background(Capsule().fill(Color.white))
+            }
+            .buttonStyle(.plain)
+            .padding(.top, 4)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Color.black)
@@ -243,16 +285,16 @@ struct RootView: View {
                 .font(.system(size: 44))
                 .foregroundColor(OwLensTheme.recordingRed)
             Text("Device Not Supported for Log")
-                .font(.geist(.semiBold, size: 20))
+                .font(.appFont(.semiBold, size: 20))
                 .foregroundColor(.white)
             Text("Bayer RAW stills are required. This iPhone model does not expose a Bayer RAW sensor stream, so Log recording is unavailable.")
-                .font(.geist(.regular, size: 13))
+                .font(.appFont(.regular, size: 13))
                 .foregroundColor(OwLensTheme.textSecondary)
                 .multilineTextAlignment(.center)
                 .padding(.horizontal, 36)
             if let caps = viewModel.capabilities {
                 Text("\(caps.marketingName) · \(caps.machineIdentifier) · \(caps.chipTier.rawValue)")
-                    .font(.geistMono(.regular, size: 11))
+                    .font(.appMono(.regular, size: 11))
                     .foregroundColor(OwLensTheme.textMuted)
             }
         }
@@ -266,10 +308,10 @@ struct RootView: View {
                 .font(.largeTitle)
                 .foregroundColor(OwLensTheme.amberWarning)
             Text("Metal GPU Pipeline Unavailable")
-                .font(.geist(.semiBold, size: 20))
+                .font(.appFont(.semiBold, size: 20))
                 .foregroundColor(.white)
             Text("OwLens requires a physical device with Apple Silicon GPU support.")
-                .font(.geist(.regular, size: 13))
+                .font(.appFont(.regular, size: 13))
                 .foregroundColor(OwLensTheme.textSecondary)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)

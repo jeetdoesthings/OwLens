@@ -63,11 +63,6 @@ struct FusedParams {
     var headroomScale: Float
 }
 
-struct LogOnlyParams {
-    var curveType: Int32
-    var headroomScale: Float
-}
-
 struct LSCParams {
     var radialR: Float
     var radialG: Float
@@ -79,28 +74,7 @@ struct LSCParams {
     var azimuthG: Float
     var azimuthB: Float
 }
-struct DenoiseParams {
-    var iso: Float
-    var radius: Int32
-    var shotCoeff: Float
-    var readCoeff: Float
-    var strength: Float  // 0.0-1.0 adaptive denoise intensity
-}
-struct RingTemporalParams {
-    var iso: Float
-    var maxBlend: Float
-    var slotCount: Int32
-    var validSlots: Int32
-    var chromaW: Int32
-    var chromaH: Int32
-    var cursor: Int32
-    var lambda: Float
-    var shotCoeff: Float
-    var readCoeff: Float
-}
-struct StoreChromaParams {
-    var slice: Int32
-}
+
 struct CropParams {
     var scaleX: Float
     var scaleY: Float
@@ -115,38 +89,25 @@ enum ProcessingQuality {
     case recordQuality
 }
 
-/// Metal pipeline: Bayer → (optional CFA-safe phase-preserving 2× reduce) → linear debayer/WB
-/// → full-res luma denoise + half-res chroma denoise → temporal denoise → log OETF.
+/// Metal pipeline: Bayer → (optional CFA-safe phase-preserving 2× reduce) → (optional defect pixel correction)
+/// → fused debayer / LSC / WB / CCM / Log OETF → (optional crop & scale) → (optional unsharp mask)
+/// → 10-bit YCbCr 4:2:0 / BGRA encode.
 ///
-/// Legacy fused kernels are still compiled for fallback and experimentation.
+///   • Single-pass demosaic + optical LSC + WB + Log encoding eliminates intermediate passes and VRAM traffic
 ///   • Pre-allocated texture pool — zero per-frame allocations
-///   • Synchronous `waitUntilCompleted` only on final BGRA readback
+///   • Asynchronous GPU command buffer dispatch with zero CPU stalling
 final class MetalPipeline: @unchecked Sendable {
     let device: MTLDevice
     let commandQueue: MTLCommandQueue
     private let scopeCommandQueue: MTLCommandQueue
     private let binPipeline: MTLComputePipelineState
-    private let linearPipeline: MTLComputePipelineState
-    private let denoisePipeline: MTLComputePipelineState
-    private let extractChromaPipeline: MTLComputePipelineState
-    private let denoiseChromaPipeline: MTLComputePipelineState
-    private let recombineChromaPipeline: MTLComputePipelineState
-    private let temporalRingPipeline: MTLComputePipelineState
-    private let storeChromaHistoryPipeline: MTLComputePipelineState
-    private let storeLumaHistoryPipeline: MTLComputePipelineState
-    private let globalMotionPipeline: MTLComputePipelineState
-    private let logOnlyPipeline: MTLComputePipelineState
     private let debayerFusedPipeline: MTLComputePipelineState
     private let convertFormatPipeline: MTLComputePipelineState
     private let convertYpCbCr10Pipeline: MTLComputePipelineState
     private let cropAndResamplePipeline: MTLComputePipelineState
     private let unsharpPipeline: MTLComputePipelineState
-    private let lumaStatsPipeline: MTLComputePipelineState
     private let defectPixelPipeline: MTLComputePipelineState
     private var textureCache: CVMetalTextureCache?
-
-    // Global motion metric buffers (1 float per slot) used to skip temporal blending during motion.
-    private let motionMetricBuffers: [MTLBuffer]
 
     // ── Texture pool (avoids per-frame allocation, triple-buffered for concurrent in-flight frames) ──
     private let poolSlotCount = 3
@@ -159,55 +120,14 @@ final class MetalPipeline: @unchecked Sendable {
     private var pooledFusedTex: [MTLTexture?] = [nil, nil, nil]
     private var pooledFusedW: [Int] = [0, 0, 0]
     private var pooledFusedH: [Int] = [0, 0, 0]
-    
-    private var pooledLinearTex: [MTLTexture?] = [nil, nil, nil]
-    private var pooledLinearW: [Int] = [0, 0, 0]
-    private var pooledLinearH: [Int] = [0, 0, 0]
-    
-    private var pooledDenoisedTex: [MTLTexture?] = [nil, nil, nil]
-    private var pooledDenoisedW: [Int] = [0, 0, 0]
-    private var pooledDenoisedH: [Int] = [0, 0, 0]
 
     private var pooledSharpenTex: [MTLTexture?] = [nil, nil, nil]
     private var pooledSharpenW: [Int] = [0, 0, 0]
     private var pooledSharpenH: [Int] = [0, 0, 0]
 
-    private var pooledChromaRawTex: [MTLTexture?] = [nil, nil, nil]
-    private var pooledChromaRawW: [Int] = [0, 0, 0]
-    private var pooledChromaRawH: [Int] = [0, 0, 0]
-    private var pooledChromaDenoisedTex: [MTLTexture?] = [nil, nil, nil]
-    private var pooledChromaDenoisedW: [Int] = [0, 0, 0]
-    private var pooledChromaDenoisedH: [Int] = [0, 0, 0]
-    private var pooledChromaMergedTex: [MTLTexture?] = [nil, nil, nil]
-    private var pooledChromaMergedW: [Int] = [0, 0, 0]
-    private var pooledChromaMergedH: [Int] = [0, 0, 0]
-
     private var pooledCorrectedBayerTex: [MTLTexture?] = [nil, nil, nil]
     private var pooledCorrectedBayerW: [Int] = [0, 0, 0]
     private var pooledCorrectedBayerH: [Int] = [0, 0, 0]
-
-    private var pooledLumaStatsTex: [MTLTexture?] = [nil, nil, nil]
-    private var pooledLumaStatsW: [Int] = [0, 0, 0]
-    private var pooledLumaStatsH: [Int] = [0, 0, 0]
-
-    // Temporal ring buffer (N-slot history, per-channel resolution split)
-    private let temporalRingCapacity = 3
-    private var lumaHistoryArray: MTLTexture?
-    private var chromaHistoryArray: MTLTexture?
-    private var lumaHistoryW: Int = 0
-    private var lumaHistoryH: Int = 0
-    private var chromaHistoryW: Int = 0
-    private var chromaHistoryH: Int = 0
-    private var temporalRingCursor: Int = 0
-    private var temporalRingValidCount: Int = 0
-
-    // Local-sigma luma stats (full-res; skipped at 4K for performance)
-    private lazy var dummyStatsTex: MTLTexture? = {
-        let desc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rg16Float, width: 1, height: 1, mipmapped: false)
-        desc.usage = [.shaderRead]
-        desc.storageMode = .private
-        return device.makeTexture(descriptor: desc)
-    }()
 
     private var pooledScaleTex: [MTLTexture?] = [nil, nil, nil]
     private var pooledScaleW: [Int] = [0, 0, 0]
@@ -221,13 +141,13 @@ final class MetalPipeline: @unchecked Sendable {
     private var pixelBufferPoolH: Int = 0
     private var pixelBufferPoolFormat: OSType = 0
 
-    var curveType: LogCurveType = .appleLog2 {
+    var curveType: LogCurveType = .sLog3Approx {
         didSet {
-            headroomScale = LogCurve.defaultRMax(for: curveType)
+            headroomScale = 1.0
         }
     }
-    /// Scene reflectance headroom multiplier (1.0 for linear, 12.0 for Apple Log 2, 10.0 for S-Log3).
-    var headroomScale: Float = LogCurve.defaultRMax(for: .appleLog2)
+    /// Scene reflectance headroom multiplier (1.0 preserves exact standard scene reflectance).
+    var headroomScale: Float = 1.0
     var wbParams: WhiteBalanceParams = .identity
     var bayerPattern: Int32 = 0
     var blackLevel: Float = 0
@@ -248,76 +168,34 @@ final class MetalPipeline: @unchecked Sendable {
     /// Device thermal state for dynamic workload shedding (.serious / .critical).
     var thermalState: ProcessInfo.ThermalState = .nominal
 
-    /// Static denoise strength 0.0-1.0, set once per recording session by CameraViewModel
-    /// based on resolution, chip tier, and recording format. 0 = no spatial/chroma denoise,
-    /// 1 = maximum (2× sigma radius). Multiplies sigmaRef in bilateral kernels.
-    var denoiseStrength: Float = 0.5
     /// Adaptive edge sharpness strength (0.0 = off, 0.5 = natural cinema sharpness, 1.0 = sharp).
     var sharpnessStrength: Float = 0.5
-
-    /// Real-time frame-budget gate for the full denoise stack. The complete
-    /// spatial+chroma+temporal denoise (~11 full-res passes) only fits the 30 fps
-    /// CFR budget at small working resolutions; at ~3 MP it costs ~45 ms — which
-    /// is exactly the 0.5× ultrawide case and overruns the 33 ms/30 fps budget,
-    /// forcing the VideoWriter hold-fill (judder). This gate makes `process`
-    /// skip the spatial/chroma passes when the (binned) Bayer pixel count
-    /// exceeds the threshold — the same fallback 4K recording already gets via
-    /// `previewFast`. Raise on faster silicon, lower on slower chips.
-    private static let maxFullDenoisePixelsForRecord: Int = 2_000_000
 
     init?(customLibraryURL: URL? = nil) {
         guard let device = MTLCreateSystemDefaultDevice(),
               let queue = device.makeCommandQueue(),
               let library = customLibraryURL.flatMap({ try? device.makeLibrary(URL: $0) }) ?? device.makeDefaultLibrary(),
               let binFunc = library.makeFunction(name: "binBayerCFA"),
-              let linearFunc = library.makeFunction(name: "debayerWBLinear"),
-              let denoiseFunc = library.makeFunction(name: "spatialDenoise"),
-              let extractChromaFunc = library.makeFunction(name: "extractHalfResChroma"),
-              let denoiseChromaFunc = library.makeFunction(name: "denoiseHalfResChroma"),
-              let recombineChromaFunc = library.makeFunction(name: "recombineLumaWithHalfResChroma"),
-              let temporalRingFunc = library.makeFunction(name: "temporalDenoiseRing"),
-              let storeChromaFunc = library.makeFunction(name: "storeChromaHistory"),
-              let globalMotionFunc = library.makeFunction(name: "estimateGlobalMotion"),
-              let logOnlyFunc = library.makeFunction(name: "applyLogOnly"),
               let debayerFusedFunc = library.makeFunction(name: "debayerFusedLog"),
               let convertFormatFunc = library.makeFunction(name: "convertRgba16FloatToBgra8"),
               let convertYpCbCr10Func = library.makeFunction(name: "convertRgbTo420YpCbCr10"),
-              let lumaStatsFunc = library.makeFunction(name: "estimateLumaVariance"),
               let defectPixelFunc = library.makeFunction(name: "correctDefectPixelsBayer"),
-              let storeLumaHistoryFunc = library.makeFunction(name: "storeLumaHistory"),
               let unsharpFunc = library.makeFunction(name: "unsharpMaskAdaptive"),
               let cropAndResampleFunc = library.makeFunction(name: "cropAndResampleBilinear") else {
             return nil
-        }
-        var mBuffers: [MTLBuffer] = []
-        for _ in 0..<3 {
-            guard let b = device.makeBuffer(length: MemoryLayout<Float>.stride, options: .storageModeShared) else { return nil }
-            mBuffers.append(b)
         }
         guard let scopeQueue = device.makeCommandQueue() else { return nil }
         self.device = device
         self.commandQueue = queue
         self.scopeCommandQueue = scopeQueue
-        self.motionMetricBuffers = mBuffers
         do {
             self.binPipeline = try device.makeComputePipelineState(function: binFunc)
-            self.linearPipeline = try device.makeComputePipelineState(function: linearFunc)
             self.unsharpPipeline = try device.makeComputePipelineState(function: unsharpFunc)
-            self.denoisePipeline = try device.makeComputePipelineState(function: denoiseFunc)
-            self.extractChromaPipeline = try device.makeComputePipelineState(function: extractChromaFunc)
-            self.denoiseChromaPipeline = try device.makeComputePipelineState(function: denoiseChromaFunc)
-            self.recombineChromaPipeline = try device.makeComputePipelineState(function: recombineChromaFunc)
-            self.temporalRingPipeline = try device.makeComputePipelineState(function: temporalRingFunc)
-            self.storeChromaHistoryPipeline = try device.makeComputePipelineState(function: storeChromaFunc)
-            self.globalMotionPipeline = try device.makeComputePipelineState(function: globalMotionFunc)
-            self.logOnlyPipeline = try device.makeComputePipelineState(function: logOnlyFunc)
             self.debayerFusedPipeline = try device.makeComputePipelineState(function: debayerFusedFunc)
             self.convertFormatPipeline = try device.makeComputePipelineState(function: convertFormatFunc)
             self.convertYpCbCr10Pipeline = try device.makeComputePipelineState(function: convertYpCbCr10Func)
             self.cropAndResamplePipeline = try device.makeComputePipelineState(function: cropAndResampleFunc)
-            self.lumaStatsPipeline = try device.makeComputePipelineState(function: lumaStatsFunc)
             self.defectPixelPipeline = try device.makeComputePipelineState(function: defectPixelFunc)
-            self.storeLumaHistoryPipeline = try device.makeComputePipelineState(function: storeLumaHistoryFunc)
         } catch {
             print("[MetalPipeline] Failed to create compute pipelines: \(error)")
             return nil
@@ -351,35 +229,6 @@ final class MetalPipeline: @unchecked Sendable {
         return tex
     }
 
-    private func getOrCreateLinearTexture(width: Int, height: Int, slot: Int = 0) -> MTLTexture? {
-        let i = slot % poolSlotCount
-        if let tex = pooledLinearTex[i], pooledLinearW[i] == width, pooledLinearH[i] == height {
-            return tex
-        }
-        let tex = makePrivateTexture(width: width, height: height)
-        pooledLinearTex[i] = tex
-        pooledLinearW[i] = width
-        pooledLinearH[i] = height
-        return tex
-    }
-
-    private func getOrCreateDenoisedTexture(width: Int, height: Int, slot: Int = 0) -> MTLTexture? {
-        let i = slot % poolSlotCount
-        if let tex = pooledDenoisedTex[i], pooledDenoisedW[i] == width, pooledDenoisedH[i] == height {
-            return tex
-        }
-        let desc = MTLTextureDescriptor.texture2DDescriptor(
-            pixelFormat: .rgba16Float, width: width, height: height, mipmapped: false)
-        desc.usage = [.shaderWrite, .shaderRead]
-        desc.storageMode = .private
-        
-        guard let tex = device.makeTexture(descriptor: desc) else { return nil }
-        pooledDenoisedTex[i] = tex
-        pooledDenoisedW[i] = width
-        pooledDenoisedH[i] = height
-        return tex
-    }
-
     private func getOrCreateSharpenTexture(width: Int, height: Int, slot: Int = 0) -> MTLTexture? {
         let i = slot % poolSlotCount
         if let tex = pooledSharpenTex[i], pooledSharpenW[i] == width, pooledSharpenH[i] == height {
@@ -393,42 +242,6 @@ final class MetalPipeline: @unchecked Sendable {
         pooledSharpenTex[i] = tex
         pooledSharpenW[i] = width
         pooledSharpenH[i] = height
-        return tex
-    }
-
-    private func getOrCreateChromaRawTexture(width: Int, height: Int, slot: Int = 0) -> MTLTexture? {
-        let i = slot % poolSlotCount
-        if let tex = pooledChromaRawTex[i], pooledChromaRawW[i] == width, pooledChromaRawH[i] == height {
-            return tex
-        }
-        let tex = makeRGTexture(width: width, height: height)
-        pooledChromaRawTex[i] = tex
-        pooledChromaRawW[i] = width
-        pooledChromaRawH[i] = height
-        return tex
-    }
-
-    private func getOrCreateChromaDenoisedTexture(width: Int, height: Int, slot: Int = 0) -> MTLTexture? {
-        let i = slot % poolSlotCount
-        if let tex = pooledChromaDenoisedTex[i], pooledChromaDenoisedW[i] == width, pooledChromaDenoisedH[i] == height {
-            return tex
-        }
-        let tex = makeRGTexture(width: width, height: height)
-        pooledChromaDenoisedTex[i] = tex
-        pooledChromaDenoisedW[i] = width
-        pooledChromaDenoisedH[i] = height
-        return tex
-    }
-
-    private func getOrCreateChromaMergedTexture(width: Int, height: Int, slot: Int = 0) -> MTLTexture? {
-        let i = slot % poolSlotCount
-        if let tex = pooledChromaMergedTex[i], pooledChromaMergedW[i] == width, pooledChromaMergedH[i] == height {
-            return tex
-        }
-        let tex = makePrivateTexture(width: width, height: height)
-        pooledChromaMergedTex[i] = tex
-        pooledChromaMergedW[i] = width
-        pooledChromaMergedH[i] = height
         return tex
     }
 
@@ -446,62 +259,8 @@ final class MetalPipeline: @unchecked Sendable {
         return tex
     }
 
-    private func getOrCreateLumaStatsTexture(width: Int, height: Int, slot: Int = 0) -> MTLTexture? {
-        let i = slot % poolSlotCount
-        if let tex = pooledLumaStatsTex[i], pooledLumaStatsW[i] == width, pooledLumaStatsH[i] == height { return tex }
-        let desc = MTLTextureDescriptor.texture2DDescriptor(
-            pixelFormat: .rg16Float,
-            width: width, height: height, mipmapped: false)
-        desc.usage = [.shaderRead, .shaderWrite]
-        desc.storageMode = .private
-        let tex = device.makeTexture(descriptor: desc)
-        pooledLumaStatsTex[i] = tex
-        pooledLumaStatsW[i] = width
-        pooledLumaStatsH[i] = height
-        return tex
-    }
-
-    // MARK: - Temporal ring buffer allocation
-
-    /// Allocate or reuse ring buffer textures (2D array type). Resets ring on size change.
-    private func ensureTemporalRing(lumaW: Int, lumaH: Int, chromaW: Int, chromaH: Int) {
-        guard lumaW > 0, lumaH > 0, chromaW > 0, chromaH > 0 else { return }
-        if lumaHistoryW == lumaW, lumaHistoryH == lumaH,
-           chromaHistoryW == chromaW, chromaHistoryH == chromaH,
-           lumaHistoryArray != nil { return }
-
-        // Luma history stored as single-channel R16Unorm (not rgba16Float) to save 4x bandwidth.
-        // The storeLumaHistory kernel converts RGB to Y before writing.
-        let lumaDesc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .r16Unorm, width: lumaW, height: lumaH, mipmapped: false)
-        lumaDesc.textureType = .type2DArray
-        lumaDesc.arrayLength = temporalRingCapacity
-        lumaDesc.usage = [.shaderRead, .shaderWrite]
-        lumaDesc.storageMode = .private
-        lumaHistoryArray = device.makeTexture(descriptor: lumaDesc)
-        chromaHistoryArray = makeTexture2DArray(width: chromaW, height: chromaH, arrayLength: temporalRingCapacity)
-        lumaHistoryW = lumaW
-        lumaHistoryH = lumaH
-        chromaHistoryW = chromaW
-        chromaHistoryH = chromaH
-        temporalRingCursor = 0
-        temporalRingValidCount = 0
-    }
-
-    func clearTemporalHistory() {
-        temporalRingCursor = 0
-        temporalRingValidCount = 0
-    }
-
-    /// Releases recording and temporal textures to reduce VRAM and cache pressure when idle or stopping recording.
+    /// Releases recording textures to reduce VRAM and cache pressure when idle or stopping recording.
     func trimMemory() {
-        clearTemporalHistory()
-        lumaHistoryArray = nil
-        chromaHistoryArray = nil
-        lumaHistoryW = 0
-        lumaHistoryH = 0
-        chromaHistoryW = 0
-        chromaHistoryH = 0
-
         pooledRawTex = Array(repeating: nil, count: poolSlotCount)
         pooledRawW = Array(repeating: 0, count: poolSlotCount)
         pooledRawH = Array(repeating: 0, count: poolSlotCount)
@@ -510,45 +269,21 @@ final class MetalPipeline: @unchecked Sendable {
         pooledBinW = Array(repeating: 0, count: poolSlotCount)
         pooledBinH = Array(repeating: 0, count: poolSlotCount)
 
-        pooledFusedTex = Array(repeating: nil, count: poolSlotCount)
-        pooledFusedW = Array(repeating: 0, count: poolSlotCount)
-        pooledFusedH = Array(repeating: 0, count: poolSlotCount)
-
-        pooledLinearTex = Array(repeating: nil, count: poolSlotCount)
-        pooledLinearW = Array(repeating: 0, count: poolSlotCount)
-        pooledLinearH = Array(repeating: 0, count: poolSlotCount)
-
-        pooledDenoisedTex = Array(repeating: nil, count: poolSlotCount)
-        pooledDenoisedW = Array(repeating: 0, count: poolSlotCount)
-        pooledDenoisedH = Array(repeating: 0, count: poolSlotCount)
-
-        pooledSharpenTex = Array(repeating: nil, count: poolSlotCount)
-        pooledSharpenW = Array(repeating: 0, count: poolSlotCount)
-        pooledSharpenH = Array(repeating: 0, count: poolSlotCount)
-
-        pooledChromaRawTex = Array(repeating: nil, count: poolSlotCount)
-        pooledChromaRawW = Array(repeating: 0, count: poolSlotCount)
-        pooledChromaRawH = Array(repeating: 0, count: poolSlotCount)
-
-        pooledChromaDenoisedTex = Array(repeating: nil, count: poolSlotCount)
-        pooledChromaDenoisedW = Array(repeating: 0, count: poolSlotCount)
-        pooledChromaDenoisedH = Array(repeating: 0, count: poolSlotCount)
-
-        pooledChromaMergedTex = Array(repeating: nil, count: poolSlotCount)
-        pooledChromaMergedW = Array(repeating: 0, count: poolSlotCount)
-        pooledChromaMergedH = Array(repeating: 0, count: poolSlotCount)
-
         pooledCorrectedBayerTex = Array(repeating: nil, count: poolSlotCount)
         pooledCorrectedBayerW = Array(repeating: 0, count: poolSlotCount)
         pooledCorrectedBayerH = Array(repeating: 0, count: poolSlotCount)
 
-        pooledLumaStatsTex = Array(repeating: nil, count: poolSlotCount)
-        pooledLumaStatsW = Array(repeating: 0, count: poolSlotCount)
-        pooledLumaStatsH = Array(repeating: 0, count: poolSlotCount)
+        pooledFusedTex = Array(repeating: nil, count: poolSlotCount)
+        pooledFusedW = Array(repeating: 0, count: poolSlotCount)
+        pooledFusedH = Array(repeating: 0, count: poolSlotCount)
 
         pooledScaleTex = Array(repeating: nil, count: poolSlotCount)
         pooledScaleW = Array(repeating: 0, count: poolSlotCount)
         pooledScaleH = Array(repeating: 0, count: poolSlotCount)
+
+        pooledSharpenTex = Array(repeating: nil, count: poolSlotCount)
+        pooledSharpenW = Array(repeating: 0, count: poolSlotCount)
+        pooledSharpenH = Array(repeating: 0, count: poolSlotCount)
 
         pooledScopeTex = nil
         pooledScopeW = 0
@@ -601,7 +336,7 @@ final class MetalPipeline: @unchecked Sendable {
                 kCVPixelBufferIOSurfacePropertiesKey as String: [:] as [String: Any]
             ]
             let poolAttrs: [String: Any] = [
-                kCVPixelBufferPoolMinimumBufferCountKey as String: 12
+                kCVPixelBufferPoolMinimumBufferCountKey as String: 16
             ]
             var pool: CVPixelBufferPool?
             let status = CVPixelBufferPoolCreate(
@@ -635,8 +370,7 @@ final class MetalPipeline: @unchecked Sendable {
         for s in 0..<poolSlotCount {
             _ = getOrCreateBinTexture(width: bW, height: bH, slot: s)
             _ = getOrCreateCorrectedBayerTexture(width: bW, height: bH, slot: s)
-            _ = getOrCreateLinearTexture(width: bW, height: bH, slot: s)
-            _ = getOrCreateFusedTexture(width: width, height: height, slot: s)
+            _ = getOrCreateFusedTexture(width: bW, height: bH, slot: s)
             _ = getOrCreateScaleTexture(width: width, height: height, slot: s)
             _ = getOrCreateSharpenTexture(width: width, height: height, slot: s)
         }
@@ -780,9 +514,9 @@ final class MetalPipeline: @unchecked Sendable {
         }
     }
 
-    // MARK: - Main process (linear denoise path)
+    // MARK: - Main process (single-pass fused pipeline)
 
-    /// Process RAW to log RGB using the linear denoise path.
+    /// Process RAW to log RGB using the streamlined single-pass fused pipeline.
     /// Uses CFA-preserving 2× reduction only when the reduced frame still covers the encode size.
     /// The completion handler is called on an internal Metal queue once the GPU work finishes.
     func process(_ pixelBuffer: CVPixelBuffer,
@@ -866,395 +600,12 @@ final class MetalPipeline: @unchecked Sendable {
             bayerIn = correctedBayerPass
         }
 
-        // ── Linear+Temporal Denoising Pipeline ──
-        // Pass 1: debayerWBLinear (Demosaic + LSC + WB -> Linear RGB)
-        // Pass 2: spatialDenoise (full-res luma detail preservation)
-        // Pass 3: half-res chroma extraction + chroma-only bilateral denoise
-        // Pass 4: recombine full-res luma with upsampled half-res chroma
-        // Pass 5: temporalDenoise — ring buffer N-slot weighted average
-        // Pass 6: applyLogOnly (Linear RGB -> S-Log3 / Log2)
-        
-        // ── Adaptive spatial/chroma denoise (gated by real-time frame budget & thermal) ──
-        let overRealtimeBudget = bayerW * bayerH > Self.maxFullDenoisePixelsForRecord
-        let isThermalCritical = thermalState == .critical
-        let isThermalThrottled = thermalState.rawValue >= ProcessInfo.ThermalState.serious.rawValue
-        let runDenoise = denoiseStrength >= 0.15 && !overRealtimeBudget && !isThermalCritical
-
-        let postLinearTex: MTLTexture
-        var logAlreadyApplied = false
-
-        if !runDenoise {
-            // ── Fused Path: Demosaic + LSC + WB + CCM + Log OETF in ONE kernel ──
-            // Uses debayerFusedLog to eliminate the separate applyLogOnly pass entirely,
-            // saving one full-resolution rgba16Float read+write round-trip (~97.5 MB at 12.2 MP).
-            // The fused kernel contains identical math to debayerWBLinear + applyLogOnly.
-            guard let fusedOut = getOrCreateLinearTexture(width: bayerW, height: bayerH, slot: slot) else { completion(nil, nil); return }
-            if let enc = commandBuffer.makeComputeCommandEncoder() {
-                enc.setComputePipelineState(debayerFusedPipeline)
-                enc.setTexture(bayerIn, index: 0)
-                enc.setTexture(fusedOut, index: 1)
-                var params = FusedParams(
-                    bayerPattern: bayerPattern,
-                    blackLevel: blackLevel,
-                    whiteLevel: max(whiteLevel, blackLevel + 1e-6),
-                    curveType: Int32(curveType.rawValue),
-                    wbGains: wbParams.gains,
-                    lscCoefficients: lscCoefficients,
-                    greenBalance: greenBalance,
-                    headroomScale: curveType == .linear ? 1.0 : headroomScale
-                )
-                enc.setBytes(&params, length: MemoryLayout<FusedParams>.stride, index: 0)
-                enc.setBytes(&lscParams, length: MemoryLayout<LSCParams>.stride, index: 1)
-                var cMatrix = wbParams.colorMatrix
-                enc.setBytes(&cMatrix, length: MemoryLayout<simd_float3x3>.stride, index: 2)
-                dispatch(enc, width: bayerW, height: bayerH, state: debayerFusedPipeline)
-                enc.endEncoding()
-            }
-            logAlreadyApplied = true
-            postLinearTex = fusedOut
-        } else {
-            // ── Full Multi-Pass Denoise Path ──
-            let chromaW = max(1, (bayerW + 1) / 2)
-            let chromaH = max(1, (bayerH + 1) / 2)
-            guard let linearOut = getOrCreateLinearTexture(width: bayerW, height: bayerH, slot: slot),
-                  let chromaMergedOut = getOrCreateChromaMergedTexture(width: bayerW, height: bayerH, slot: slot),
-                  let denoisedOut = getOrCreateDenoisedTexture(width: bayerW, height: bayerH, slot: slot),
-                  let chromaRawOut = getOrCreateChromaRawTexture(width: chromaW, height: chromaH, slot: slot),
-                  let chromaDenoisedOut = getOrCreateChromaDenoisedTexture(width: chromaW, height: chromaH, slot: slot) else { completion(nil, nil); return }
-
-            // Pass 1: Linear Demosaic + WB
-            if let enc = commandBuffer.makeComputeCommandEncoder() {
-                enc.setComputePipelineState(linearPipeline)
-                enc.setTexture(bayerIn, index: 0)
-                enc.setTexture(linearOut, index: 1)
-                var params = FusedParams(
-                    bayerPattern: bayerPattern,
-                    blackLevel: blackLevel,
-                    whiteLevel: max(whiteLevel, blackLevel + 1e-6),
-                    curveType: Int32(curveType.rawValue),
-                    wbGains: wbParams.gains,
-                    lscCoefficients: lscCoefficients,
-                    greenBalance: greenBalance,
-                    headroomScale: 1.0
-                )
-                enc.setBytes(&params, length: MemoryLayout<FusedParams>.stride, index: 0)
-                enc.setBytes(&lscParams, length: MemoryLayout<LSCParams>.stride, index: 1)
-                var cMatrix = wbParams.colorMatrix
-                enc.setBytes(&cMatrix, length: MemoryLayout<simd_float3x3>.stride, index: 2)
-                dispatch(enc, width: bayerW, height: bayerH, state: linearPipeline)
-                enc.endEncoding()
-            }
-
-            // Ensure temporal ring buffers exist at the correct per-channel resolutions.
-            ensureTemporalRing(lumaW: bayerW, lumaH: bayerH, chromaW: chromaW, chromaH: chromaH)
-
-            // Pass 1.5: Per-pixel local-sigma guide. Skipped in previewFast or during thermal throttle.
-            let useLocalSigma = processingQuality == .recordQuality && bayerW < 3000 && !isThermalThrottled
-            let lumaStatsTex: MTLTexture? = useLocalSigma
-                ? getOrCreateLumaStatsTexture(width: bayerW, height: bayerH, slot: slot)
-                : dummyStatsTex
-            if useLocalSigma, let statsTex = lumaStatsTex,
-               let enc = commandBuffer.makeComputeCommandEncoder() {
-                enc.setComputePipelineState(lumaStatsPipeline)
-                enc.setTexture(linearOut, index: 0)
-                enc.setTexture(statsTex, index: 1)
-                dispatch(enc, width: bayerW, height: bayerH, state: lumaStatsPipeline)
-                enc.endEncoding()
-            }
-
-            let denoiseRadius: Int32 = (processingQuality == .previewFast || isThermalThrottled) ? 2 : (iso > 200 ? 3 : 2)
-
-            // Pass 2: Spatial denoise full-res luma.
-            if let enc = commandBuffer.makeComputeCommandEncoder() {
-                enc.setComputePipelineState(denoisePipeline)
-                enc.setTexture(linearOut, index: 0)
-                enc.setTexture(denoisedOut, index: 1)
-                enc.setTexture(lumaStatsTex, index: 2)
-                var dParams = DenoiseParams(iso: iso, radius: denoiseRadius, shotCoeff: noiseShotCoeff, readCoeff: noiseReadCoeff, strength: denoiseStrength)
-                enc.setBytes(&dParams, length: MemoryLayout<DenoiseParams>.stride, index: 0)
-                dispatch(enc, width: bayerW, height: bayerH, state: denoisePipeline)
-                enc.endEncoding()
-            }
-
-            // Pass 3a: Average chroma into half-res UV plane.
-            if let enc = commandBuffer.makeComputeCommandEncoder() {
-                enc.setComputePipelineState(extractChromaPipeline)
-                enc.setTexture(linearOut, index: 0)
-                enc.setTexture(chromaRawOut, index: 1)
-                dispatch(enc, width: chromaW, height: chromaH, state: extractChromaPipeline)
-                enc.endEncoding()
-            }
-
-            // Pass 3b: Cross-bilateral chroma denoise.
-            if let enc = commandBuffer.makeComputeCommandEncoder() {
-                enc.setComputePipelineState(denoiseChromaPipeline)
-                enc.setTexture(chromaRawOut, index: 0)
-                enc.setTexture(linearOut, index: 1)
-                enc.setTexture(chromaDenoisedOut, index: 2)
-                enc.setTexture(lumaStatsTex, index: 3)
-                var dParams = DenoiseParams(iso: iso, radius: denoiseRadius, shotCoeff: noiseShotCoeff, readCoeff: noiseReadCoeff, strength: denoiseStrength)
-                enc.setBytes(&dParams, length: MemoryLayout<DenoiseParams>.stride, index: 0)
-                dispatch(enc, width: chromaW, height: chromaH, state: denoiseChromaPipeline)
-                enc.endEncoding()
-            }
-
-            // Pass 4: Recombine full-res luma with upsampled half-res chroma.
-            if let enc = commandBuffer.makeComputeCommandEncoder() {
-                enc.setComputePipelineState(recombineChromaPipeline)
-                enc.setTexture(denoisedOut, index: 0)
-                enc.setTexture(chromaDenoisedOut, index: 1)
-                enc.setTexture(chromaMergedOut, index: 2)
-                dispatch(enc, width: bayerW, height: bayerH, state: recombineChromaPipeline)
-                enc.endEncoding()
-            }
-
-            // Store half-res chroma history for temporal chroma ring (record quality only).
-            if processingQuality == .recordQuality, let chromaArr = chromaHistoryArray {
-                if let enc = commandBuffer.makeComputeCommandEncoder() {
-                    enc.setComputePipelineState(storeChromaHistoryPipeline)
-                    enc.setTexture(chromaMergedOut, index: 0)
-                    enc.setTexture(chromaArr, index: 1)
-                    var scParams = StoreChromaParams(slice: Int32(temporalRingCursor))
-                    enc.setBytes(&scParams, length: MemoryLayout<StoreChromaParams>.stride, index: 0)
-                    dispatch(enc, width: chromaW, height: chromaH, state: storeChromaHistoryPipeline)
-                    enc.endEncoding()
-                }
-            }
-
-            // Pass 5: Temporal Denoise — N-slot ring buffer weighted average.
-            let temporalOut = linearOut
-            let doTemporal = temporalRingValidCount > 1
-            let motionMetricBuffer = motionMetricBuffers[slot % poolSlotCount]
-            if doTemporal {
-                // Estimate global motion metric.
-                if let enc = commandBuffer.makeComputeCommandEncoder() {
-                    enc.setComputePipelineState(globalMotionPipeline)
-                    enc.setTexture(chromaMergedOut, index: 0)
-                    enc.setTexture(lumaHistoryArray, index: 1)
-                    enc.setBuffer(motionMetricBuffer, offset: 0, index: 0)
-                    var cursor = Int32(temporalRingCursor)
-                    var slots = Int32(temporalRingCapacity)
-                    enc.setBytes(&cursor, length: MemoryLayout<Int32>.stride, index: 1)
-                    enc.setBytes(&slots, length: MemoryLayout<Int32>.stride, index: 2)
-                    enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1),
-                                             threadsPerThreadgroup: MTLSize(width: 1, height: 1, depth: 1))
-                    enc.endEncoding()
-                }
-
-                if let enc = commandBuffer.makeComputeCommandEncoder() {
-                    enc.setComputePipelineState(temporalRingPipeline)
-                    enc.setTexture(chromaMergedOut, index: 0)
-                    enc.setTexture(temporalOut, index: 1)
-
-                    let isoClamped = max(iso, 33.0)
-                    let isoNorm = min(max((isoClamped - 33.0) / (1600.0 - 33.0), 0.0), 1.0)
-                    let maxBlend: Float = 0.10 + 0.15 * isoNorm
-                    var ringParams = RingTemporalParams(
-                        iso: isoClamped,
-                        maxBlend: maxBlend,
-                        slotCount: Int32(temporalRingCapacity),
-                        validSlots: Int32(temporalRingValidCount),
-                        chromaW: Int32(chromaW),
-                        chromaH: Int32(chromaH),
-                        cursor: Int32(temporalRingCursor),
-                        lambda: 0.7,
-                        shotCoeff: noiseShotCoeff,
-                        readCoeff: noiseReadCoeff
-                    )
-                    enc.setBytes(&ringParams, length: MemoryLayout<RingTemporalParams>.stride, index: 0)
-                    enc.setBuffer(motionMetricBuffer, offset: 0, index: 1)
-
-                    enc.setTexture(lumaHistoryArray, index: 2)
-                    enc.setTexture(chromaHistoryArray, index: 3)
-
-                    dispatch(enc, width: bayerW, height: bayerH, state: temporalRingPipeline)
-                    enc.endEncoding()
-                }
-            } else if let blit = commandBuffer.makeBlitCommandEncoder() {
-                blit.copy(
-                    from: chromaMergedOut,
-                    sourceSlice: 0, sourceLevel: 0,
-                    sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
-                    sourceSize: MTLSize(width: bayerW, height: bayerH, depth: 1),
-                    to: temporalOut,
-                    destinationSlice: 0, destinationLevel: 0,
-                    destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0)
-                )
-                blit.endEncoding()
-            }
-
-            // Push luma history into ring buffer via compute kernel (RGB→Y conversion).
-            if let lumaArr = lumaHistoryArray,
-               let enc = commandBuffer.makeComputeCommandEncoder() {
-                enc.setComputePipelineState(storeLumaHistoryPipeline)
-                enc.setTexture(chromaMergedOut, index: 0)
-                enc.setTexture(lumaArr, index: 1)
-                var scParams = StoreChromaParams(slice: Int32(temporalRingCursor))
-                enc.setBytes(&scParams, length: MemoryLayout<StoreChromaParams>.stride, index: 0)
-                dispatch(enc, width: bayerW, height: bayerH, state: storeLumaHistoryPipeline)
-                enc.endEncoding()
-                temporalRingCursor = (temporalRingCursor + 1) % temporalRingCapacity
-                if temporalRingValidCount < temporalRingCapacity {
-                    temporalRingValidCount += 1
-                }
-            }
-
-            postLinearTex = temporalOut
+        // ── Single-Pass Fused Debayer: Demosaic + LSC + WB + CCM + Log OETF in ONE kernel ──
+        // Uses debayerFusedLog to eliminate separate debayer, WB, LSC, and log passes,
+        // saving ~97.5 MB per frame of VRAM bandwidth at 12.2 MP.
+        guard let fusedOut = getOrCreateFusedTexture(width: bayerW, height: bayerH, slot: slot) else {
+            completion(nil, nil); return
         }
-
-        // Final crop and scale into target aspect ratio & resolution
-        let scaledTex = cropToAspectAndScale(
-            postLinearTex,
-            targetWidth: encodeWidth,
-            targetHeight: encodeHeight,
-            destinationTexture: nil,
-            slot: slot,
-            cb: commandBuffer
-        ) ?? postLinearTex
-
-        // Adaptive unsharp masking executed on target resolution post-crop/scale.
-        // Avoids reading ~878 MB / writing ~97.5 MB per frame at 12.2 MP, reducing GPU latency
-        // by up to 83% at 1080p, and prevents downscaling filter from blurring sharpened details.
-        let sharpenedTex: MTLTexture
-        if sharpnessStrength > 0.001, let sTex = getOrCreateSharpenTexture(width: scaledTex.width, height: scaledTex.height, slot: slot),
-           let enc = commandBuffer.makeComputeCommandEncoder() {
-            enc.setComputePipelineState(unsharpPipeline)
-            enc.setTexture(scaledTex, index: 0)
-            enc.setTexture(sTex, index: 1)
-            var s = sharpnessStrength
-            enc.setBytes(&s, length: MemoryLayout<Float>.stride, index: 0)
-            dispatch(enc, width: scaledTex.width, height: scaledTex.height, state: unsharpPipeline)
-            enc.endEncoding()
-            sharpenedTex = sTex
-        } else {
-            sharpenedTex = scaledTex
-        }
-
-        let finalTex: MTLTexture
-        if logAlreadyApplied {
-            // Fused kernel already applied the Log OETF — skip the separate pass entirely.
-            // This saves one full 12.2 MP rgba16Float read+write round-trip (~97.5 MB bandwidth).
-            finalTex = sharpenedTex
-        } else {
-            // Apply Log OETF (with highlight shoulder) to the scaled scene-linear frame
-            let outW = sharpenedTex.width
-            let outH = sharpenedTex.height
-            guard let finalLogTex = getOrCreateFusedTexture(width: outW, height: outH, slot: slot) else { completion(nil, nil); return }
-            if let enc = commandBuffer.makeComputeCommandEncoder() {
-                enc.setComputePipelineState(logOnlyPipeline)
-                enc.setTexture(sharpenedTex, index: 0)
-                enc.setTexture(finalLogTex, index: 1)
-                var logParams = LogOnlyParams(
-                    curveType: Int32(curveType.rawValue),
-                    headroomScale: curveType == .linear ? 1.0 : headroomScale
-                )
-                enc.setBytes(&logParams, length: MemoryLayout<LogOnlyParams>.stride, index: 0)
-                dispatch(enc, width: outW, height: outH, state: logOnlyPipeline)
-                enc.endEncoding()
-            }
-            finalTex = finalLogTex
-        }
-
-        var outputPB: CVPixelBuffer?
-        var retainedCVTextures: [Any] = []
-        if encodeAsBGRA {
-            let encoded = encodeOutputPixelBuffer(
-                from: finalTex,
-                encodeWidth: encodeWidth,
-                encodeHeight: encodeHeight,
-                cb: commandBuffer
-            )
-            outputPB = encoded.0
-            retainedCVTextures = encoded.1
-        }
-
-        let finalTexBox = SendableBox(value: finalTex)
-        let outputPBBox = SendableBox(value: outputPB)
-        let retainedTexturesBox = SendableBox(value: retainedCVTextures)
-        let completionBox = SendableBox(value: completion)
-        commandBuffer.addCompletedHandler { cb in
-            _ = retainedTexturesBox.value
-#if DEBUG
-            let ms = (CACurrentMediaTime() - t0) * 1000.0
-            print("[MetalPipeline] frame time: \(String(format: "%.2f", ms)) ms")
-#endif
-            if let error = cb.error {
-                print("[MetalPipeline] ERROR: Command buffer failed: \(error.localizedDescription)")
-            }
-            completionBox.value(finalTexBox.value, outputPBBox.value)
-        }
-        commandBuffer.commit()
-    }
-
-    // MARK: - Preview-Only (lightweight capture path)
-
-    /// Fast preview path: bin → DPC → demosaic → log → crop/scale.
-    /// Skips spatial/chroma/temporal denoise entirely — useful for viewfinder
-    /// preview where full denoise is unnecessary overhead. Frame times ~2-5ms.
-    func processPreviewOnly(_ pixelBuffer: CVPixelBuffer,
-                            encodeWidth: Int = 1920,
-                            encodeHeight: Int = 1440,
-                            slot: Int = 0,
-                            completion: @escaping (MTLTexture?) -> Void) {
-        let t0 = CACurrentMediaTime()
-        let fullW = CVPixelBufferGetWidth(pixelBuffer)
-        let fullH = CVPixelBufferGetHeight(pixelBuffer)
-        guard fullW > 0, fullH > 0 else { completion(nil); return }
-
-        guard let fullBayer = makeRawTexture(from: pixelBuffer, slot: slot) else {
-            print("[MetalPipeline] Failed to create input texture")
-            completion(nil); return
-        }
-
-        guard let commandBuffer = commandQueue.makeCommandBuffer() else { completion(nil); return }
-
-        // Phase-preserving half reduction.
-        var bayerIn: MTLTexture
-        let bayerW: Int
-        let bayerH: Int
-        let halfW = (fullW / 2) & ~1
-        let halfH = (fullH / 2) & ~1
-        let canReduceRaw = (halfW >= encodeWidth && halfH >= encodeHeight) || fullW > 3000
-        if canReduceRaw {
-            guard let halfTex = getOrCreateBinTexture(width: halfW, height: halfH, slot: slot),
-                  let enc = commandBuffer.makeComputeCommandEncoder() else { completion(nil); return }
-            enc.setComputePipelineState(binPipeline)
-            enc.setTexture(fullBayer, index: 0)
-            enc.setTexture(halfTex, index: 1)
-            dispatch(enc, width: halfW, height: halfH, state: binPipeline)
-            enc.endEncoding()
-            bayerIn = halfTex
-            bayerW = halfW
-            bayerH = halfH
-        } else {
-            bayerIn = fullBayer
-            bayerW = fullW
-            bayerH = fullH
-        }
-
-        // Defect pixel correction (skip on full-res sensor where hot pixels are averaged during downsampling).
-        if bayerW <= 3000 {
-            guard let correctedBayerPass = getOrCreateCorrectedBayerTexture(width: bayerW, height: bayerH, slot: slot),
-                  let encDPC = commandBuffer.makeComputeCommandEncoder() else { completion(nil); return }
-            encDPC.setComputePipelineState(defectPixelPipeline)
-            encDPC.setTexture(bayerIn, index: 0)
-            encDPC.setTexture(correctedBayerPass, index: 1)
-            var debayerParams = DebayerParams(
-                bayerPattern: bayerPattern,
-                blackLevel: blackLevel,
-                whiteLevel: max(whiteLevel, blackLevel + 1e-6),
-                lscCoefficients: lscCoefficients
-            )
-            var defectNoiseParams = DefectPixelParams(shotCoeff: noiseShotCoeff, readCoeff: noiseReadCoeff)
-            encDPC.setBytes(&debayerParams, length: MemoryLayout<DebayerParams>.stride, index: 0)
-            encDPC.setBytes(&defectNoiseParams, length: MemoryLayout<DefectPixelParams>.stride, index: 1)
-            dispatch(encDPC, width: bayerW, height: bayerH, state: defectPixelPipeline)
-            encDPC.endEncoding()
-            bayerIn = correctedBayerPass
-        }
-
-        // ── Fused Path: Demosaic + LSC + WB + CCM + Log OETF in ONE kernel ──
-        guard let fusedOut = getOrCreateLinearTexture(width: bayerW, height: bayerH, slot: slot) else { completion(nil); return }
         if let enc = commandBuffer.makeComputeCommandEncoder() {
             enc.setComputePipelineState(debayerFusedPipeline)
             enc.setTexture(bayerIn, index: 0)
@@ -1287,31 +638,61 @@ final class MetalPipeline: @unchecked Sendable {
             cb: commandBuffer
         ) ?? fusedOut
 
+        // Adaptive unsharp masking executed on target resolution post-crop/scale.
         let finalTex: MTLTexture
-        if sharpnessStrength > 0.001, let sharpenTex = getOrCreateSharpenTexture(width: scaledTex.width, height: scaledTex.height, slot: slot),
+        if sharpnessStrength > 0.001, let sTex = getOrCreateSharpenTexture(width: scaledTex.width, height: scaledTex.height, slot: slot),
            let enc = commandBuffer.makeComputeCommandEncoder() {
             enc.setComputePipelineState(unsharpPipeline)
             enc.setTexture(scaledTex, index: 0)
-            enc.setTexture(sharpenTex, index: 1)
+            enc.setTexture(sTex, index: 1)
             var s = sharpnessStrength
             enc.setBytes(&s, length: MemoryLayout<Float>.stride, index: 0)
             dispatch(enc, width: scaledTex.width, height: scaledTex.height, state: unsharpPipeline)
             enc.endEncoding()
-            finalTex = sharpenTex
+            finalTex = sTex
         } else {
             finalTex = scaledTex
         }
 
+        var outputPB: CVPixelBuffer?
+        var retainedCVTextures: [Any] = []
+        if encodeAsBGRA {
+            let encoded = encodeOutputPixelBuffer(
+                from: finalTex,
+                encodeWidth: encodeWidth,
+                encodeHeight: encodeHeight,
+                cb: commandBuffer
+            )
+            outputPB = encoded.0
+            retainedCVTextures = encoded.1
+        }
+
         let finalTexBox = SendableBox(value: finalTex)
+        let outputPBBox = SendableBox(value: outputPB)
+        let retainedTexturesBox = SendableBox(value: retainedCVTextures)
         let completionBox = SendableBox(value: completion)
-        commandBuffer.addCompletedHandler { _ in
-#if DEBUG
-            let ms = (CACurrentMediaTime() - t0) * 1000.0
-            print("[MetalPipeline] preview frame time: \(String(format: "%.2f", ms)) ms")
-#endif
-            completionBox.value(finalTexBox.value)
+        commandBuffer.addCompletedHandler { cb in
+            _ = retainedTexturesBox.value
+            if let error = cb.error {
+                print("[MetalPipeline] ERROR: Command buffer failed: \(error.localizedDescription)")
+            }
+            completionBox.value(finalTexBox.value, outputPBBox.value)
         }
         commandBuffer.commit()
+    }
+
+    // MARK: - Preview-Only (lightweight capture path)
+
+    /// Fast preview path: delegates to process with encodeAsBGRA: false.
+    /// Runs single-pass fused debayer + crop/scale + unsharp mask with zero CVPixelBuffer allocation.
+    func processPreviewOnly(_ pixelBuffer: CVPixelBuffer,
+                            encodeWidth: Int = 1920,
+                            encodeHeight: Int = 1440,
+                            slot: Int = 0,
+                            completion: @escaping (MTLTexture?) -> Void) {
+        process(pixelBuffer, encodeWidth: encodeWidth, encodeHeight: encodeHeight, encodeAsBGRA: false, slot: slot) { texture, _ in
+            completion(texture)
+        }
     }
 
     func scale(_ texture: MTLTexture, width: Int, height: Int, destinationTexture: MTLTexture? = nil, slot: Int = 0, cb: MTLCommandBuffer) -> MTLTexture? {
@@ -1519,31 +900,9 @@ final class MetalPipeline: @unchecked Sendable {
         return device.makeTexture(descriptor: desc)
     }
 
-    private func makeRGTexture(width: Int, height: Int) -> MTLTexture? {
-        let desc = MTLTextureDescriptor.texture2DDescriptor(
-            pixelFormat: .rg16Float, width: width, height: height, mipmapped: false)
-        desc.usage = [.shaderRead, .shaderWrite]
-        desc.storageMode = .private
-        return device.makeTexture(descriptor: desc)
-    }
-
     private func makePrivateTexture(width: Int, height: Int) -> MTLTexture? {
         let desc = MTLTextureDescriptor.texture2DDescriptor(
             pixelFormat: .rgba16Float, width: width, height: height, mipmapped: false)
-        desc.usage = [.shaderRead, .shaderWrite]
-        desc.storageMode = .private
-        return device.makeTexture(descriptor: desc)
-    }
-
-    private func makeTexture2DArray(width: Int, height: Int, arrayLength: Int) -> MTLTexture? {
-        let desc = MTLTextureDescriptor()
-        desc.textureType = .type2DArray
-        desc.pixelFormat = .rgba16Float
-        desc.width = width
-        desc.height = height
-        desc.depth = 1
-        desc.arrayLength = arrayLength
-        desc.mipmapLevelCount = 1
         desc.usage = [.shaderRead, .shaderWrite]
         desc.storageMode = .private
         return device.makeTexture(descriptor: desc)

@@ -37,21 +37,21 @@ struct ScopesOverlay: View {
 
     private var histogramBadge: some View {
         HStack(spacing: 3) {
-            Circle().fill(Color(red: 1.0, green: 0.25, blue: 0.25)).frame(width: 3.5, height: 3.5)
-            Circle().fill(Color(red: 0.20, green: 0.95, blue: 0.40)).frame(width: 3.5, height: 3.5)
-            Circle().fill(Color(red: 0.30, green: 0.65, blue: 1.0)).frame(width: 3.5, height: 3.5)
+            Circle().fill(Color(red: 1.0, green: 0.25, blue: 0.25)).frame(width: 4, height: 4)
+            Circle().fill(Color(red: 0.20, green: 0.95, blue: 0.40)).frame(width: 4, height: 4)
+            Circle().fill(Color(red: 0.30, green: 0.65, blue: 1.0)).frame(width: 4, height: 4)
         }
     }
 
     private var waveformBadge: some View {
         Text("IRE")
-            .font(.geistMono(.bold, size: 7))
-            .foregroundColor(Color(red: 1.0, green: 0.80, blue: 0.28).opacity(0.90))
-            .padding(.horizontal, 3.5)
+            .font(.appMono(.bold, size: 7.5))
+            .foregroundColor(OwLensTheme.cinemaAmber)
+            .padding(.horizontal, 4)
             .padding(.vertical, 1)
             .background(
                 RoundedRectangle(cornerRadius: 3, style: .continuous)
-                    .fill(Color(red: 1.0, green: 0.80, blue: 0.28).opacity(0.18))
+                    .fill(OwLensTheme.cinemaAmber.opacity(0.18))
             )
     }
 
@@ -65,7 +65,7 @@ struct ScopesOverlay: View {
         VStack(alignment: .leading, spacing: 3) {
             HStack(spacing: 4) {
                 Text(title)
-                    .font(.geistMono(.semiBold, size: 8))
+                    .font(.appMono(.semiBold, size: 8))
                     .foregroundColor(OwLensTheme.textSecondary)
                     .tracking(0.3)
 
@@ -90,8 +90,8 @@ struct ScopesOverlay: View {
 
     private var histogramCanvas: some View {
         Canvas { context, size in
-            // Subtle vertical graticule guides at 18% (shadow/mid boundary), 50% (midtones), and 90%
-            let guides: [(CGFloat, Double)] = [(0.18, 0.06), (0.50, 0.08), (0.90, 0.06)]
+            // Clear vertical graticule guides at 18% (shadow/mid boundary), 50% (midtones), and 90%
+            let guides: [(CGFloat, Double)] = [(0.18, 0.20), (0.50, 0.28), (0.90, 0.20)]
             for (pos, opacity) in guides {
                 var guidePath = Path()
                 let x = size.width * pos
@@ -100,7 +100,7 @@ struct ScopesOverlay: View {
                 context.stroke(
                     guidePath,
                     with: .color(Color.white.opacity(opacity)),
-                    style: StrokeStyle(lineWidth: 0.5, dash: [1.5, 1.5])
+                    style: StrokeStyle(lineWidth: 0.5, dash: [2, 2])
                 )
             }
 
@@ -204,14 +204,14 @@ struct ScopesOverlay: View {
             path75.addLine(to: CGPoint(x: traceWidth, y: y75))
             context.stroke(path75, with: .color(Color.white.opacity(0.14)), style: StrokeStyle(lineWidth: 0.5, dash: [2, 2]))
 
-            // 50 IRE (Middle Gray reference — accented in Cinema Gold!)
+            // 50 IRE (Middle Gray reference — accented in Cinema Amber)
             var path50 = Path()
             let y50 = size.height * 0.50
             path50.move(to: CGPoint(x: 0, y: y50))
             path50.addLine(to: CGPoint(x: traceWidth, y: y50))
             context.stroke(
                 path50,
-                with: .color(Color(red: 1.0, green: 0.78, blue: 0.22).opacity(0.50)),
+                with: .color(OwLensTheme.cinemaAmber.opacity(0.65)),
                 style: StrokeStyle(lineWidth: 0.75, dash: [3, 2])
             )
 
@@ -233,7 +233,7 @@ struct ScopesOverlay: View {
             var divider = Path()
             divider.move(to: CGPoint(x: traceWidth, y: 0))
             divider.addLine(to: CGPoint(x: traceWidth, y: size.height))
-            context.stroke(divider, with: .color(Color.white.opacity(0.10)), lineWidth: 0.5)
+            context.stroke(divider, with: .color(Color.white.opacity(0.12)), lineWidth: 0.5)
 
             // ── 4. Dedicated IRE Scale Marks & Labels ──
             let scaleX = size.width - 1.0
@@ -245,16 +245,16 @@ struct ScopesOverlay: View {
                 tick.addLine(to: CGPoint(x: tickX, y: y))
                 context.stroke(tick, with: .color(color.opacity(0.5)), lineWidth: 0.5)
 
-                let font: Font = .system(size: 6.5, weight: isBold ? .bold : .medium, design: .monospaced)
+                let font: Font = .system(size: 7.5, weight: isBold ? .bold : .medium, design: .monospaced)
                 let resolved = Text(text).font(font).foregroundColor(color)
                 context.draw(resolved, at: CGPoint(x: scaleX, y: y), anchor: .trailing)
             }
 
-            drawLabel("100", y: 3.5, color: Color.white.opacity(0.50))
-            drawLabel("75", y: y75, color: Color.white.opacity(0.40))
-            drawLabel("50", y: y50, color: Color(red: 1.0, green: 0.80, blue: 0.28).opacity(0.95), isBold: true)
-            drawLabel("25", y: y25, color: Color.white.opacity(0.40))
-            drawLabel("0", y: size.height - 3.5, color: Color.white.opacity(0.50))
+            drawLabel("100", y: 3.5, color: Color.white.opacity(0.55))
+            drawLabel("75", y: y75, color: Color.white.opacity(0.45))
+            drawLabel("50", y: y50, color: OwLensTheme.cinemaAmber, isBold: true)
+            drawLabel("25", y: y25, color: Color.white.opacity(0.45))
+            drawLabel("0", y: size.height - 3.5, color: Color.white.opacity(0.55))
         }
     }
 }
