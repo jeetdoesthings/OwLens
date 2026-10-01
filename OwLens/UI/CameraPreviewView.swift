@@ -2,50 +2,65 @@ import SwiftUI
 import UIKit
 import MetalKit
 import QuartzCore
+import os
 
 /// Thread-safe texture delivery pipe from the Metal pipeline to MTKView.
 /// Completely bypasses SwiftUI's view body evaluation loop at 24/30 fps,
 /// scheduling direct layer updates onto the MTKView.
 final class PreviewFeed: @unchecked Sendable {
-    private let lock = NSLock()
+    private let lock = OSAllocatedUnfairLock()
     private(set) var currentTexture: MTLTexture?
     private weak var targetView: MTKView?
     private weak var coordinator: CameraPreviewView.Coordinator?
+    private var isRenderScheduled = false
 
     func register(view: MTKView, coordinator: CameraPreviewView.Coordinator) {
-        lock.lock()
-        defer { lock.unlock() }
-        self.targetView = view
-        self.coordinator = coordinator
-        if let currentTexture {
-            coordinator.currentTexture = currentTexture
+        let tex = lock.withLock {
+            self.targetView = view
+            self.coordinator = coordinator
+            return self.currentTexture
+        }
+        if let tex {
+            coordinator.currentTexture = tex
             view.setNeedsDisplay()
         }
     }
 
     func unregister() {
-        lock.lock()
-        defer { lock.unlock() }
-        self.targetView = nil
-        self.coordinator = nil
+        lock.withLock {
+            self.targetView = nil
+            self.coordinator = nil
+            self.isRenderScheduled = false
+        }
     }
 
     func submit(texture: MTLTexture) {
-        lock.lock()
-        currentTexture = texture
-        let view = targetView
-        let coord = coordinator
-        lock.unlock()
+        let shouldSchedule: Bool = lock.withLock {
+            currentTexture = texture
+            guard targetView != nil, coordinator != nil else { return false }
+            if isRenderScheduled { return false }
+            isRenderScheduled = true
+            return true
+        }
+        guard shouldSchedule else { return }
 
-        guard let view, let coord else { return }
-        if Thread.isMainThread {
-            coord.currentTexture = texture
-            view.setNeedsDisplay()
-        } else {
-            DispatchQueue.main.async {
-                coord.currentTexture = texture
+        let updateBlock = { [weak self] in
+            guard let self else { return }
+            let (tex, view, coord): (MTLTexture?, MTKView?, CameraPreviewView.Coordinator?) = self.lock.withLock {
+                self.isRenderScheduled = false
+                return (self.currentTexture, self.targetView, self.coordinator)
+            }
+
+            if let tex, let coord, let view {
+                coord.currentTexture = tex
                 view.setNeedsDisplay()
             }
+        }
+
+        if Thread.isMainThread {
+            updateBlock()
+        } else {
+            DispatchQueue.main.async(execute: updateBlock)
         }
     }
 }
@@ -58,6 +73,7 @@ struct CameraPreviewView: UIViewRepresentable {
     @Binding var showFocusPeaking: Bool
     var showDisplayLUT: Bool = false
     var overlayOnly: Bool = false
+    var targetFPS: Double = 30.0
  
     func makeUIView(context: Context) -> MTKView {
         let mtkView = MTKView(frame: .zero, device: metalPipeline.device)
@@ -78,6 +94,13 @@ struct CameraPreviewView: UIViewRepresentable {
         // Avoid UIKit transforming layers into portrait letterbox mid-record
         mtkView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
 
+        // Triple-buffering & timeout prevents CAMetalLayer from blocking the main thread during VSync transitions
+        if let metalLayer = mtkView.layer as? CAMetalLayer {
+            metalLayer.maximumDrawableCount = 3
+            metalLayer.allowsNextDrawableTimeout = true
+            metalLayer.presentsWithTransaction = false
+        }
+
         previewFeed.register(view: mtkView, coordinator: context.coordinator)
         return mtkView
     }
@@ -95,6 +118,7 @@ struct CameraPreviewView: UIViewRepresentable {
         context.coordinator.showClipping = showClipping
         context.coordinator.showFocusPeaking = showFocusPeaking
         context.coordinator.showDisplayLUT = showDisplayLUT
+        context.coordinator.targetFPS = targetFPS
         context.coordinator.isAppActive = UIApplication.shared.applicationState == .active
         if context.coordinator.overlayOnly != overlayOnly {
             context.coordinator.overlayOnly = overlayOnly
@@ -131,6 +155,7 @@ struct CameraPreviewView: UIViewRepresentable {
         var showFocusPeaking: Bool = false
         var showDisplayLUT: Bool = false
         var overlayOnly: Bool = false
+        var targetFPS: Double = 30.0
         /// Cached app state — updated from MainActor via updateUIView, read on render thread.
         var isAppActive: Bool = true
         /// No redundant-draw guard needed: the display link runs at 30 fps and frames
@@ -232,13 +257,9 @@ struct CameraPreviewView: UIViewRepresentable {
             
             if let renderPassDescriptor = view.currentRenderPassDescriptor,
                let renderPipeline = renderPipeline {
-                renderPassDescriptor.colorAttachments[0].loadAction = .clear
-                renderPassDescriptor.colorAttachments[0].clearColor = MTLClearColor(
-                    red: 0,
-                    green: 0,
-                    blue: 0,
-                    alpha: overlayOnly ? 0 : 1
-                )
+                // fullscreenVertex & displayFragment write 100% of the viewport (including letterbox/pillarbox margins),
+                // so loadAction = .dontCare avoids an unnecessary tile clear pass.
+                renderPassDescriptor.colorAttachments[0].loadAction = .dontCare
                 guard let renderEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: renderPassDescriptor) else {
                     commandBuffer.present(drawable)
                     commandBuffer.commit()
@@ -264,7 +285,8 @@ struct CameraPreviewView: UIViewRepresentable {
                 renderEncoder.endEncoding()
             }
  
-            commandBuffer.present(drawable)
+            // Enforce minimum presentation duration to eliminate irregular v-sync cadence judder on 60Hz and 120Hz displays
+            commandBuffer.present(drawable, afterMinimumDuration: 1.0 / max(1.0, targetFPS))
             commandBuffer.commit()
         }
     }

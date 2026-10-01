@@ -30,7 +30,6 @@ struct NormalVideoPreviewView: UIViewRepresentable {
             context.coordinator.lensID = lensID
             uiView.updateVideoOrientation()
         }
-        uiView.updateVideoOrientation()
     }
 
     func makeCoordinator() -> Coordinator {
@@ -101,7 +100,9 @@ final class PreviewLayerView: UIView {
         // returns false for non-video connections, preserving the old guard, and
         // avoids NSInvalidArgumentException when assigning an unsupported angle.
         guard connection.isVideoRotationAngleSupported(angle) else { return }
-        connection.videoRotationAngle = angle
+        if connection.videoRotationAngle != angle {
+            connection.videoRotationAngle = angle
+        }
     }
 
     private func aspectFitRect(in bounds: CGRect, aspect: CGFloat) -> CGRect {

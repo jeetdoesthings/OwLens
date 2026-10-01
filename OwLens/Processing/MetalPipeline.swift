@@ -2,6 +2,7 @@ import Metal
 import MetalKit
 import CoreVideo
 import simd
+import os
 
 /// Wraps a non-Sendable value so it can be captured by a `@Sendable` closure
 /// (e.g. `MTLTexture`, `CVPixelBuffer?`, or completion callbacks inside
@@ -107,6 +108,13 @@ final class MetalPipeline: @unchecked Sendable {
     private let cropAndResamplePipeline: MTLComputePipelineState
     private let unsharpPipeline: MTLComputePipelineState
     private let defectPixelPipeline: MTLComputePipelineState
+    private let binThreads: MTLSize
+    private let debayerFusedThreads: MTLSize
+    private let convertFormatThreads: MTLSize
+    private let convertYpCbCr10Threads: MTLSize
+    private let cropAndResampleThreads: MTLSize
+    private let unsharpThreads: MTLSize
+    private let defectPixelThreads: MTLSize
     private var textureCache: CVMetalTextureCache?
 
     // ── Texture pool (avoids per-frame allocation, triple-buffered for concurrent in-flight frames) ──
@@ -140,6 +148,67 @@ final class MetalPipeline: @unchecked Sendable {
     private var pixelBufferPoolW: Int = 0
     private var pixelBufferPoolH: Int = 0
     private var pixelBufferPoolFormat: OSType = 0
+
+    // ── Frame timing & moving-average telemetry ──
+    private let timingLock = OSAllocatedUnfairLock()
+    private var rollingFrameTimes: [Double] = Array(repeating: 0.0, count: 30)
+    private var rollingIndex = 0
+    private var rollingCount = 0
+    private var rollingSum: Double = 0.0
+    private let rollingWindowSize = 30
+    private var totalFramesProcessed: Int64 = 0
+    private var lastRollingLogTime: CFTimeInterval = 0
+    public private(set) var latestFrameTimeMs: Double = 0.0
+    public private(set) var averageFrameTimeMs: Double = 0.0
+
+    private func recordFrameTime(_ ms: Double, isRecording: Bool, width: Int, height: Int) {
+        let (avg, minMs, maxMs, shouldLog): (Double, Double, Double, Bool) = timingLock.withLock {
+            totalFramesProcessed += 1
+            latestFrameTimeMs = ms
+            if rollingCount < rollingWindowSize {
+                rollingFrameTimes[rollingIndex] = ms
+                rollingSum += ms
+                rollingCount += 1
+                rollingIndex = (rollingIndex + 1) % rollingWindowSize
+            } else {
+                rollingSum -= rollingFrameTimes[rollingIndex]
+                rollingFrameTimes[rollingIndex] = ms
+                rollingSum += ms
+                rollingIndex = (rollingIndex + 1) % rollingWindowSize
+            }
+
+            let avg = rollingSum / Double(rollingCount)
+            averageFrameTimeMs = avg
+
+            let now = CACurrentMediaTime()
+            let log = (now - lastRollingLogTime >= 1.0 || (totalFramesProcessed <= 30 && totalFramesProcessed % 10 == 0))
+            var minVal = ms
+            var maxVal = ms
+            if log {
+                lastRollingLogTime = now
+                minVal = rollingFrameTimes[0..<rollingCount].min() ?? ms
+                maxVal = rollingFrameTimes[0..<rollingCount].max() ?? ms
+            }
+            return (avg, minVal, maxVal, log)
+        }
+
+        #if DEBUG
+        print(String(format: "[MetalPipeline] frame time: %.2f ms", ms))
+        #endif
+
+        if shouldLog {
+            let effectiveFPS = avg > 0 ? (1000.0 / avg) : 0.0
+            let headroom30 = 33.33 - avg
+            let headroom60 = 16.67 - avg
+            let status60 = headroom60 >= 0 ? "FEASIBLE" : "EXCEEDS BUDGET"
+
+            print(String(
+                format: "[MetalPipeline] ⏱ Avg Frame Time (30f): %.2f ms (min: %.2f, max: %.2f) | GPU: ~%.1f fps | 30fps margin: %+.1f ms | 60fps (16.67ms): %+.1f ms [%@] | Mode: %@",
+                avg, minMs, maxMs, effectiveFPS, headroom30, headroom60, status60,
+                isRecording ? "REC (\(width)x\(height))" : "VIEW (\(width)x\(height))"
+            ))
+        }
+    }
 
     var curveType: LogCurveType = .sLog3Approx {
         didSet {
@@ -189,13 +258,29 @@ final class MetalPipeline: @unchecked Sendable {
         self.commandQueue = queue
         self.scopeCommandQueue = scopeQueue
         do {
-            self.binPipeline = try device.makeComputePipelineState(function: binFunc)
-            self.unsharpPipeline = try device.makeComputePipelineState(function: unsharpFunc)
-            self.debayerFusedPipeline = try device.makeComputePipelineState(function: debayerFusedFunc)
-            self.convertFormatPipeline = try device.makeComputePipelineState(function: convertFormatFunc)
-            self.convertYpCbCr10Pipeline = try device.makeComputePipelineState(function: convertYpCbCr10Func)
-            self.cropAndResamplePipeline = try device.makeComputePipelineState(function: cropAndResampleFunc)
-            self.defectPixelPipeline = try device.makeComputePipelineState(function: defectPixelFunc)
+            let bin = try device.makeComputePipelineState(function: binFunc)
+            let unsharp = try device.makeComputePipelineState(function: unsharpFunc)
+            let debayer = try device.makeComputePipelineState(function: debayerFusedFunc)
+            let convertFormat = try device.makeComputePipelineState(function: convertFormatFunc)
+            let convertYp = try device.makeComputePipelineState(function: convertYpCbCr10Func)
+            let crop = try device.makeComputePipelineState(function: cropAndResampleFunc)
+            let defect = try device.makeComputePipelineState(function: defectPixelFunc)
+
+            self.binPipeline = bin
+            self.unsharpPipeline = unsharp
+            self.debayerFusedPipeline = debayer
+            self.convertFormatPipeline = convertFormat
+            self.convertYpCbCr10Pipeline = convertYp
+            self.cropAndResamplePipeline = crop
+            self.defectPixelPipeline = defect
+
+            self.binThreads = Self.computeThreadsPerGroup(for: bin)
+            self.unsharpThreads = Self.computeThreadsPerGroup(for: unsharp)
+            self.debayerFusedThreads = Self.computeThreadsPerGroup(for: debayer)
+            self.convertFormatThreads = Self.computeThreadsPerGroup(for: convertFormat)
+            self.convertYpCbCr10Threads = Self.computeThreadsPerGroup(for: convertYp)
+            self.cropAndResampleThreads = Self.computeThreadsPerGroup(for: crop)
+            self.defectPixelThreads = Self.computeThreadsPerGroup(for: defect)
         } catch {
             print("[MetalPipeline] Failed to create compute pipelines: \(error)")
             return nil
@@ -425,10 +510,12 @@ final class MetalPipeline: @unchecked Sendable {
                     enc.setComputePipelineState(convertFormatPipeline)
                     enc.setTexture(sourceTexture, index: 0)
                     enc.setTexture(bgraTex, index: 1)
-                    dispatch(enc, width: encodeWidth, height: encodeHeight, state: convertFormatPipeline)
+                    dispatch(enc, width: encodeWidth, height: encodeHeight, threadsPerGroup: convertFormatThreads)
                     enc.endEncoding()
 
-                    Self.attachColorMetadata(to: pb, curveType: curveType)
+                    if CVBufferGetAttachment(pb, kCVImageBufferColorPrimariesKey, nil) == nil {
+                        Self.attachColorMetadata(to: pb, curveType: curveType)
+                    }
                     return (pb, [])
                 }
             }
@@ -445,10 +532,12 @@ final class MetalPipeline: @unchecked Sendable {
             enc.setComputePipelineState(convertFormatPipeline)
             enc.setTexture(sourceTexture, index: 0)
             enc.setTexture(bgraTex, index: 1)
-            dispatch(enc, width: encodeWidth, height: encodeHeight, state: convertFormatPipeline)
+            dispatch(enc, width: encodeWidth, height: encodeHeight, threadsPerGroup: convertFormatThreads)
             enc.endEncoding()
 
-            Self.attachColorMetadata(to: pb, curveType: curveType)
+            if CVBufferGetAttachment(pb, kCVImageBufferColorPrimariesKey, nil) == nil {
+                Self.attachColorMetadata(to: pb, curveType: curveType)
+            }
             return (pb, [cvTex])
         } else {
             guard let pb = getOrCreatePixelBuffer(width: encodeWidth, height: encodeHeight, format: kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange) else {
@@ -478,10 +567,12 @@ final class MetalPipeline: @unchecked Sendable {
                     enc.setTexture(sourceTexture, index: 0)
                     enc.setTexture(yTex, index: 1)
                     enc.setTexture(uvTex, index: 2)
-                    dispatch(enc, width: uvW, height: uvH, state: convertYpCbCr10Pipeline)
+                    dispatch(enc, width: uvW, height: uvH, threadsPerGroup: convertYpCbCr10Threads)
                     enc.endEncoding()
 
-                    Self.attachColorMetadata(to: pb, curveType: curveType)
+                    if CVBufferGetAttachment(pb, kCVImageBufferColorPrimariesKey, nil) == nil {
+                        Self.attachColorMetadata(to: pb, curveType: curveType)
+                    }
                     return (pb, [])
                 }
             }
@@ -506,10 +597,12 @@ final class MetalPipeline: @unchecked Sendable {
             enc.setTexture(sourceTexture, index: 0)
             enc.setTexture(yTex, index: 1)
             enc.setTexture(uvTex, index: 2)
-            dispatch(enc, width: uvW, height: uvH, state: convertYpCbCr10Pipeline)
+            dispatch(enc, width: uvW, height: uvH, threadsPerGroup: convertYpCbCr10Threads)
             enc.endEncoding()
 
-            Self.attachColorMetadata(to: pb, curveType: curveType)
+            if CVBufferGetAttachment(pb, kCVImageBufferColorPrimariesKey, nil) == nil {
+                Self.attachColorMetadata(to: pb, curveType: curveType)
+            }
             return (pb, [cvY, cvUV])
         }
     }
@@ -535,9 +628,7 @@ final class MetalPipeline: @unchecked Sendable {
                  encodeAsBGRA: Bool = false,
                  slot: Int = 0,
                  completion: @escaping (MTLTexture?, CVPixelBuffer?) -> Void) {
-#if DEBUG
         let t0 = CACurrentMediaTime()
-#endif
         let fullW = CVPixelBufferGetWidth(pixelBuffer)
         let fullH = CVPixelBufferGetHeight(pixelBuffer)
         guard fullW > 0, fullH > 0 else { completion(nil, nil); return }
@@ -566,7 +657,7 @@ final class MetalPipeline: @unchecked Sendable {
             enc.setComputePipelineState(binPipeline)
             enc.setTexture(fullBayer, index: 0)
             enc.setTexture(halfTex, index: 1)
-            dispatch(enc, width: halfW, height: halfH, state: binPipeline)
+            dispatch(enc, width: halfW, height: halfH, threadsPerGroup: binThreads)
             enc.endEncoding()
             bayerIn = halfTex
             bayerW = halfW
@@ -595,7 +686,7 @@ final class MetalPipeline: @unchecked Sendable {
             var defectNoiseParams = DefectPixelParams(shotCoeff: noiseShotCoeff, readCoeff: noiseReadCoeff)
             encDPC.setBytes(&debayerParams, length: MemoryLayout<DebayerParams>.stride, index: 0)
             encDPC.setBytes(&defectNoiseParams, length: MemoryLayout<DefectPixelParams>.stride, index: 1)
-            dispatch(encDPC, width: bayerW, height: bayerH, state: defectPixelPipeline)
+            dispatch(encDPC, width: bayerW, height: bayerH, threadsPerGroup: defectPixelThreads)
             encDPC.endEncoding()
             bayerIn = correctedBayerPass
         }
@@ -624,7 +715,7 @@ final class MetalPipeline: @unchecked Sendable {
             enc.setBytes(&lscParams, length: MemoryLayout<LSCParams>.stride, index: 1)
             var cMatrix = wbParams.colorMatrix
             enc.setBytes(&cMatrix, length: MemoryLayout<simd_float3x3>.stride, index: 2)
-            dispatch(enc, width: bayerW, height: bayerH, state: debayerFusedPipeline)
+            dispatch(enc, width: bayerW, height: bayerH, threadsPerGroup: debayerFusedThreads)
             enc.endEncoding()
         }
 
@@ -639,15 +730,18 @@ final class MetalPipeline: @unchecked Sendable {
         ) ?? fusedOut
 
         // Adaptive unsharp masking executed on target resolution post-crop/scale.
+        // Runs for recording to deliver cinema-grade detail, and safely bypassed in previewFast
+        // (and during elevated thermal states) to save ~2ms of GPU time and ~100MB/s memory traffic.
         let finalTex: MTLTexture
-        if sharpnessStrength > 0.001, let sTex = getOrCreateSharpenTexture(width: scaledTex.width, height: scaledTex.height, slot: slot),
+        if processingQuality == .recordQuality && sharpnessStrength > 0.001,
+           let sTex = getOrCreateSharpenTexture(width: scaledTex.width, height: scaledTex.height, slot: slot),
            let enc = commandBuffer.makeComputeCommandEncoder() {
             enc.setComputePipelineState(unsharpPipeline)
             enc.setTexture(scaledTex, index: 0)
             enc.setTexture(sTex, index: 1)
             var s = sharpnessStrength
             enc.setBytes(&s, length: MemoryLayout<Float>.stride, index: 0)
-            dispatch(enc, width: scaledTex.width, height: scaledTex.height, state: unsharpPipeline)
+            dispatch(enc, width: scaledTex.width, height: scaledTex.height, threadsPerGroup: unsharpThreads)
             enc.endEncoding()
             finalTex = sTex
         } else {
@@ -671,8 +765,10 @@ final class MetalPipeline: @unchecked Sendable {
         let outputPBBox = SendableBox(value: outputPB)
         let retainedTexturesBox = SendableBox(value: retainedCVTextures)
         let completionBox = SendableBox(value: completion)
-        commandBuffer.addCompletedHandler { cb in
+        commandBuffer.addCompletedHandler { [weak self] cb in
             _ = retainedTexturesBox.value
+            let dtMs = (CACurrentMediaTime() - t0) * 1000.0
+            self?.recordFrameTime(dtMs, isRecording: encodeAsBGRA, width: encodeWidth, height: encodeHeight)
             if let error = cb.error {
                 print("[MetalPipeline] ERROR: Command buffer failed: \(error.localizedDescription)")
             }
@@ -713,7 +809,7 @@ final class MetalPipeline: @unchecked Sendable {
                         enc.setComputePipelineState(convertFormatPipeline)
                         enc.setTexture(texture, index: 0)
                         enc.setTexture(dst, index: 1)
-                        dispatch(enc, width: targetWidth, height: targetHeight, state: convertFormatPipeline)
+                        dispatch(enc, width: targetWidth, height: targetHeight, threadsPerGroup: convertFormatThreads)
                         enc.endEncoding()
                     }
                 } else if let blit = cb.makeBlitCommandEncoder() {
@@ -765,7 +861,7 @@ final class MetalPipeline: @unchecked Sendable {
         enc.setTexture(dst, index: 1)
         var params = CropParams(scaleX: scaleX, scaleY: scaleY, startX: startX, startY: startY)
         enc.setBytes(&params, length: MemoryLayout<CropParams>.stride, index: 0)
-        dispatch(enc, width: targetWidth, height: targetHeight, state: cropAndResamplePipeline)
+        dispatch(enc, width: targetWidth, height: targetHeight, threadsPerGroup: cropAndResampleThreads)
         enc.endEncoding()
 
         return dst
@@ -794,7 +890,7 @@ final class MetalPipeline: @unchecked Sendable {
             enc.setTexture(output, index: 1)
             var params = CropParams(scaleX: scaleX, scaleY: scaleY, startX: startX, startY: startY)
             enc.setBytes(&params, length: MemoryLayout<CropParams>.stride, index: 0)
-            dispatch(enc, width: width, height: height, state: cropAndResamplePipeline)
+            dispatch(enc, width: width, height: height, threadsPerGroup: cropAndResampleThreads)
             enc.endEncoding()
         }
         let outputBox = SendableBox(value: output)
@@ -804,7 +900,7 @@ final class MetalPipeline: @unchecked Sendable {
             let bytesPerComponent = MemoryLayout<UInt16>.stride
             let bytesPerRow = width * componentsPerPixel * bytesPerComponent
             let totalElements = width * height * componentsPerPixel
-            let pixels = [UInt16](unsafeUninitializedCapacity: totalElements) { buffer, initializedCount in
+            withUnsafeTemporaryAllocation(of: UInt16.self, capacity: totalElements) { buffer in
                 if let base = buffer.baseAddress {
                     outputBox.value.getBytes(
                         base,
@@ -812,12 +908,17 @@ final class MetalPipeline: @unchecked Sendable {
                         from: MTLRegionMake2D(0, 0, width, height),
                         mipmapLevel: 0
                     )
-                    initializedCount = totalElements
+                    let scope = ScopeData.make(
+                        fromHalfRGBAPointer: base,
+                        count: totalElements,
+                        width: width,
+                        height: height
+                    )
+                    completionBox.value(scope)
                 } else {
-                    initializedCount = 0
+                    completionBox.value(nil)
                 }
             }
-            completionBox.value(ScopeData.make(fromHalfRGBA: pixels, width: width, height: height))
         }
         cb.commit()
     }
@@ -908,19 +1009,21 @@ final class MetalPipeline: @unchecked Sendable {
         return device.makeTexture(descriptor: desc)
     }
 
-    private func dispatch(_ enc: MTLComputeCommandEncoder, width: Int, height: Int, state: MTLComputePipelineState) {
+    private static func computeThreadsPerGroup(for state: MTLComputePipelineState) -> MTLSize {
         // Optimal 16x16 2D tile (256 threads) on Apple Silicon maximizes GPU EU occupancy
         // and L1 texture cache locality while preventing register spilling.
-        let tw: Int
-        let th: Int
         if state.maxTotalThreadsPerThreadgroup >= 256 {
-            tw = 16
-            th = 16
+            return MTLSize(width: 16, height: 16, depth: 1)
         } else {
-            tw = state.threadExecutionWidth
-            th = max(1, state.maxTotalThreadsPerThreadgroup / tw)
+            let tw = state.threadExecutionWidth
+            let th = max(1, state.maxTotalThreadsPerThreadgroup / tw)
+            return MTLSize(width: tw, height: th, depth: 1)
         }
-        let threadsPerGroup = MTLSize(width: tw, height: th, depth: 1)
+    }
+
+    private func dispatch(_ enc: MTLComputeCommandEncoder, width: Int, height: Int, threadsPerGroup: MTLSize) {
+        let tw = threadsPerGroup.width
+        let th = threadsPerGroup.height
         let groups = MTLSize(
             width: (width + tw - 1) / tw,
             height: (height + th - 1) / th,

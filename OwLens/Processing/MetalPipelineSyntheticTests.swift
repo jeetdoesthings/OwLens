@@ -797,8 +797,17 @@ extension MetalPipeline {
             allPassed = false
         }
 
+        whitePixel.withUnsafeBufferPointer { ptr in
+            guard let base = ptr.baseAddress else { return }
+            let scopePtr = ScopeData.make(fromHalfRGBAPointer: base, count: ptr.count, width: 1, height: 1, histogramBins: 64, waveformColumns: 64, waveformRows: 48)
+            if scopePtr.waveform[0 * 64 + 0] <= 0 {
+                print("[ScopeDataTest] FAIL White pixel pointer did not hit waveform top row (100 IRE)")
+                allPassed = false
+            }
+        }
+
         if allPassed {
-            print("[ScopeDataTest] PASS: ScopeData BT.2020 luma and 100 IRE clipping verified")
+            print("[ScopeDataTest] PASS: ScopeData BT.2020 luma and 100 IRE clipping verified (array & pointer APIs)")
         }
         return allPassed
     }

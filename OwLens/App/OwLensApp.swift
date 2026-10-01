@@ -1,5 +1,8 @@
 import SwiftUI
 import AVFoundation
+import AVKit
+import MediaPlayer
+import Combine
 
 @main
 struct OwLensApp: App {
@@ -21,6 +24,13 @@ struct RootView: View {
 
     var body: some View {
         ZStack {
+            // Hardware Volume Button & Camera Control Shutter Interception
+            HardwareShutterInteractionView {
+                viewModel.toggleRecording()
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .allowsHitTesting(false)
+
             if permissionDenied {
                 permissionDeniedView
             } else if viewModel.isDeviceUnsupportedForLog {
@@ -37,7 +47,8 @@ struct RootView: View {
                             showClipping: $viewModel.showClipping,
                             showFocusPeaking: $viewModel.showFocusPeaking,
                             showDisplayLUT: viewModel.showDisplayLUT,
-                            overlayOnly: false
+                            overlayOnly: false,
+                            targetFPS: viewModel.selectedFPS.rawValue
                         )
                         .opacity(1)
                         .allowsHitTesting(true)
@@ -120,7 +131,7 @@ struct RootView: View {
 
                 // Interactive HUD Controls & Panels (docked to edges on iPad and iPhone)
                 ControlsView(viewModel: viewModel)
-                    .ignoresSafeArea(edges: .vertical)
+                    .ignoresSafeArea()
             } else if viewModel.metalPipeline == nil {
                 metalUnavailableView
             } else {
@@ -336,6 +347,66 @@ struct RootView: View {
             }
         default:
             permissionDenied = true
+        }
+    }
+}
+
+// MARK: - Hardware Shutter Interception (Volume Buttons & Camera Control)
+
+/// Captures physical volume button presses (Volume Up / Down) and Camera Control events to trigger recording.
+/// Uses native AVCaptureEventInteraction (iOS 17.2+) with an off-screen MPVolumeView to suppress the system volume HUD.
+struct HardwareShutterInteractionView: UIViewRepresentable {
+    let onTrigger: () -> Void
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(onTrigger: onTrigger)
+    }
+
+    func makeUIView(context: Context) -> UIView {
+        let view = UIView(frame: .zero)
+
+        // 1. Off-screen MPVolumeView suppresses the iOS system volume HUD popup
+        let volumeView = MPVolumeView(frame: CGRect(x: -1000, y: -1000, width: 1, height: 1))
+        volumeView.alpha = 0.0001
+        volumeView.clipsToBounds = true
+        view.addSubview(volumeView)
+
+        // 2. AVCaptureEventInteraction for native hardware button handling (iOS 17.2+)
+        if #available(iOS 17.2, *) {
+            let interaction = AVCaptureEventInteraction(primary: { [weak coordinator = context.coordinator] event in
+                if event.phase == .ended {
+                    coordinator?.triggerAction()
+                }
+            }, secondary: { [weak coordinator = context.coordinator] event in
+                if event.phase == .ended {
+                    coordinator?.triggerAction()
+                }
+            })
+            view.addInteraction(interaction)
+        }
+
+        return view
+    }
+
+    func updateUIView(_ uiView: UIView, context: Context) {
+        context.coordinator.onTrigger = onTrigger
+    }
+
+    final class Coordinator: NSObject {
+        var onTrigger: () -> Void
+        private var lastTriggerTime: CFTimeInterval = 0
+
+        init(onTrigger: @escaping () -> Void) {
+            self.onTrigger = onTrigger
+        }
+
+        func triggerAction() {
+            let now = CACurrentMediaTime()
+            guard now - lastTriggerTime > 0.4 else { return }
+            lastTriggerTime = now
+            DispatchQueue.main.async { [weak self] in
+                self?.onTrigger()
+            }
         }
     }
 }

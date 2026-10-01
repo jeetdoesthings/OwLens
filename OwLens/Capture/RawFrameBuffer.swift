@@ -1,5 +1,6 @@
 import Foundation
 import CoreVideo
+import os
 
 /// Thread-safe ring buffer for incoming RAW frames.
 /// Decouples capture rate from processing rate — if the Metal pipeline
@@ -11,13 +12,11 @@ final class RawFrameBuffer {
     private var writeIndex = 0
     private var readIndex = 0
     private var count = 0
-    private let lock = NSLock()
+    private let lock = OSAllocatedUnfairLock()
     private var _droppedCount: Int = 0
 
     var droppedCount: Int {
-        lock.lock()
-        defer { lock.unlock() }
-        return _droppedCount
+        lock.withLock { _droppedCount }
     }
 
     init(capacity: Int = 3) {
@@ -27,78 +26,71 @@ final class RawFrameBuffer {
 
     /// Enqueue a new raw frame. Overwrites oldest if full.
     func enqueue(_ frame: RawFrameData) {
-        lock.lock()
-        defer { lock.unlock() }
+        lock.withLock {
+            if count == capacity {
+                // Drop oldest
+                buffer[readIndex] = nil
+                readIndex = (readIndex + 1) % capacity
+                count -= 1
+                _droppedCount += 1
+            }
 
-        if count == capacity {
-            // Drop oldest
-            buffer[readIndex] = nil
-            readIndex = (readIndex + 1) % capacity
-            count -= 1
-            _droppedCount += 1
+            buffer[writeIndex] = frame
+            writeIndex = (writeIndex + 1) % capacity
+            count += 1
         }
-
-        buffer[writeIndex] = frame
-        writeIndex = (writeIndex + 1) % capacity
-        count += 1
     }
 
     /// Dequeue the oldest available frame. Returns nil if empty.
     func dequeue() -> RawFrameData? {
-        lock.lock()
-        defer { lock.unlock() }
+        lock.withLock {
+            guard count > 0 else { return nil }
 
-        guard count > 0 else { return nil }
-
-        let frame = buffer[readIndex]
-        buffer[readIndex] = nil
-        readIndex = (readIndex + 1) % capacity
-        count -= 1
-        return frame
+            let frame = buffer[readIndex]
+            buffer[readIndex] = nil
+            readIndex = (readIndex + 1) % capacity
+            count -= 1
+            return frame
+        }
     }
 
     /// Drop backlog; return only the newest frame (lowest preview/encode latency).
     func dequeueLatest() -> RawFrameData? {
-        lock.lock()
-        defer { lock.unlock() }
+        lock.withLock {
+            guard count > 0 else { return nil }
 
-        guard count > 0 else { return nil }
-
-        let dropped = count - 1
-        if dropped > 0 {
-            for _ in 0..<dropped {
-                buffer[readIndex] = nil
-                readIndex = (readIndex + 1) % capacity
+            let dropped = count - 1
+            if dropped > 0 {
+                for i in 0..<dropped {
+                    buffer[(readIndex + i) % capacity] = nil
+                }
+                readIndex = (readIndex + dropped) % capacity
+                count -= dropped
+                _droppedCount += dropped
             }
-            count -= dropped
-            _droppedCount += dropped
-        }
 
-        let frame = buffer[readIndex]
-        buffer[readIndex] = nil
-        readIndex = (readIndex + 1) % capacity
-        count -= 1
-        return frame
+            let frame = buffer[readIndex]
+            buffer[readIndex] = nil
+            readIndex = (readIndex + 1) % capacity
+            count -= 1
+            return frame
+        }
     }
 
     var currentCount: Int {
-        lock.lock()
-        defer { lock.unlock() }
-        return count
+        lock.withLock { count }
     }
 
     var isFull: Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        return count == capacity
+        lock.withLock { count == capacity }
     }
 
     func flush() {
-        lock.lock()
-        defer { lock.unlock() }
-        buffer = Array(repeating: nil, count: capacity)
-        writeIndex = 0
-        readIndex = 0
-        count = 0
+        lock.withLock {
+            buffer = Array(repeating: nil, count: capacity)
+            writeIndex = 0
+            readIndex = 0
+            count = 0
+        }
     }
 }

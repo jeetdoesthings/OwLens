@@ -8,6 +8,7 @@ import simd
 import UIKit
 import UniformTypeIdentifiers
 import SwiftUI
+import os
 
 /// Dedicated observable object holding live audio peak levels.
 /// Throttled to ~15 Hz with a deadband filter, isolating VU meter animations
@@ -188,6 +189,7 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
         }
     }
     @Published var droppedFrames: Int = 0
+    @Published var averageFrameTimeMs: Double = 0.0
     @Published var cfaLabel: String = "—"
 
     /// Runtime device probe (set once at setup).
@@ -365,8 +367,25 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
     var audioLevel: Float { audioMonitor.level }
     nonisolated(unsafe) private var lastAudioLevelUpdateTime: CFTimeInterval = 0
 
-    @Published var batteryLevel: Float = 1.0
+    @Published var currentTimeString: String = {
+        let f = DateFormatter()
+        f.dateFormat = "HH:mm"
+        f.locale = Locale(identifier: "en_US_POSIX")
+        return f.string(from: Date())
+    }()
+    @Published var batteryLevel: Float = {
+        UIDevice.current.isBatteryMonitoringEnabled = true
+        let raw = UIDevice.current.batteryLevel
+        return raw >= 0 ? raw : -1.0
+    }()
     @Published var isBatteryCharging: Bool = false
+
+    private static let timeFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "HH:mm"
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        return formatter
+    }()
 
     // MARK: - HUD State & Toast Notifications
     @Published var isHUDHidden: Bool = false
@@ -396,7 +415,7 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
 
     private let processQueue = DispatchQueue(label: "raw.process.queue", qos: .userInteractive)
     private let recordingQueue = DispatchQueue(label: "com.owlens.recording", qos: .userInteractive)
-    nonisolated private let processLock = NSLock()
+    nonisolated private let processLock = OSAllocatedUnfairLock()
     nonisolated(unsafe) private var freeSlots: Set<Int> = [0, 1, 2]
 
     // Sequencer for guaranteeing strictly monotonic frame ordering during recording
@@ -411,6 +430,7 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
     nonisolated(unsafe) private var isAudioMutedUnsafe = false
     nonisolated(unsafe) private var showScopesUnsafe = true
     nonisolated(unsafe) private var lastScopeUpdateTime: CFTimeInterval = 0
+    nonisolated(unsafe) private var lastMainActorSyncTime: CFTimeInterval = 0
     nonisolated(unsafe) var isAppActive = true
     /// Measured LSC override from device calibration (set once at setup).
     nonisolated(unsafe) private var lscOverride: LSCCoefficients?
@@ -433,7 +453,7 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
     override init() {
         metalPipeline = MetalPipeline()
         super.init()
-        startBatteryMonitoring()
+        startClockAndBatteryMonitoring()
 #if DEBUG
         if let pipeline = metalPipeline {
             Task.detached(priority: .utility) {
@@ -595,6 +615,9 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
     private func handleAppActive() {
         isAppActive = true
         UIApplication.shared.isIdleTimerDisabled = true
+        UIDevice.current.isBatteryMonitoringEnabled = true
+        updateBatteryStatus()
+        updateCurrentTime()
         updateStorageEstimate()
         startStorageMonitor()
         // Restart session if we already configured once
@@ -779,9 +802,10 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.6, execute: work)
     }
 
-    private func startBatteryMonitoring() {
+    private func startClockAndBatteryMonitoring() {
         UIDevice.current.isBatteryMonitoringEnabled = true
         updateBatteryStatus()
+        updateCurrentTime()
 
         // Hardware PMU needs a cycle after enabling battery monitoring to populate true level
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
@@ -804,14 +828,26 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
             .sink { [weak self] _ in
                 UIDevice.current.isBatteryMonitoringEnabled = true
                 self?.updateBatteryStatus()
+                self?.updateCurrentTime()
             }
             .store(in: &cancellables)
 
-        // Periodic 5s polling ensures live updates without relying solely on coalesced notifications
-        Timer.publish(every: 5.0, on: .main, in: .common)
+        // 1 Hz timer to keep 24-hour clock and battery level accurate
+        Timer.publish(every: 1.0, on: .main, in: .common)
             .autoconnect()
-            .sink { [weak self] _ in self?.updateBatteryStatus() }
+            .sink { [weak self] _ in
+                guard let self else { return }
+                self.updateCurrentTime()
+                self.updateBatteryStatus()
+            }
             .store(in: &cancellables)
+    }
+
+    private func updateCurrentTime() {
+        let formatted = Self.timeFormatter.string(from: Date())
+        if currentTimeString != formatted {
+            currentTimeString = formatted
+        }
     }
 
     private func updateBatteryStatus() {
@@ -820,21 +856,30 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
         }
         let raw = UIDevice.current.batteryLevel
         if raw >= 0 {
-            batteryLevel = raw
+            if abs(batteryLevel - raw) > 0.001 {
+                batteryLevel = raw
+            }
         }
         let state = UIDevice.current.batteryState
-        isBatteryCharging = (state == .charging || state == .full)
+        let charging = (state == .charging || state == .full)
+        if isBatteryCharging != charging {
+            isBatteryCharging = charging
+        }
     }
 
     nonisolated private func processAudioSample(_ sample: CMSampleBuffer) {
+        let now = CACurrentMediaTime()
         if isAudioMutedUnsafe {
+            // Throttled reset to prevent queuing up to 100 async tasks/sec on the main runloop when muted
+            guard now - lastAudioLevelUpdateTime >= 0.25 else { return }
+            lastAudioLevelUpdateTime = now
             DispatchQueue.main.async { [weak self] in
                 self?.audioMonitor.reset()
             }
             return
         }
-        let now = CACurrentMediaTime()
-        guard now - lastAudioLevelUpdateTime >= 0.05 else { return }
+        // Align background sample processing directly with AudioMonitor's ~15 Hz (66 ms) UI cadence
+        guard now - lastAudioLevelUpdateTime >= 0.066 else { return }
         lastAudioLevelUpdateTime = now
 
         guard let blockBuffer = CMSampleBufferGetDataBuffer(sample) else { return }
@@ -1332,6 +1377,20 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
 
     // MARK: - Recording
 
+    private let initializationTime: Date = Date()
+
+    func toggleRecording() {
+        guard isCameraReady, !isDeviceUnsupportedForLog, !isSaving else { return }
+        // Guard against any spurious triggers during initial view hierarchy stabilization
+        guard Date().timeIntervalSince(initializationTime) > 1.0 else { return }
+        Haptics.notification(.success)
+        if isRecording {
+            stopRecording()
+        } else {
+            startRecording()
+        }
+    }
+
     func startRecording() {
         guard !isDeviceUnsupportedForLog else {
             errorMessage = "Recording disabled — device has no Bayer RAW."
@@ -1413,11 +1472,11 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
             )
             isRecording = true
             isRecordingUnsafe = true
-            processLock.lock()
-            nextDispatchSequenceID = 0
-            nextOutputSequenceID = 0
-            reorderBuffer.removeAll()
-            processLock.unlock()
+            processLock.withLock {
+                nextDispatchSequenceID = 0
+                nextOutputSequenceID = 0
+                reorderBuffer.removeAll()
+            }
             frameIndex = 0
             frameCount = 0
             recordingStartTime = recordingDate
@@ -1504,15 +1563,16 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
             }
         }
 
-        processLock.lock()
-        let bufferedKeys = reorderBuffer.keys.sorted()
-        var remaining: [(MTLTexture?, CVPixelBuffer?, RawFrameData)] = []
-        for k in bufferedKeys {
-            if let item = reorderBuffer.removeValue(forKey: k) {
-                remaining.append(item)
+        let remaining: [(MTLTexture?, CVPixelBuffer?, RawFrameData)] = processLock.withLock {
+            let bufferedKeys = reorderBuffer.keys.sorted()
+            var rem: [(MTLTexture?, CVPixelBuffer?, RawFrameData)] = []
+            for k in bufferedKeys {
+                if let item = reorderBuffer.removeValue(forKey: k) {
+                    rem.append(item)
+                }
             }
+            return rem
         }
-        processLock.unlock()
 
         for item in remaining {
             dispatchOrderedRecordedFrame(item.0, bgraPB: item.1, frameData: item.2)
@@ -1824,20 +1884,11 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
     }
 
     nonisolated private func scheduleProcess() {
-        processLock.lock()
-        guard !freeSlots.isEmpty else {
-            processLock.unlock()
-            return
+        let slotToUse: Int? = processLock.withLock {
+            guard !freeSlots.isEmpty, frameBuffer.currentCount > 0 else { return nil }
+            return freeSlots.popFirst()
         }
-        guard frameBuffer.currentCount > 0 else {
-            processLock.unlock()
-            return
-        }
-        guard let slot = freeSlots.popFirst() else {
-            processLock.unlock()
-            return
-        }
-        processLock.unlock()
+        guard let slot = slotToUse else { return }
 
         processQueue.async { [weak self] in
             self?.drainBuffer(slot: slot)
@@ -1850,10 +1901,10 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
             // FIFO during recording: process every single captured frame in order without skipping
             frame = frameBuffer.dequeue()
             if var f = frame {
-                processLock.lock()
-                f.sequenceID = nextDispatchSequenceID
-                nextDispatchSequenceID &+= 1
-                processLock.unlock()
+                processLock.withLock {
+                    f.sequenceID = nextDispatchSequenceID
+                    nextDispatchSequenceID &+= 1
+                }
                 frame = f
             }
         } else {
@@ -1861,9 +1912,9 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
             frame = frameBuffer.dequeueLatest()
         }
         guard let frame else {
-            processLock.lock()
-            freeSlots.insert(slot)
-            processLock.unlock()
+            processLock.withLock {
+                freeSlots.insert(slot)
+            }
             return
         }
 
@@ -1872,10 +1923,10 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
 
         processFrame(frame, slot: slot) { [weak self] in
             guard let self else { return }
-            self.processLock.lock()
-            self.freeSlots.insert(slot)
-            let remaining = self.frameBuffer.currentCount
-            self.processLock.unlock()
+            let remaining: Int = self.processLock.withLock {
+                self.freeSlots.insert(slot)
+                return self.frameBuffer.currentCount
+            }
             if remaining > 0 {
                 self.scheduleProcess()
             }
@@ -1988,22 +2039,31 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
                 // Submit texture directly to PreviewFeed for zero-allocation rendering on MTKView
                 previewFeed.submit(texture: framed)
 
-                let frameDataBox = SendableBox(value: frameData)
-                Task { @MainActor [weak self] in
-                    guard let self else { return }
-                    self.syncLiveAutoValues(from: frameDataBox.value)
-                    if self.cfaLabel != cfaName { self.cfaLabel = cfaName }
-                    if self.droppedFrames != drops { self.droppedFrames = drops }
+                let now = CACurrentMediaTime()
+                if now - lastMainActorSyncTime >= 0.10 || drops > 0 {
+                    lastMainActorSyncTime = now
+                    let frameDataBox = SendableBox(value: frameData)
+                    let avgMs = pipeline.averageFrameTimeMs
+                    Task { @MainActor [weak self] in
+                        guard let self else { return }
+                        self.syncLiveAutoValues(from: frameDataBox.value)
+                        if self.cfaLabel != cfaName { self.cfaLabel = cfaName }
+                        if self.droppedFrames != drops { self.droppedFrames = drops }
+                        if abs(self.averageFrameTimeMs - avgMs) >= 0.1 { self.averageFrameTimeMs = avgMs }
+                    }
                 }
             }
         }
     }
 
-    /// Updates live exposure scopes (histogram + waveform) throttled to ~10 Hz without blocking capture/render.
+    /// Updates live exposure scopes (histogram + waveform) throttled to ~10 Hz (4 Hz when recording) without blocking capture/render.
     nonisolated private func updateScopesIfNeeded(from framed: MTLTexture, pipeline: MetalPipeline?) {
         guard showScopesUnsafe else { return }
         let now = CACurrentMediaTime()
-        guard now - lastScopeUpdateTime >= 0.1 else { return }
+        // During active recording, throttle from 10 Hz (100ms) to 4 Hz (250ms) to reduce GPU downsampling passes
+        // and CPU texture memory readbacks (getBytes) while VideoToolbox encodes real-time frames.
+        let interval: Double = isRecordingUnsafe ? 0.25 : 0.10
+        guard now - lastScopeUpdateTime >= interval else { return }
         lastScopeUpdateTime = now
         pipeline?.makeScopeData(from: framed) { [weak self] scope in
             guard let self, let scope else { return }
@@ -2026,14 +2086,15 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
         guard let framed else { return }
 
         if isRecordingUnsafe {
-            processLock.lock()
-            reorderBuffer[frameData.sequenceID] = (framed, bgraPB, frameData)
-            var readyFrames: [(MTLTexture?, CVPixelBuffer?, RawFrameData)] = []
-            while let next = reorderBuffer.removeValue(forKey: nextOutputSequenceID) {
-                readyFrames.append(next)
-                nextOutputSequenceID &+= 1
+            let readyFrames: [(MTLTexture?, CVPixelBuffer?, RawFrameData)] = processLock.withLock {
+                reorderBuffer[frameData.sequenceID] = (framed, bgraPB, frameData)
+                var ready: [(MTLTexture?, CVPixelBuffer?, RawFrameData)] = []
+                while let next = reorderBuffer.removeValue(forKey: nextOutputSequenceID) {
+                    ready.append(next)
+                    nextOutputSequenceID &+= 1
+                }
+                return ready
             }
-            processLock.unlock()
 
             for item in readyFrames {
                 dispatchOrderedRecordedFrame(item.0, bgraPB: item.1, frameData: item.2)
@@ -2075,12 +2136,18 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
         // Submit texture directly to PreviewFeed for zero-allocation rendering on MTKView
         previewFeed.submit(texture: framed)
 
-        let frameDataBox = SendableBox(value: frameData)
-        Task { @MainActor [weak self] in
-            guard let self else { return }
-            self.syncLiveAutoValues(from: frameDataBox.value)
-            if self.cfaLabel != cfaName { self.cfaLabel = cfaName }
-            if self.droppedFrames != drops { self.droppedFrames = drops }
+        let now = CACurrentMediaTime()
+        if now - lastMainActorSyncTime >= 0.10 || drops > 0 {
+            lastMainActorSyncTime = now
+            let frameDataBox = SendableBox(value: frameData)
+            let avgMs = metalPipeline?.averageFrameTimeMs ?? 0.0
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.syncLiveAutoValues(from: frameDataBox.value)
+                if self.cfaLabel != cfaName { self.cfaLabel = cfaName }
+                if self.droppedFrames != drops { self.droppedFrames = drops }
+                if abs(self.averageFrameTimeMs - avgMs) >= 0.1 { self.averageFrameTimeMs = avgMs }
+            }
         }
     }
 
@@ -2104,7 +2171,18 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
         guard let device = captureController.activeDevice else { return }
 
         if isAutoWhiteBalanceEnabled {
-            if let gains = frameData.whiteBalanceGains {
+            // Fast path: use pre-smoothed Kelvin and Tint calculated on the capture queue
+            // without performing expensive nonlinear polynomial root-finding on the main thread!
+            if let temp = frameData.kelvin, let tintVal = frameData.tint {
+                let clampedTemp = max(2000, min(10000, temp))
+                if abs(wbKelvin - clampedTemp) >= 25 {
+                    wbKelvin = clampedTemp
+                    wbStopIndex = ExposureStops.nearestIndex(in: wbStops, to: clampedTemp)
+                }
+                if abs(wbTint - tintVal) >= 1.0 {
+                    wbTint = tintVal
+                }
+            } else if let gains = frameData.whiteBalanceGains {
                 let clamped = clampWhiteBalanceGains(gains, for: device)
                 let temperatureAndTint = device.temperatureAndTintValues(for: clamped)
                 let temp = max(2000, min(10000, temperatureAndTint.temperature))

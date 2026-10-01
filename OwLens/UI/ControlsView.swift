@@ -7,47 +7,50 @@ struct ControlsView: View {
     @ObservedObject var viewModel: CameraViewModel
 
     var body: some View {
-        ZStack {
-            // Top HUD Status Bar
-            topStatusBar
-                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+        GeometryReader { geo in
+            ZStack {
+                // Top HUD Status Bar
+                topStatusBar(in: geo)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
 
-            // Left Monitoring Tools Rail
-            leftToolRail
-                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+                // Left Monitoring Tools Rail
+                leftToolRail(in: geo)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
 
-            // Bottom Exposure Deck & Transient Panels
-            VStack(spacing: 8) {
-                Spacer(minLength: 0)
-                transientStatusArea
-                bottomExposureDeck
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
-
-            // Right Record Grip (Record button + Scopes below)
-            rightRecordGrip
-                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .trailing)
-
-            // Interactive Toast Pill
-            if let toast = viewModel.activeToast {
-                let isOffState = toast.contains("OFF") || toast.contains("Disabled")
-                let isLockState = toast.contains("Lock")
-                HStack(spacing: 6) {
-                    Image(systemName: isLockState ? "lock.fill" : (isOffState ? "minus.circle.fill" : "checkmark.circle.fill"))
-                        .font(.system(size: isLockState ? 10 : 11, weight: .semibold))
-                        .foregroundColor(isLockState ? Color.white : (isOffState ? OwLensTheme.textSecondary : OwLensTheme.audioNominal))
-                    Text(toast)
-                        .font(.appFont(.medium, size: 12))
-                        .foregroundColor(.white)
+                // Bottom Exposure Deck & Transient Panels
+                VStack(spacing: 8) {
+                    Spacer(minLength: 0)
+                    transientStatusArea
+                    bottomExposureDeck(in: geo)
                 }
-                .padding(.horizontal, 14)
-                .padding(.vertical, 7)
-                .glassPanel(cornerRadius: OwLensTheme.radiusCard, border: OwLensTheme.glassBorderActive, background: OwLensTheme.glassBaseHeavy)
-                .padding(.top, 48)
-                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
-                .transition(.move(edge: .top).combined(with: .opacity))
-                .zIndex(30)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
+
+                // Right Record Grip (Record button + Scopes below)
+                rightRecordGrip(in: geo)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .trailing)
+
+                // Interactive Toast Pill
+                if let toast = viewModel.activeToast {
+                    let isOffState = toast.contains("OFF") || toast.contains("Disabled")
+                    let isLockState = toast.contains("Lock")
+                    HStack(spacing: 6) {
+                        Image(systemName: isLockState ? "lock.fill" : (isOffState ? "minus.circle.fill" : "checkmark.circle.fill"))
+                            .font(.system(size: isLockState ? 10 : 11, weight: .semibold))
+                            .foregroundColor(isLockState ? Color.white : (isOffState ? OwLensTheme.textSecondary : OwLensTheme.audioNominal))
+                        Text(toast)
+                            .font(.appFont(.medium, size: 12))
+                            .foregroundColor(.white)
+                    }
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 7)
+                    .glassPanel(cornerRadius: OwLensTheme.radiusCard, border: OwLensTheme.glassBorderActive, background: OwLensTheme.glassBaseHeavy)
+                    .padding(.top, max(48, ScreenGeometry.topPadding(in: geo) + 38))
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+                    .transition(.move(edge: .top).combined(with: .opacity))
+                    .zIndex(30)
+                }
             }
+            .frame(width: geo.size.width, height: geo.size.height)
         }
         .opacity(viewModel.isHUDHidden ? 0 : 1)
         .animation(.easeInOut(duration: 0.22), value: viewModel.isHUDHidden)
@@ -57,19 +60,88 @@ struct ControlsView: View {
         .animation(.spring(response: 0.28, dampingFraction: 0.82), value: viewModel.showScopes)
     }
 
+    // MARK: - Screen Safe Area & Notch Geometry Helper
+
+    private enum ScreenGeometry {
+        static var windowInsets: UIEdgeInsets {
+            let activeScene = UIApplication.shared.connectedScenes
+                .compactMap({ $0 as? UIWindowScene })
+                .first(where: { $0.activationState == .foregroundActive }) ?? UIApplication.shared.connectedScenes
+                .compactMap({ $0 as? UIWindowScene })
+                .first
+
+            var insets = activeScene?.windows.first(where: { $0.isKeyWindow })?.safeAreaInsets
+                ?? activeScene?.windows.first?.safeAreaInsets
+                ?? .zero
+
+            // If bottom has home indicator (>= 20pt) but left/right report < 30pt (e.g. edge case or early layout pass),
+            // determine the notch side from interface orientation so the UI is NEVER under the notch:
+            if insets.bottom >= 20 && insets.left < 30 && insets.right < 30 {
+                let orientation = activeScene?.interfaceOrientation ?? .landscapeRight
+                if orientation == .landscapeLeft {
+                    // Home button on left -> Notch is on the RIGHT
+                    insets.right = 59
+                } else {
+                    // Home button on right -> Notch is on the LEFT
+                    insets.left = 59
+                }
+            }
+
+            return insets
+        }
+
+        /// Effective safe padding for leading edge (clears notch/Dynamic Island + generous margin)
+        static func leadingPadding(in geo: GeometryProxy) -> CGFloat {
+            let insets = windowInsets
+            let notch = max(geo.safeAreaInsets.leading, insets.left)
+            return notch >= 30 ? (notch + 20) : 28
+        }
+
+        /// Effective safe padding for trailing edge (clears notch/Dynamic Island + generous margin)
+        static func trailingPadding(in geo: GeometryProxy) -> CGFloat {
+            let insets = windowInsets
+            let notch = max(geo.safeAreaInsets.trailing, insets.right)
+            return notch >= 30 ? (notch + 20) : 28
+        }
+
+        /// Effective safe padding for top edge
+        static func topPadding(in geo: GeometryProxy) -> CGFloat {
+            let insets = windowInsets
+            let safeTop = max(geo.safeAreaInsets.top, insets.top)
+            return max(12, safeTop + 4)
+        }
+
+        /// Effective safe padding for bottom edge
+        static func bottomPadding(in geo: GeometryProxy) -> CGFloat {
+            let insets = windowInsets
+            let safeBottom = max(geo.safeAreaInsets.bottom, insets.bottom)
+            return max(16, safeBottom)
+        }
+    }
+
     // MARK: - Top Status Bar
 
-    private var topStatusBar: some View {
-        HStack(spacing: 8) {
-            leftStatusGroup
-            Spacer(minLength: 4)
+    private func topStatusBar(in geo: GeometryProxy) -> some View {
+        let safeLeading = ScreenGeometry.leadingPadding(in: geo)
+        let safeTrailing = ScreenGeometry.trailingPadding(in: geo)
+        let safeTop = ScreenGeometry.topPadding(in: geo)
+
+        return ZStack {
+            // Layer 1: True Mathematical Center (Pinned directly to geo.size.width / 2)
             centerStatusGroup
-            Spacer(minLength: 4)
+                .frame(maxWidth: .infinity, alignment: .center)
+
+            // Layer 2: Leading Telemetry
+            leftStatusGroup
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.leading, safeLeading)
+
+            // Layer 3: Trailing Save & Battery
             rightStatusGroup
+                .frame(maxWidth: .infinity, alignment: .trailing)
+                .padding(.trailing, safeTrailing)
         }
-        .padding(.leading, 20)
-        .padding(.trailing, viewModel.showScopes ? 126 : 28)
-        .padding(.top, 10)
+        .padding(.top, safeTop)
     }
 
     private var isTopLocked: Bool {
@@ -130,9 +202,6 @@ struct ControlsView: View {
                 .fixedSize(horizontal: true, vertical: false)
             }
 
-            // Live Device Battery Gauge with Percentage Beside
-            batteryIndicator
-
             if viewModel.droppedFrames > 0 {
                 HStack(spacing: 4) {
                     Image(systemName: "exclamationmark.triangle.fill")
@@ -150,11 +219,22 @@ struct ControlsView: View {
         }
     }
 
+    private var timeIndicator: some View {
+        Text(viewModel.currentTimeString)
+            .font(.appMono(.bold, size: 10))
+            .foregroundColor(OwLensTheme.textPrimary)
+            .padding(.horizontal, 7)
+            .frame(height: 30)
+            .glassPanel(cornerRadius: OwLensTheme.radiusCard)
+            .lineLimit(1)
+            .fixedSize(horizontal: true, vertical: false)
+    }
+
     private var batteryIndicator: some View {
         let level = viewModel.batteryLevel
         let isCharging = viewModel.isBatteryCharging
-        let percent = Int(max(0, min(100, (level * 100).rounded())))
-        let isLow = level < 0.20
+        let percent: Int? = level >= 0 ? Int(max(0, min(100, (level * 100).rounded()))) : nil
+        let isLow = level >= 0 && level < 0.20
         let statusColor: Color = isLow ? OwLensTheme.recordingRed : (isCharging ? OwLensTheme.audioNominal : OwLensTheme.textPrimary)
 
         return HStack(spacing: 4) {
@@ -166,18 +246,20 @@ struct ControlsView: View {
                             RoundedRectangle(cornerRadius: 2.5, style: .continuous)
                                 .fill(Color.black.opacity(0.35))
                         )
-                        .frame(width: 22, height: 12)
+                        .frame(width: 20, height: 11)
 
-                    RoundedRectangle(cornerRadius: 1.5, style: .continuous)
-                        .fill(statusColor)
-                        .frame(width: max(2, CGFloat(level) * 18), height: 8)
-                        .padding(.leading, 2)
+                    if let pct = percent {
+                        RoundedRectangle(cornerRadius: 1.5, style: .continuous)
+                            .fill(statusColor)
+                            .frame(width: max(2, CGFloat(pct) / 100.0 * 16), height: 7)
+                            .padding(.leading, 2)
+                    }
                 }
 
                 // Terminal nub
                 Capsule()
                     .fill(statusColor.opacity(0.50))
-                    .frame(width: 1.5, height: 5)
+                    .frame(width: 1.5, height: 4)
                     .offset(x: 0.5)
             }
 
@@ -187,13 +269,14 @@ struct ControlsView: View {
                         .font(.system(size: 7, weight: .bold))
                         .foregroundColor(OwLensTheme.audioNominal)
                 }
-                Text("\(percent)%")
+                Text(percent != nil ? "\(percent!)%" : "--%")
                     .font(.appMono(.bold, size: 9))
                     .foregroundColor(isLow ? OwLensTheme.recordingRed : OwLensTheme.textPrimary)
             }
         }
+        .padding(.horizontal, 7)
         .frame(height: 30)
-        .padding(.horizontal, 4)
+        .glassPanel(cornerRadius: OwLensTheme.radiusCard)
         .lineLimit(1)
         .fixedSize(horizontal: true, vertical: false)
     }
@@ -211,9 +294,7 @@ struct ControlsView: View {
                     .lineLimit(1)
                     .fixedSize()
             }
-            .padding(.horizontal, 8)
-            .frame(minWidth: 38)
-            .frame(height: 30)
+            .frame(width: 40, height: 30)
             .glassPanel(cornerRadius: OwLensTheme.radiusCard)
             .contentShape(Rectangle())
             .onTapGesture {
@@ -237,9 +318,7 @@ struct ControlsView: View {
                     .lineLimit(1)
                     .fixedSize()
             }
-            .padding(.horizontal, 8)
-            .frame(minWidth: 32)
-            .frame(height: 30)
+            .frame(width: 40, height: 30)
             .glassPanel(cornerRadius: OwLensTheme.radiusCard)
             .contentShape(Rectangle())
             .onTapGesture {
@@ -326,13 +405,17 @@ struct ControlsView: View {
 
     private var rightStatusGroup: some View {
         HStack(spacing: 6) {
+            timeIndicator
+
+            batteryIndicator
+
             // Save Destination (Photos vs Files - tap cycles, long-press opens drawer)
             HStack {
                 Image(systemName: saveDestinationIcon(viewModel.selectedSaveDestination))
                     .font(.system(size: 11, weight: .medium))
                     .foregroundColor(isTopLocked ? OwLensTheme.textDisabled : OwLensTheme.textSecondary)
             }
-            .frame(width: 32, height: 30)
+            .frame(width: 34, height: 30)
             .glassPanel(cornerRadius: OwLensTheme.radiusCard)
             .contentShape(Rectangle())
             .onTapGesture {
@@ -352,8 +435,10 @@ struct ControlsView: View {
 
     // MARK: - Left Monitoring Tools Rail
 
-    private var leftToolRail: some View {
-        VStack(spacing: 4) {
+    private func leftToolRail(in geo: GeometryProxy) -> some View {
+        let safeLeading = ScreenGeometry.leadingPadding(in: geo)
+
+        return VStack(spacing: 4) {
             monitoringToolButton(
                 text: "709",
                 isActive: viewModel.showDisplayLUT
@@ -398,7 +483,7 @@ struct ControlsView: View {
         }
         .padding(4)
         .glassPanel(cornerRadius: OwLensTheme.radiusLg, background: OwLensTheme.glassBaseHeavy)
-        .padding(.leading, 20)
+        .padding(.leading, safeLeading)
     }
 
     private func monitoringToolButton(
@@ -434,8 +519,10 @@ struct ControlsView: View {
 
     // MARK: - Bottom Exposure Deck
 
-    private var bottomExposureDeck: some View {
-        HStack(spacing: 6) {
+    private func bottomExposureDeck(in geo: GeometryProxy) -> some View {
+        let safeBottom = ScreenGeometry.bottomPadding(in: geo)
+
+        return HStack(spacing: 6) {
             // ISO & Shutter Angle
             deckTile(
                 title: "EXPOSURE",
@@ -488,7 +575,7 @@ struct ControlsView: View {
             audioDeckTile
         }
         .padding(.horizontal, 40)
-        .padding(.bottom, 20)
+        .padding(.bottom, safeBottom)
     }
 
     private var audioDeckTile: some View {
@@ -1425,8 +1512,10 @@ struct ControlsView: View {
 
     // MARK: - Right Record Grip
 
-    private var rightRecordGrip: some View {
-        ZStack(alignment: .trailing) {
+    private func rightRecordGrip(in geo: GeometryProxy) -> some View {
+        let safeTrailing = ScreenGeometry.trailingPadding(in: geo)
+
+        return ZStack(alignment: .trailing) {
             // Shutter / Record Trigger - Locked in the exact physical vertical center
             recordButton
                 .frame(maxHeight: .infinity, alignment: .center)
@@ -1443,19 +1532,12 @@ struct ControlsView: View {
                     ))
             }
         }
-        .padding(.trailing, 22)
+        .padding(.trailing, safeTrailing)
     }
 
     private var recordButton: some View {
         Button {
-            guard !viewModel.isSaving else { return }
-            if viewModel.isRecording {
-                Haptics.notification(.success)
-                viewModel.stopRecording()
-            } else {
-                Haptics.notification(.success)
-                viewModel.startRecording()
-            }
+            viewModel.toggleRecording()
         } label: {
             ZStack {
                 // Outer Ring with subtle pulsing glow when recording

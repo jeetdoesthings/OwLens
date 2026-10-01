@@ -19,14 +19,15 @@ struct ScopeData: Equatable {
     )
 
     static func make(
-        fromHalfRGBA pixels: [UInt16],
+        fromHalfRGBAPointer base: UnsafePointer<UInt16>,
+        count: Int,
         width: Int,
         height: Int,
         histogramBins: Int = 64,
         waveformColumns: Int = 64,
         waveformRows: Int = 48
     ) -> ScopeData {
-        guard width > 0, height > 0, pixels.count >= width * height * 4 else {
+        guard width > 0, height > 0, count >= width * height * 4 else {
             return .empty
         }
 
@@ -46,32 +47,29 @@ struct ScopeData: Equatable {
                 colMap[x] = min(waveformColumns - 1, x * waveformColumns / width)
             }
 
-            pixels.withUnsafeBufferPointer { ptr in
-                guard let base = ptr.baseAddress else { return }
-                var idx = 0
-                for _ in 0..<height {
-                    for x in 0..<width {
-                        let r16 = Float16(bitPattern: base[idx])
-                        let g16 = Float16(bitPattern: base[idx + 1])
-                        let b16 = Float16(bitPattern: base[idx + 2])
-                        idx += 4
+            var idx = 0
+            for _ in 0..<height {
+                for x in 0..<width {
+                    let r16 = Float16(bitPattern: base[idx])
+                    let g16 = Float16(bitPattern: base[idx + 1])
+                    let b16 = Float16(bitPattern: base[idx + 2])
+                    idx += 4
 
-                        let r = min(1.0, max(0.0, Float(r16)))
-                        let g = min(1.0, max(0.0, Float(g16)))
-                        let b = min(1.0, max(0.0, Float(b16)))
-                        let luma = min(1.0, max(0.0, 0.2627 * r + 0.6780 * g + 0.0593 * b))
+                    let r = min(1.0, max(0.0, Float(r16)))
+                    let g = min(1.0, max(0.0, Float(g16)))
+                    let b = min(1.0, max(0.0, Float(b16)))
+                    let luma = min(1.0, max(0.0, 0.2627 * r + 0.6780 * g + 0.0593 * b))
 
-                        let rBin = min(maxHistBin, Int(r * histScale))
-                        let gBin = min(maxHistBin, Int(g * histScale))
-                        let bBin = min(maxHistBin, Int(b * histScale))
-                        histogramRed[rBin] += 1
-                        histogramGreen[gBin] += 1
-                        histogramBlue[bBin] += 1
+                    let rBin = min(maxHistBin, Int(r * histScale))
+                    let gBin = min(maxHistBin, Int(g * histScale))
+                    let bBin = min(maxHistBin, Int(b * histScale))
+                    histogramRed[rBin] += 1
+                    histogramGreen[gBin] += 1
+                    histogramBlue[bBin] += 1
 
-                        let col = colMap[x]
-                        let row = maxWaveRow - min(maxWaveRow, Int(luma * waveScale))
-                        waveform[row * waveformColumns + col] += 1
-                    }
+                    let col = colMap[x]
+                    let row = maxWaveRow - min(maxWaveRow, Int(luma * waveScale))
+                    waveform[row * waveformColumns + col] += 1
                 }
             }
 
@@ -85,6 +83,28 @@ struct ScopeData: Equatable {
                 histogramGreen: histogramGreen,
                 histogramBlue: histogramBlue,
                 waveform: waveform,
+                waveformColumns: waveformColumns,
+                waveformRows: waveformRows
+            )
+        }
+    }
+
+    static func make(
+        fromHalfRGBA pixels: [UInt16],
+        width: Int,
+        height: Int,
+        histogramBins: Int = 64,
+        waveformColumns: Int = 64,
+        waveformRows: Int = 48
+    ) -> ScopeData {
+        pixels.withUnsafeBufferPointer { ptr in
+            guard let base = ptr.baseAddress else { return .empty }
+            return make(
+                fromHalfRGBAPointer: base,
+                count: ptr.count,
+                width: width,
+                height: height,
+                histogramBins: histogramBins,
                 waveformColumns: waveformColumns,
                 waveformRows: waveformRows
             )

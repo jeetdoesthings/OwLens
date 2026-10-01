@@ -138,7 +138,8 @@ final class VideoWriter: @unchecked Sendable {
                 kCVPixelBufferPixelFormatTypeKey as String: pixelFormatType,
                 kCVPixelBufferWidthKey as String: width,
                 kCVPixelBufferHeightKey as String: height,
-                kCVPixelBufferMetalCompatibilityKey as String: true
+                kCVPixelBufferMetalCompatibilityKey as String: true,
+                kCVPixelBufferIOSurfacePropertiesKey as String: [:] as [String: Any]
             ])
 
         guard writer.canAdd(vInput) else {
@@ -254,8 +255,10 @@ final class VideoWriter: @unchecked Sendable {
             return false
         }
 
-        // Attach color space & transfer characteristics to pixel buffer for VideoToolbox encoding
-        MetalPipeline.attachColorMetadata(to: pixelBuffer, curveType: curveType)
+        // Color space & transfer characteristics are attached once at buffer creation by MetalPipeline.encodeOutputPixelBuffer.
+        if CVBufferGetAttachment(pixelBuffer, kCVImageBufferColorPrimariesKey, nil) == nil {
+            MetalPipeline.attachColorMetadata(to: pixelBuffer, curveType: curveType)
+        }
 
         let now = CACurrentMediaTime()
 
@@ -352,9 +355,60 @@ final class VideoWriter: @unchecked Sendable {
         // Drain previously queued audio buffers first if input is ready
         drainPendingAudioBuffersLocked()
 
+        var singleTiming = CMSampleTimingInfo(
+            duration: .invalid,
+            presentationTimeStamp: .invalid,
+            decodeTimeStamp: .invalid
+        )
         var timingCount: CMItemCount = 0
-        CMSampleBufferGetSampleTimingInfoArray(sampleBuffer, entryCount: 0, arrayToFill: nil, entriesNeededOut: &timingCount)
+        CMSampleBufferGetSampleTimingInfoArray(sampleBuffer, entryCount: 1, arrayToFill: &singleTiming, entriesNeededOut: &timingCount)
         guard timingCount > 0 else { return false }
+
+        // Fast path: eliminate 50-100 heap array allocations/sec for standard 1-timing AVCapture audio buffers
+        if timingCount == 1 {
+            let baseTime = sessionStartTime.isValid ? sessionStartTime : audioReferenceTime
+            if !baseTime.isValid {
+                audioReferenceTime = singleTiming.presentationTimeStamp
+            }
+            let refTime = sessionStartTime.isValid ? sessionStartTime : audioReferenceTime
+
+            if sessionStartTime.isValid, singleTiming.duration.isValid {
+                let bufferEnd = CMTimeAdd(singleTiming.presentationTimeStamp, singleTiming.duration)
+                if CMTimeCompare(bufferEnd, refTime) <= 0 {
+                    return true
+                }
+            }
+
+            var pts = CMTimeSubtract(singleTiming.presentationTimeStamp, refTime)
+            if CMTimeCompare(pts, .zero) < 0 { pts = .zero }
+            singleTiming.presentationTimeStamp = pts
+            if singleTiming.decodeTimeStamp.isValid {
+                singleTiming.decodeTimeStamp = pts
+            }
+
+            var retimed: CMSampleBuffer?
+            let status = CMSampleBufferCreateCopyWithNewTiming(
+                allocator: kCFAllocatorDefault,
+                sampleBuffer: sampleBuffer,
+                sampleTimingEntryCount: 1,
+                sampleTimingArray: &singleTiming,
+                sampleBufferOut: &retimed
+            )
+            guard status == noErr, let retimed else { return false }
+
+            if input.isReadyForMoreMediaData && pendingAudioBuffers.isEmpty {
+                return input.append(retimed)
+            } else {
+                if pendingAudioBuffers.count < maxPendingAudioBuffers {
+                    pendingAudioBuffers.append(retimed)
+                    return true
+                } else {
+                    pendingAudioBuffers.removeFirst()
+                    pendingAudioBuffers.append(retimed)
+                    return false
+                }
+            }
+        }
 
         var timings = Array(repeating: CMSampleTimingInfo(
             duration: .invalid,
