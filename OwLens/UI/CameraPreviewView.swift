@@ -285,8 +285,7 @@ struct CameraPreviewView: UIViewRepresentable {
                 renderEncoder.endEncoding()
             }
  
-            // Enforce minimum presentation duration to eliminate irregular v-sync cadence judder on 60Hz and 120Hz displays
-            commandBuffer.present(drawable, afterMinimumDuration: 1.0 / max(1.0, targetFPS))
+            commandBuffer.present(drawable)
             commandBuffer.commit()
         }
     }

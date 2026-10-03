@@ -431,6 +431,7 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
     nonisolated(unsafe) private var showScopesUnsafe = true
     nonisolated(unsafe) private var lastScopeUpdateTime: CFTimeInterval = 0
     nonisolated(unsafe) private var lastMainActorSyncTime: CFTimeInterval = 0
+    nonisolated(unsafe) private var lastReportedDrops: Int = 0
     nonisolated(unsafe) var isAppActive = true
     /// Measured LSC override from device calibration (set once at setup).
     nonisolated(unsafe) private var lscOverride: LSCCoefficients?
@@ -455,24 +456,7 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
         super.init()
         startClockAndBatteryMonitoring()
 #if DEBUG
-        if let pipeline = metalPipeline {
-            Task.detached(priority: .utility) {
-                _ = pipeline.runSyntheticHotPixelTest()
-                _ = MetalPipeline.runAppleLog2AccuracyTest()
-                _ = MetalPipeline.runColorMatrixValidationTest()
-                _ = MetalPipeline.runLogCurvesStandardComplianceTest()
-                _ = MetalPipeline.runHighlightShoulderTest()
-                _ = MetalPipeline.runMalvarNeutralityTest()
-                _ = MetalPipeline.runScopeDataBT2020Test()
-                _ = MetalPipeline.run10BitYCbCrEncodingTest()
-                _ = MetalPipeline.runAutoExposureAndWBValidationTest()
-                _ = MetalPipeline.runFlawsValidationTest()
-                _ = pipeline.runPipelineThroughputBenchmark()
-                await MainActor.run {
-                    _ = CameraViewModel.runFileNameGenerationTest()
-                }
-            }
-        }
+        // Automated unit tests and benchmarks are invoked via test suites rather than on camera startup.
 #endif
         loadFilesFolderBookmark()
         metalPipeline?.curveType = selectedCurve
@@ -1144,62 +1128,76 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.1, execute: work)
     }
 
-    /// Push ISO / shutter / WB to hardware. Call only when unlocked (or once on lock).
+    /// Push ISO / shutter / WB to hardware asynchronously off the main thread.
     func applyManualExposureAndWB() {
         guard let device = captureController.activeDevice ??
                 AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back) else { return }
 
-        do {
-            try device.lockForConfiguration()
+        let iso = isoValue
+        let shutter = shutterValue
+        let fps = activeFPS
+        let autoWB = isAutoWhiteBalanceEnabled
+        let kelvin = wbKelvin
+        let tint = wbTint
 
-            let clampedISO = max(device.activeFormat.minISO, min(device.activeFormat.maxISO, isoValue))
-            var shutterDuration = CMTimeMakeWithSeconds((Double(shutterValue) / 360.0) / activeFPS, preferredTimescale: 1_000_000)
-            let minD = device.activeFormat.minExposureDuration
-            let maxD = device.activeFormat.maxExposureDuration
-            if CMTimeCompare(shutterDuration, minD) < 0 { shutterDuration = minD }
-            if CMTimeCompare(shutterDuration, maxD) > 0 { shutterDuration = maxD }
-            // setExposureModeCustom raises NSInvalidArgumentException ("Unsupported
-            // exposure mode") when .custom isn't supported by the active format/device
-            // (e.g. some ultrawides) — and Swift `try/catch` does NOT catch ObjC
-            // exceptions. Guard it, mirroring the setFocusModeLocked fix, and fall back
-            // to a supported mode so toggling exposure doesn't crash the app.
-            if device.isExposureModeSupported(.custom) {
-                device.setExposureModeCustom(duration: shutterDuration, iso: clampedISO)
-            } else if device.isExposureModeSupported(.locked) {
-                device.exposureMode = .locked
-            } else if device.isExposureModeSupported(.continuousAutoExposure) {
-                device.exposureMode = .continuousAutoExposure
-            } else {
-                print("[CameraViewModel] No supported manual exposure mode on \(device.localizedName)")
-            }
+        // Dispatch hardware configuration off the main thread to completely prevent UI hitching
+        DispatchQueue.global(qos: .userInitiated).async { [weak self, weak device] in
+            guard let device else { return }
+            var explicitGains: AVCaptureDevice.WhiteBalanceGains? = nil
+            do {
+                try device.lockForConfiguration()
 
-            if isAutoWhiteBalanceEnabled {
-                if device.isWhiteBalanceModeSupported(.continuousAutoWhiteBalance) {
-                    device.whiteBalanceMode = .continuousAutoWhiteBalance
-                }
-                device.unlockForConfiguration()
-                updateWBParams(from: device)
-            } else {
-                let temperatureAndTint = AVCaptureDevice.WhiteBalanceTemperatureAndTintValues(temperature: wbKelvin, tint: wbTint)
-                let wbGains = device.deviceWhiteBalanceGains(for: temperatureAndTint)
-                let clampedGains = clampWhiteBalanceGains(wbGains, for: device)
-                // setWhiteBalanceModeLocked raises NSInvalidArgumentException when .locked
-                // isn't supported by the active format/device; guard it (mirroring the
-                // setFocusModeLocked fix) and fall back to auto white balance.
-                if device.isWhiteBalanceModeSupported(.locked) {
-                    device.setWhiteBalanceModeLocked(with: clampedGains)
-                } else if device.isWhiteBalanceModeSupported(.continuousAutoWhiteBalance) {
-                    device.whiteBalanceMode = .continuousAutoWhiteBalance
-                } else if device.isWhiteBalanceModeSupported(.autoWhiteBalance) {
-                    device.whiteBalanceMode = .autoWhiteBalance
+                let clampedISO = max(device.activeFormat.minISO, min(device.activeFormat.maxISO, iso))
+                var shutterDuration = CMTimeMakeWithSeconds((Double(shutter) / 360.0) / fps, preferredTimescale: 1_000_000)
+                let minD = device.activeFormat.minExposureDuration
+                let maxD = device.activeFormat.maxExposureDuration
+                if CMTimeCompare(shutterDuration, minD) < 0 { shutterDuration = minD }
+                if CMTimeCompare(shutterDuration, maxD) > 0 { shutterDuration = maxD }
+
+                if device.isExposureModeSupported(.custom) {
+                    device.setExposureModeCustom(duration: shutterDuration, iso: clampedISO, completionHandler: nil)
+                } else if device.isExposureModeSupported(.locked) {
+                    device.exposureMode = .locked
+                } else if device.isExposureModeSupported(.continuousAutoExposure) {
+                    device.exposureMode = .continuousAutoExposure
                 } else {
-                    print("[CameraViewModel] No supported manual white balance mode on \(device.localizedName)")
+                    print("[CameraViewModel] No supported manual exposure mode on \(device.localizedName)")
+                }
+
+                if autoWB {
+                    if device.isWhiteBalanceModeSupported(.continuousAutoWhiteBalance) {
+                        device.whiteBalanceMode = .continuousAutoWhiteBalance
+                    }
+                } else {
+                    let temperatureAndTint = AVCaptureDevice.WhiteBalanceTemperatureAndTintValues(temperature: kelvin, tint: tint)
+                    let wbGains = device.deviceWhiteBalanceGains(for: temperatureAndTint)
+                    let maxGain = device.maxWhiteBalanceGain
+                    let clamped = AVCaptureDevice.WhiteBalanceGains(
+                        redGain: max(1.0, min(maxGain, wbGains.redGain)),
+                        greenGain: max(1.0, min(maxGain, wbGains.greenGain)),
+                        blueGain: max(1.0, min(maxGain, wbGains.blueGain))
+                    )
+                    if device.isWhiteBalanceModeSupported(.locked) {
+                        device.setWhiteBalanceModeLocked(with: clamped, completionHandler: nil)
+                    } else if device.isWhiteBalanceModeSupported(.continuousAutoWhiteBalance) {
+                        device.whiteBalanceMode = .continuousAutoWhiteBalance
+                    } else if device.isWhiteBalanceModeSupported(.autoWhiteBalance) {
+                        device.whiteBalanceMode = .autoWhiteBalance
+                    } else {
+                        print("[CameraViewModel] No supported manual white balance mode on \(device.localizedName)")
+                    }
+                    explicitGains = clamped
                 }
                 device.unlockForConfiguration()
-                updateWBParams(from: device, explicitGains: clampedGains)
+            } catch {
+                print("[CameraViewModel] applyManualExposureAndWB: \(error)")
             }
-        } catch {
-            print("[CameraViewModel] applyManualExposureAndWB: \(error)")
+
+            let finalGains = explicitGains
+            DispatchQueue.main.async { [weak self] in
+                guard let self, let activeDevice = self.captureController.activeDevice else { return }
+                self.updateWBParams(from: activeDevice, explicitGains: finalGains)
+            }
         }
     }
 
@@ -1543,7 +1541,6 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
         guard isRecording, !isSaving else { return }
 
         isRecording = false
-        isRecordingUnsafe = false
         isSaving = true
         videoWriter.onLowDiskSpace = nil
         recordingTimer?.invalidate()
@@ -1563,23 +1560,24 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
             }
         }
 
-        let remaining: [(MTLTexture?, CVPixelBuffer?, RawFrameData)] = processLock.withLock {
+        let remaining: [(MTLTexture, CVPixelBuffer?, RawFrameData)] = processLock.withLock {
             let bufferedKeys = reorderBuffer.keys.sorted()
-            var rem: [(MTLTexture?, CVPixelBuffer?, RawFrameData)] = []
+            var rem: [(MTLTexture, CVPixelBuffer?, RawFrameData)] = []
             for k in bufferedKeys {
-                if let item = reorderBuffer.removeValue(forKey: k) {
-                    rem.append(item)
+                if let item = reorderBuffer.removeValue(forKey: k), let tex = item.0 {
+                    rem.append((tex, item.1, item.2))
                 }
             }
             return rem
         }
 
         for item in remaining {
-            dispatchOrderedRecordedFrame(item.0, bgraPB: item.1, frameData: item.2)
+            dispatchOrderedRecordedFrame(item.0, bgraPB: item.1, frameData: item.2, isTailFlush: true)
         }
 
         recordingQueue.async { [weak self] in
             guard let self else { return }
+            self.isRecordingUnsafe = false
             self.videoWriter.finish { [weak self] url, error in
                 self?.processQueue.async {
                     self?.metalPipeline?.trimMemory()
@@ -2040,8 +2038,10 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
                 previewFeed.submit(texture: framed)
 
                 let now = CACurrentMediaTime()
-                if now - lastMainActorSyncTime >= 0.10 || drops > 0 {
+                let dropsChanged = (drops != lastReportedDrops)
+                if now - lastMainActorSyncTime >= 0.10 || dropsChanged {
                     lastMainActorSyncTime = now
+                    lastReportedDrops = drops
                     let frameDataBox = SendableBox(value: frameData)
                     let avgMs = pipeline.averageFrameTimeMs
                     Task { @MainActor [weak self] in
@@ -2083,31 +2083,51 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
         // Immediately release the Metal pipeline slot so the next frame can begin GPU work concurrently!
         completion()
 
-        guard let framed else { return }
+        guard isRecordingUnsafe else {
+            if let framed {
+                dispatchOrderedRecordedFrame(framed, bgraPB: bgraPB, frameData: frameData)
+            }
+            return
+        }
 
-        if isRecordingUnsafe {
-            let readyFrames: [(MTLTexture?, CVPixelBuffer?, RawFrameData)] = processLock.withLock {
+        let readyFrames: [(MTLTexture, CVPixelBuffer?, RawFrameData)] = processLock.withLock {
+            if let framed {
                 reorderBuffer[frameData.sequenceID] = (framed, bgraPB, frameData)
-                var ready: [(MTLTexture?, CVPixelBuffer?, RawFrameData)] = []
-                while let next = reorderBuffer.removeValue(forKey: nextOutputSequenceID) {
-                    ready.append(next)
+            } else {
+                // Advance sequence if this failed frame is the one we are waiting for
+                if frameData.sequenceID == nextOutputSequenceID {
                     nextOutputSequenceID &+= 1
                 }
-                return ready
             }
 
-            for item in readyFrames {
-                dispatchOrderedRecordedFrame(item.0, bgraPB: item.1, frameData: item.2)
+            // Gap recovery: if a sequence ID was lost before reaching handleRecordedFrame (e.g. dropped in ring buffer),
+            // prevent reorderBuffer from stalling indefinitely.
+            if let minKey = reorderBuffer.keys.min() {
+                if minKey > nextOutputSequenceID && reorderBuffer.count >= 6 {
+                    nextOutputSequenceID = minKey
+                }
             }
-        } else {
-            dispatchOrderedRecordedFrame(framed, bgraPB: bgraPB, frameData: frameData)
+
+            var ready: [(MTLTexture, CVPixelBuffer?, RawFrameData)] = []
+            while let next = reorderBuffer.removeValue(forKey: nextOutputSequenceID) {
+                if let tex = next.0 {
+                    ready.append((tex, next.1, next.2))
+                }
+                nextOutputSequenceID &+= 1
+            }
+            return ready
+        }
+
+        for item in readyFrames {
+            dispatchOrderedRecordedFrame(item.0, bgraPB: item.1, frameData: item.2)
         }
     }
 
     nonisolated private func dispatchOrderedRecordedFrame(
         _ framed: MTLTexture?,
         bgraPB: CVPixelBuffer?,
-        frameData: RawFrameData
+        frameData: RawFrameData,
+        isTailFlush: Bool = false
     ) {
         guard let framed else { return }
 
@@ -2123,12 +2143,14 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
 
         updateScopesIfNeeded(from: framed, pipeline: metalPipeline)
 
-        if let bgraPB, isRecordingUnsafe {
+        if let bgraPB, (isRecordingUnsafe || isTailFlush) {
             let timestamp = frameData.timestamp
             recordingQueue.async { [weak self] in
-                guard let self, self.isRecordingUnsafe else { return }
-                if self.videoWriter.appendFrame(pixelBuffer: bgraPB, captureTime: timestamp) {
-                    self.frameIndex += 1
+                guard let self else { return }
+                if isTailFlush || self.isRecordingUnsafe {
+                    if self.videoWriter.appendFrame(pixelBuffer: bgraPB, captureTime: timestamp) {
+                        self.frameIndex += 1
+                    }
                 }
             }
         }
@@ -2137,8 +2159,10 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
         previewFeed.submit(texture: framed)
 
         let now = CACurrentMediaTime()
-        if now - lastMainActorSyncTime >= 0.10 || drops > 0 {
+        let dropsChanged = (drops != lastReportedDrops)
+        if now - lastMainActorSyncTime >= 0.10 || dropsChanged {
             lastMainActorSyncTime = now
+            lastReportedDrops = drops
             let frameDataBox = SendableBox(value: frameData)
             let avgMs = metalPipeline?.averageFrameTimeMs ?? 0.0
             Task { @MainActor [weak self] in

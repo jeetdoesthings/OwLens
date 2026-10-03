@@ -29,6 +29,8 @@ final class VideoWriter: @unchecked Sendable {
     private var lastPixelBuffer: CVPixelBuffer?
     private var pendingAudioBuffers: [CMSampleBuffer] = []
     private let maxPendingAudioBuffers = 50
+    private var prerollAudioBuffers: [CMSampleBuffer] = []
+    private let maxPrerollAudioBuffers = 20
     private var curveType: LogCurveType = .sLog3Approx
     private let lock = NSLock()
 
@@ -207,6 +209,61 @@ final class VideoWriter: @unchecked Sendable {
         }
     }
 
+    private func drainPrerollAudioBuffersLocked() {
+        guard let input = audioInput, hasStartedSession, sessionStartTime.isValid else {
+            prerollAudioBuffers.removeAll()
+            return
+        }
+        let preroll = prerollAudioBuffers
+        prerollAudioBuffers.removeAll()
+
+        for sampleBuffer in preroll {
+            var timingCount: CMItemCount = 0
+            CMSampleBufferGetSampleTimingInfoArray(sampleBuffer, entryCount: 0, arrayToFill: nil, entriesNeededOut: &timingCount)
+            guard timingCount > 0 else { continue }
+
+            var timings = Array(repeating: CMSampleTimingInfo(
+                duration: .invalid,
+                presentationTimeStamp: .invalid,
+                decodeTimeStamp: .invalid
+            ), count: timingCount)
+            CMSampleBufferGetSampleTimingInfoArray(sampleBuffer, entryCount: timingCount, arrayToFill: &timings, entriesNeededOut: &timingCount)
+
+            let refTime = sessionStartTime
+            if timings[0].duration.isValid {
+                let bufferEnd = CMTimeAdd(timings[0].presentationTimeStamp, timings[0].duration)
+                if CMTimeCompare(bufferEnd, refTime) <= 0 {
+                    continue
+                }
+            }
+
+            for i in 0..<timings.count {
+                var pts = CMTimeSubtract(timings[i].presentationTimeStamp, refTime)
+                if CMTimeCompare(pts, .zero) < 0 { pts = .zero }
+                timings[i].presentationTimeStamp = pts
+                if timings[i].decodeTimeStamp.isValid {
+                    timings[i].decodeTimeStamp = pts
+                }
+            }
+
+            var retimed: CMSampleBuffer?
+            let status = CMSampleBufferCreateCopyWithNewTiming(
+                allocator: kCFAllocatorDefault,
+                sampleBuffer: sampleBuffer,
+                sampleTimingEntryCount: timingCount,
+                sampleTimingArray: &timings,
+                sampleBufferOut: &retimed
+            )
+            guard status == noErr, let retimed else { continue }
+
+            if input.isReadyForMoreMediaData && pendingAudioBuffers.isEmpty {
+                _ = input.append(retimed)
+            } else if pendingAudioBuffers.count < maxPendingAudioBuffers {
+                pendingAudioBuffers.append(retimed)
+            }
+        }
+    }
+
     private var lastDiskCheckTime: CFTimeInterval = 0
     private var cachedHasSpace = true
 
@@ -271,41 +328,54 @@ final class VideoWriter: @unchecked Sendable {
             lastFrameHostTime = now
             assetWriter?.startSession(atSourceTime: .zero)
             hasStartedSession = true
+            drainPrerollAudioBuffersLocked()
         }
 
-        // Frame pacing & dropped-frame compensation:
-        // True CFR guarantees rock-solid constant frame rate with zero cumulative audio/video drift.
-        // Only inject a held frame if the interval since the last frame shows that an entire frame
-        // period (>= 1.75 * interval) was completely dropped by camera hardware.
-        // Minor 5-20ms timer/sensor jitters never trigger duplicate frames, ensuring pure fluid motion.
-        let frameInterval = 1.0 / targetFPS
-        if realFrameCount >= 1, let hold = lastPixelBuffer {
-            let deltaFromLast: Double
-            if let captureTime = captureTime, captureTime.isValid, lastFrameCaptureTime.isValid {
-                deltaFromLast = max(0, CMTimeSubtract(captureTime, lastFrameCaptureTime).seconds)
-            } else {
-                deltaFromLast = max(0, now - lastFrameHostTime)
-            }
+        // Cumulative elapsed time timeline pacing:
+        // By locking the CFR frame index to total elapsed time since sessionStartTime,
+        // we guarantee zero cumulative audio/video desync over arbitrarily long recordings.
+        let elapsedSeconds: Double
+        if let captureTime = captureTime, captureTime.isValid, sessionStartTime.isValid {
+            elapsedSeconds = max(0, CMTimeSubtract(captureTime, sessionStartTime).seconds)
+        } else {
+            elapsedSeconds = max(0, now - startHostTime)
+        }
 
-            if deltaFromLast >= (1.75 * frameInterval) {
-                let missedSlots = min(10, Int((deltaFromLast / frameInterval).rounded()) - 1)
-                for _ in 0..<missedSlots {
-                    guard input.isReadyForMoreMediaData else {
-                        droppedFrames += 1
-                        break
-                    }
-                    if writeCFR(hold, index: frameCount, adaptor: adaptor) {
-                        frameCount += 1
-                    } else {
-                        droppedFrames += 1
-                        break
-                    }
+        let targetIndex = max(frameCount, Int64((elapsedSeconds * targetFPS).rounded()))
+        let missedSlots = min(15, Int(targetIndex - frameCount))
+
+        if missedSlots > 0, let hold = lastPixelBuffer {
+            for _ in 0..<missedSlots {
+                guard input.isReadyForMoreMediaData else {
+                    droppedFrames += 1
+                    break
+                }
+                if writeCFR(hold, index: frameCount, adaptor: adaptor) {
+                    frameCount += 1
+                } else {
+                    droppedFrames += 1
+                    break
                 }
             }
         }
 
         // Drain any pending audio buffers now that video input might have made room
         drainPendingAudioBuffersLocked()
+
+        // VideoToolbox backpressure handling:
+        // Hardware encoder occasionally takes 1-4ms to complete a GOP slice.
+        // Spin-wait briefly outside lock before discarding to eliminate spurious frame drops.
+        var spinAttempts = 0
+        while !input.isReadyForMoreMediaData && spinAttempts < 5 {
+            lock.unlock()
+            usleep(2000) // 2ms sleep outside lock
+            lock.lock()
+            guard isRecording, videoInput != nil, pixelBufferAdaptor != nil else {
+                droppedFrames += 1
+                return false
+            }
+            spinAttempts += 1
+        }
 
         // Current real frame
         guard input.isReadyForMoreMediaData else {
@@ -345,12 +415,21 @@ final class VideoWriter: @unchecked Sendable {
         defer { lock.unlock() }
 
         guard isRecording,
-              let input = audioInput,
-              hasStartedSession,
-              realFrameCount >= 1 else {
+              let input = audioInput else {
             return false
         }
         guard CMSampleBufferDataIsReady(sampleBuffer) else { return false }
+
+        // If session has not started yet (waiting for Frame 0), buffer pre-roll audio
+        if !hasStartedSession || realFrameCount == 0 {
+            if prerollAudioBuffers.count < maxPrerollAudioBuffers {
+                prerollAudioBuffers.append(sampleBuffer)
+            } else {
+                prerollAudioBuffers.removeFirst()
+                prerollAudioBuffers.append(sampleBuffer)
+            }
+            return true
+        }
 
         // Drain previously queued audio buffers first if input is ready
         drainPendingAudioBuffersLocked()
@@ -496,6 +575,7 @@ final class VideoWriter: @unchecked Sendable {
         // Drain any remaining buffered audio
         drainPendingAudioBuffersLocked()
         pendingAudioBuffers.removeAll()
+        prerollAudioBuffers.removeAll()
 
         let url = assetWriter?.outputURL
         isRecording = false
@@ -574,7 +654,7 @@ final class VideoWriter: @unchecked Sendable {
         let software = AVMutableMetadataItem()
         software.keySpace = .quickTimeUserData
         software.key = AVMetadataKey.quickTimeUserDataKeySoftware as (NSCopying & NSObjectProtocol)
-        software.value = "OwLens Cinema Camera v1.4" as (NSCopying & NSObjectProtocol)
+        software.value = "OwLens Cinema Camera v1.6" as (NSCopying & NSObjectProtocol)
         items.append(software)
 
         // 4. QuickTime Make
