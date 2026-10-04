@@ -27,6 +27,7 @@
 		CB29FE53AEF7F9FC3782144D /* LevelMonitor.swift in Sources */ = {isa = PBXBuildFile; fileRef = 380C24086C404D00F196D3EF /* LevelMonitor.swift */; };
 		CFC4A66803E3722EA3895818 /* OwLensApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3309FCB4DB267101C6ECE0AB /* OwLensApp.swift */; };
 		D8846897A8299E234D957B07 /* DeviceCapabilities.swift in Sources */ = {isa = PBXBuildFile; fileRef = E26B792621D23C998D868624 /* DeviceCapabilities.swift */; };
+		E1A000010000000000000001 /* GyroMotionRecorder.swift in Sources */ = {isa = PBXBuildFile; fileRef = E1A000020000000000000001 /* GyroMotionRecorder.swift */; };
 		F8B89CFD32B830286FBEA9F7 /* ScopesOverlay.swift in Sources */ = {isa = PBXBuildFile; fileRef = 07E8AF4E5950154F03CB942E /* ScopesOverlay.swift */; };
 		F8C468F1CB4E9D60832D79A4 /* RawFrameBuffer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0B6995D9D7490CA5AC49154E /* RawFrameBuffer.swift */; };
 		FA99A71A56D13A8905D06872 /* RecordingSettings.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3D83D18912845DAB7164C62D /* RecordingSettings.swift */; };
@@ -55,6 +56,7 @@
 		CD4D88339EDB4CCE3E689AC1 /* ScopeData.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ScopeData.swift; sourceTree = "<group>"; };
 		D3D3C76FE38C04980C86CE21 /* ControlsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ControlsView.swift; sourceTree = "<group>"; };
 		DD6827259D4D051C11C1206F /* Debayer.metal */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.metal; path = Debayer.metal; sourceTree = "<group>"; };
+		E1A000020000000000000001 /* GyroMotionRecorder.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GyroMotionRecorder.swift; sourceTree = "<group>"; };
 		E26B792621D23C998D868624 /* DeviceCapabilities.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DeviceCapabilities.swift; sourceTree = "<group>"; };
 		F3021592CCD8622440C6506A /* VideoWriter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VideoWriter.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
@@ -81,6 +83,7 @@
 		4CDD610AB8A7B936DABF84BF /* Encoding */ = {
 			isa = PBXGroup;
 			children = (
+				E1A000020000000000000001 /* GyroMotionRecorder.swift */,
 				F3021592CCD8622440C6506A /* VideoWriter.swift */,
 			);
 			path = Encoding;
@@ -245,6 +248,7 @@
 				FA99A71A56D13A8905D06872 /* RecordingSettings.swift in Sources */,
 				876ED42C73C516D7F0A216D4 /* ScopeData.swift in Sources */,
 				F8B89CFD32B830286FBEA9F7 /* ScopesOverlay.swift in Sources */,
+				E1A000010000000000000001 /* GyroMotionRecorder.swift in Sources */,
 				32637B18CCC58D60E803240A /* VideoWriter.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;

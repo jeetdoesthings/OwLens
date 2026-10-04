@@ -613,8 +613,8 @@ final class MetalPipeline: @unchecked Sendable {
     /// Uses CFA-preserving 2× reduction only when the reduced frame still covers the encode size.
     /// The completion handler is called on an internal Metal queue once the GPU work finishes.
     func process(_ pixelBuffer: CVPixelBuffer,
-                 encodeWidth: Int = 1920,
-                 encodeHeight: Int = 1440,
+                 encodeWidth: Int = 2016,
+                 encodeHeight: Int = 1512,
                  slot: Int = 0,
                  completion: @escaping (MTLTexture?) -> Void) {
         process(pixelBuffer, encodeWidth: encodeWidth, encodeHeight: encodeHeight, encodeAsBGRA: false, slot: slot) { texture, _ in
@@ -623,8 +623,8 @@ final class MetalPipeline: @unchecked Sendable {
     }
 
     func process(_ pixelBuffer: CVPixelBuffer,
-                 encodeWidth: Int = 1920,
-                 encodeHeight: Int = 1440,
+                 encodeWidth: Int = 2016,
+                 encodeHeight: Int = 1512,
                  encodeAsBGRA: Bool = false,
                  slot: Int = 0,
                  completion: @escaping (MTLTexture?, CVPixelBuffer?) -> Void) {
@@ -641,8 +641,8 @@ final class MetalPipeline: @unchecked Sendable {
         guard let commandBuffer = commandQueue.makeCommandBuffer() else { completion(nil, nil); return }
 
         // Phase-preserving 2x2 CFA sensor binning (averages 4 identical-color photosites in each 4x4 block).
-        // For Open Gate (1920x1440) and 1080p (1920x1080), half-resolution (2016x1512) exceeds the
-        // container resolution (3.05 MP > 2.76 MP), so binning provides pristine 1:1 optical sampling,
+        // For Open Gate (2016x1512) and 1080p (1920x1080), half-resolution (2016x1512) matches or exceeds the
+        // container resolution (3.05 MP >= 2.76 MP), so binning provides pristine 1:1 optical sampling,
         // boosts SNR by +6 dB (halving noise variance in Log shadows), eliminates Bayer moiré,
         // and maintains smooth real-time 30 fps playback.
         var bayerIn: MTLTexture
@@ -782,8 +782,8 @@ final class MetalPipeline: @unchecked Sendable {
     /// Fast preview path: delegates to process with encodeAsBGRA: false.
     /// Runs single-pass fused debayer + crop/scale + unsharp mask with zero CVPixelBuffer allocation.
     func processPreviewOnly(_ pixelBuffer: CVPixelBuffer,
-                            encodeWidth: Int = 1920,
-                            encodeHeight: Int = 1440,
+                            encodeWidth: Int = 2016,
+                            encodeHeight: Int = 1512,
                             slot: Int = 0,
                             completion: @escaping (MTLTexture?) -> Void) {
         process(pixelBuffer, encodeWidth: encodeWidth, encodeHeight: encodeHeight, encodeAsBGRA: false, slot: slot) { texture, _ in

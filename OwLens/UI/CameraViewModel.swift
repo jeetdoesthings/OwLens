@@ -96,7 +96,7 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
             refreshStatusLine()
         }
     }
-    @Published var selectedBitrate: BitratePreset = .mbps100 {
+    @Published var selectedBitrate: BitratePreset = .mbps150 {
         didSet {
             guard !controlsLocked else { return }
             updateStorageEstimate()
@@ -423,8 +423,8 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
     nonisolated(unsafe) private var nextOutputSequenceID: UInt64 = 0
     nonisolated(unsafe) private var reorderBuffer: [UInt64: (MTLTexture?, CVPixelBuffer?, RawFrameData)] = [:]
 
-    nonisolated(unsafe) private var activeEncodeWidth = 1920
-    nonisolated(unsafe) private var activeEncodeHeight = 1440
+    nonisolated(unsafe) private var activeEncodeWidth = 2016
+    nonisolated(unsafe) private var activeEncodeHeight = 1512
     nonisolated(unsafe) private var activeFPS: Double = 30
     nonisolated(unsafe) private var isRecordingUnsafe = false
     nonisolated(unsafe) private var isAudioMutedUnsafe = false
@@ -1619,12 +1619,15 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
     }
 
     private func saveFinishedRecording(at url: URL) async {
+        let tempGcsvURL = url.deletingPathExtension().appendingPathExtension("gcsv")
+
         // Validate the file before attempting any save
         guard await validateVideoFile(at: url) else {
             statusText = "Save failed"
             errorMessage = "Video file is corrupt or empty"
             print("[CameraViewModel] File validation failed for \(url.lastPathComponent)")
             try? FileManager.default.removeItem(at: url)
+            try? FileManager.default.removeItem(at: tempGcsvURL)
             endSaveTask()
             return
         }
@@ -1637,6 +1640,7 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
                         self.errorMessage = "Photo library access denied"
                         self.refreshStatusLine()
                         try? FileManager.default.removeItem(at: url)
+                        try? FileManager.default.removeItem(at: tempGcsvURL)
                         self.endSaveTask()
                     }
                     return
@@ -1656,6 +1660,7 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
                         self.endSaveTask()
                     }
                     try? FileManager.default.removeItem(at: url)
+                    try? FileManager.default.removeItem(at: tempGcsvURL)
                 }
             }
         case .files:
@@ -1777,10 +1782,12 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
 
     private func saveRecordingToChosenFilesFolder(_ url: URL) {
         defer { endSaveTask() }
+        let tempGcsvURL = url.deletingPathExtension().appendingPathExtension("gcsv")
         guard let folderURL = resolveFilesFolderURL() else {
             errorMessage = "Choose a Files folder before recording"
             statusText = "Save failed"
             try? FileManager.default.removeItem(at: url)
+            try? FileManager.default.removeItem(at: tempGcsvURL)
             refreshStatusLine()
             return
         }
@@ -1796,12 +1803,23 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
             let destination = uniqueDestinationURL(in: folderURL, preferredName: url.lastPathComponent)
             try FileManager.default.copyItem(at: url, to: destination)
             try? FileManager.default.removeItem(at: url)
+
+            // Also copy companion .gcsv file alongside the video into the chosen folder
+            if FileManager.default.fileExists(atPath: tempGcsvURL.path) {
+                let gcsvDestination = destination.deletingPathExtension().appendingPathExtension("gcsv")
+                try? FileManager.default.removeItem(at: gcsvDestination)
+                try? FileManager.default.copyItem(at: tempGcsvURL, to: gcsvDestination)
+                try? FileManager.default.removeItem(at: tempGcsvURL)
+                print("[CameraViewModel] Copied companion .gcsv to Files folder: \(gcsvDestination.path)")
+            }
+
             statusText = "Saved to Files"
             showToast("Saved to Files")
             refreshStatusLine()
             print("[CameraViewModel] Saved recording to Files: \(destination.path)")
         } catch {
             try? FileManager.default.removeItem(at: url)
+            try? FileManager.default.removeItem(at: tempGcsvURL)
             errorMessage = "Files save failed: \(error.localizedDescription)"
             statusText = "Save failed"
             refreshStatusLine()
@@ -2094,16 +2112,19 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
             if let framed {
                 reorderBuffer[frameData.sequenceID] = (framed, bgraPB, frameData)
             } else {
-                // Advance sequence if this failed frame is the one we are waiting for
+                // If this frame failed, insert a placeholder or advance
                 if frameData.sequenceID == nextOutputSequenceID {
                     nextOutputSequenceID &+= 1
+                } else if frameData.sequenceID > nextOutputSequenceID {
+                    // Mark as failed placeholder so sequencer doesn't stall when reaching it
+                    reorderBuffer[frameData.sequenceID] = (nil, nil, frameData)
                 }
             }
 
             // Gap recovery: if a sequence ID was lost before reaching handleRecordedFrame (e.g. dropped in ring buffer),
-            // prevent reorderBuffer from stalling indefinitely.
+            // prevent reorderBuffer from stalling. Since only 3 slots exist, waiting for 6 frames caused 200ms freezes.
             if let minKey = reorderBuffer.keys.min() {
-                if minKey > nextOutputSequenceID && reorderBuffer.count >= 6 {
+                if minKey > nextOutputSequenceID && (reorderBuffer.count >= 2 || freeSlots.count == 3) {
                     nextOutputSequenceID = minKey
                 }
             }

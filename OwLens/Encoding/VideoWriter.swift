@@ -14,6 +14,9 @@ final class VideoWriter: @unchecked Sendable {
     private var assetWriter: AVAssetWriter?
     private var videoInput: AVAssetWriterInput?
     private var audioInput: AVAssetWriterInput?
+    private var metadataInput: AVAssetWriterInput?
+    private var metadataFormatDesc: CMFormatDescription?
+    let gyroRecorder = GyroMotionRecorder()
     private var pixelBufferAdaptor: AVAssetWriterInputPixelBufferAdaptor?
     private var frameCount: Int64 = 0
     private var realFrameCount: Int64 = 0
@@ -165,6 +168,30 @@ final class VideoWriter: @unchecked Sendable {
             }
         }
 
+        // Gyroflow motion logging & embedded CAMM metadata track
+        gyroRecorder.start(orientation: orientation, fps: fps)
+        var formatDesc: CMFormatDescription?
+        let spec: [String: Any] = [
+            kCMMetadataFormatDescriptionMetadataSpecificationKey_Identifier as String: "mdta/com.google.camm",
+            kCMMetadataFormatDescriptionMetadataSpecificationKey_DataType as String: kCMMetadataBaseDataType_RawData as String
+        ]
+        let metaStatus = CMMetadataFormatDescriptionCreateWithMetadataSpecifications(
+            allocator: kCFAllocatorDefault,
+            metadataType: kCMMetadataFormatType_Boxed,
+            metadataSpecifications: [spec] as CFArray,
+            formatDescriptionOut: &formatDesc
+        )
+        var mInput: AVAssetWriterInput?
+        if metaStatus == noErr, let formatDesc {
+            let meta = AVAssetWriterInput(mediaType: .metadata, outputSettings: nil, sourceFormatHint: formatDesc)
+            meta.expectsMediaDataInRealTime = true
+            if writer.canAdd(meta) {
+                writer.add(meta)
+                mInput = meta
+                self.metadataFormatDesc = formatDesc
+            }
+        }
+
         writer.metadata = Self.makeMetadataItems(curveType: curveType, fps: fps, width: width, height: height)
 
         guard writer.startWriting() else {
@@ -174,6 +201,7 @@ final class VideoWriter: @unchecked Sendable {
         self.assetWriter = writer
         self.videoInput = vInput
         self.audioInput = aInput
+        self.metadataInput = mInput
         self.pixelBufferAdaptor = adaptor
         self.frameCount = 0
         self.realFrameCount = 0
@@ -328,12 +356,34 @@ final class VideoWriter: @unchecked Sendable {
             lastFrameHostTime = now
             assetWriter?.startSession(atSourceTime: .zero)
             hasStartedSession = true
+            gyroRecorder.anchorSession(startHostTime: now)
             drainPrerollAudioBuffersLocked()
+        } else if realFrameCount <= 1 {
+            // Startup grace: If initial pipeline spin-up delayed the second frame,
+            // re-anchor session start to prevent a burst of duplicate frames at file start.
+            let deltaFromStart: Double
+            if let captureTime = captureTime, captureTime.isValid, sessionStartTime.isValid {
+                deltaFromStart = max(0, CMTimeSubtract(captureTime, sessionStartTime).seconds)
+            } else {
+                deltaFromStart = max(0, now - startHostTime)
+            }
+            if deltaFromStart > (1.5 / targetFPS) {
+                if let captureTime = captureTime, captureTime.isValid {
+                    sessionStartTime = captureTime
+                    lastFrameCaptureTime = captureTime
+                }
+                startHostTime = now
+                lastFrameHostTime = now
+                gyroRecorder.anchorSession(startHostTime: now)
+            }
         }
 
-        // Cumulative elapsed time timeline pacing:
-        // By locking the CFR frame index to total elapsed time since sessionStartTime,
-        // we guarantee zero cumulative audio/video desync over arbitrarily long recordings.
+        // True CFR timeline pacing with jitter deadband:
+        // By anchoring to cumulative elapsed time, we guarantee zero cumulative audio/video drift.
+        // A held frame is ONLY injected if cumulative elapsed time indicates that an entire frame
+        // period (>= 1.75 * interval) was genuinely dropped by camera hardware.
+        // Minor 5-25ms timer/sensor jitters never trigger duplicate frames, eliminating stutter
+        // while preserving rock-solid audio/video synchronization over arbitrarily long recordings.
         let elapsedSeconds: Double
         if let captureTime = captureTime, captureTime.isValid, sessionStartTime.isValid {
             elapsedSeconds = max(0, CMTimeSubtract(captureTime, sessionStartTime).seconds)
@@ -341,16 +391,18 @@ final class VideoWriter: @unchecked Sendable {
             elapsedSeconds = max(0, now - startHostTime)
         }
 
-        let targetIndex = max(frameCount, Int64((elapsedSeconds * targetFPS).rounded()))
-        let missedSlots = min(15, Int(targetIndex - frameCount))
+        let expectedFrames = elapsedSeconds * targetFPS
+        let cumulativeDrift = expectedFrames - Double(frameCount)
 
-        if missedSlots > 0, let hold = lastPixelBuffer {
+        if cumulativeDrift >= 1.75, let hold = lastPixelBuffer {
+            let missedSlots = min(10, Int(cumulativeDrift))
             for _ in 0..<missedSlots {
                 guard input.isReadyForMoreMediaData else {
                     droppedFrames += 1
                     break
                 }
                 if writeCFR(hold, index: frameCount, adaptor: adaptor) {
+                    appendGyroMetadataLocked(index: frameCount, elapsedSeconds: elapsedSeconds)
                     frameCount += 1
                 } else {
                     droppedFrames += 1
@@ -385,6 +437,7 @@ final class VideoWriter: @unchecked Sendable {
         }
 
         if writeCFR(pixelBuffer, index: frameCount, adaptor: adaptor) {
+            appendGyroMetadataLocked(index: frameCount, elapsedSeconds: elapsedSeconds)
             frameCount += 1
             realFrameCount += 1
             lastPixelBuffer = pixelBuffer
@@ -397,6 +450,58 @@ final class VideoWriter: @unchecked Sendable {
             droppedFrames += 1
             return false
         }
+    }
+
+    private func appendGyroMetadataLocked(index: Int64, elapsedSeconds: Double) {
+        guard let mInput = metadataInput,
+              mInput.isReadyForMoreMediaData,
+              let formatDesc = metadataFormatDesc,
+              let sample = gyroRecorder.latestSample(at: elapsedSeconds) else { return }
+
+        let cammData = sample.toCAMMData()
+        var blockBuffer: CMBlockBuffer?
+        let bbStatus = CMBlockBufferCreateWithMemoryBlock(
+            allocator: kCFAllocatorDefault,
+            memoryBlock: nil,
+            blockLength: cammData.count,
+            blockAllocator: kCFAllocatorDefault,
+            customBlockSource: nil,
+            offsetToData: 0,
+            dataLength: cammData.count,
+            flags: 0,
+            blockBufferOut: &blockBuffer
+        )
+        guard bbStatus == noErr, let bb = blockBuffer else { return }
+
+        cammData.withUnsafeBytes { rawBuffer in
+            if let ptr = rawBuffer.baseAddress {
+                CMBlockBufferReplaceDataBytes(
+                    with: ptr,
+                    blockBuffer: bb,
+                    offsetIntoDestination: 0,
+                    dataLength: cammData.count
+                )
+            }
+        }
+
+        let pts = CMTime(value: index * 1000, timescale: CMTimeScale(targetFPS * 1000.0))
+        let duration = CMTime(value: 1000, timescale: CMTimeScale(targetFPS * 1000.0))
+        var timing = CMSampleTimingInfo(duration: duration, presentationTimeStamp: pts, decodeTimeStamp: .invalid)
+
+        var sampleBuffer: CMSampleBuffer?
+        let sbStatus = CMSampleBufferCreateReady(
+            allocator: kCFAllocatorDefault,
+            dataBuffer: bb,
+            formatDescription: formatDesc,
+            sampleCount: 1,
+            sampleTimingEntryCount: 1,
+            sampleTimingArray: &timing,
+            sampleSizeEntryCount: 1,
+            sampleSizeArray: [cammData.count],
+            sampleBufferOut: &sampleBuffer
+        )
+        guard sbStatus == noErr, let sampleBuffer else { return }
+        _ = mInput.append(sampleBuffer)
     }
 
     private func writeCFR(
@@ -586,6 +691,7 @@ final class VideoWriter: @unchecked Sendable {
         let writer = assetWriter
         let vIn = videoInput
         let aIn = audioInput
+        let mIn = metadataInput
         let total = frameCount
         let real = realFrameCount
         let drops = droppedFrames
@@ -594,6 +700,7 @@ final class VideoWriter: @unchecked Sendable {
 
         vIn?.markAsFinished()
         aIn?.markAsFinished()
+        mIn?.markAsFinished()
 
         // `writer` (AVAssetWriter) is non-Sendable; box it so the @Sendable
         // finishWriting callback can capture it. If there is no writer there is
@@ -607,6 +714,7 @@ final class VideoWriter: @unchecked Sendable {
         if real == 0 {
             print("[VideoWriter] No real frames were appended to the video timeline.")
             writer.cancelWriting()
+            gyroRecorder.stop()
             if let url {
                 try? FileManager.default.removeItem(at: url)
             }
@@ -618,13 +726,67 @@ final class VideoWriter: @unchecked Sendable {
             let status = boxedWriter.value.status
             let duration = Double(total) / fps
             print("[VideoWriter] Done. timeline=\(total) real=\(real) holds=\(total - real) drops=\(drops) \(String(format: "%.2f", duration))s @ \(Int(fps))fps status=\(String(describing: status))")
+            let outputURL = boxedWriter.value.outputURL
+            let gcsvData = self.gyroRecorder.exportGCSVData(videoFileName: outputURL.lastPathComponent)
+            self.gyroRecorder.stop()
             if status == .failed {
                 let err = boxedWriter.value.error ?? NSError(domain: "OwLens", code: 103, userInfo: [NSLocalizedDescriptionKey: "Video writer failed to finalize file"])
                 print("[VideoWriter] Error: \(err)")
                 completion(nil, err)
             } else {
+                Self.patchMebxToCamm(at: outputURL)
+
+                // 1. Always save dedicated .gcsv file to Documents/OwLens Gyro in Files app
+                GyroMotionRecorder.saveGCSVFile(data: gcsvData, videoFileName: outputURL.lastPathComponent)
+
+                // 2. Also write companion .gcsv alongside temporary video file
+                let tempGcsvURL = outputURL.deletingPathExtension().appendingPathExtension("gcsv")
+                try? gcsvData.write(to: tempGcsvURL, options: .atomic)
+
                 completion(url, nil)
             }
+        }
+    }
+
+    /// In-place patch to replace AVFoundation's default 'mebx' sample entry identifier
+    /// in the metadata track's 'stsd' box with 'camm' (Google Camera Motion Metadata).
+    /// This enables standard Gyroflow and DaVinci Resolve OpenFX plugin to natively detect
+    /// and parse the embedded gyroscope stream with zero external sidecar files.
+    private static func patchMebxToCamm(at url: URL) {
+        guard let fileHandle = try? FileHandle(forUpdating: url) else { return }
+        defer { try? fileHandle.close() }
+
+        let fileSize = fileHandle.seekToEndOfFile()
+        guard fileSize > 64 else { return }
+
+        let scanLength = min(fileSize, 5 * 1024 * 1024)
+        let scanOffset = fileSize - scanLength
+        fileHandle.seek(toFileOffset: scanOffset)
+        let buffer = fileHandle.readData(ofLength: Int(scanLength))
+
+        let mebxBytes = Data("mebx".utf8)
+        let cammBytes = Data("camm".utf8)
+        let stsdBytes = Data("stsd".utf8)
+
+        if let stsdRange = buffer.range(of: stsdBytes) {
+            let searchWindow = Range(uncheckedBounds: (
+                lower: stsdRange.upperBound,
+                upper: min(buffer.count, stsdRange.upperBound + 64)
+            ))
+            if let mebxRange = buffer.range(of: mebxBytes, options: [], in: searchWindow) {
+                let filePatchOffset = scanOffset + UInt64(mebxRange.lowerBound)
+                fileHandle.seek(toFileOffset: filePatchOffset)
+                fileHandle.write(cammBytes)
+                print("[VideoWriter] Successfully patched stsd entry 'mebx' -> 'camm' at offset \(filePatchOffset)")
+                return
+            }
+        }
+
+        if let mebxRange = buffer.range(of: mebxBytes) {
+            let filePatchOffset = scanOffset + UInt64(mebxRange.lowerBound)
+            fileHandle.seek(toFileOffset: filePatchOffset)
+            fileHandle.write(cammBytes)
+            print("[VideoWriter] Fallback patched 'mebx' -> 'camm' at offset \(filePatchOffset)")
         }
     }
 

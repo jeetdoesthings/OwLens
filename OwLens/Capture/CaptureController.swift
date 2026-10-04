@@ -236,7 +236,7 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
                 maxInFlight = 1
                 print("[CaptureController] Responsive capture disabled — would remove Bayer RAW")
             } else {
-                maxInFlight = 2
+                maxInFlight = 3
             }
         }
         if photoOutput.isFastCapturePrioritizationSupported {
@@ -382,7 +382,7 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
                 prewarmBayerBufferPool(width: Int(dims.width), height: Int(dims.height), format: rawPixelFormat)
             }
         }
-        let prepared = (0..<3).map { _ in makeRAWPhotoSettings() }
+        let prepared = (0..<8).map { _ in makeRAWPhotoSettings() }
         photoOutput.setPreparedPhotoSettingsArray(prepared) { preparedOK, error in
             if let error {
                 print("[CaptureController] prepare RAW settings failed: \(error)")
@@ -393,13 +393,13 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
     }
 
     /// Keep AVFoundation photoOutput prepared settings primed during continuous capture burst.
-    /// Replenishes every 3 frames so capture never reverts to unprepared/cold ISP mode.
+    /// Replenishes every 15 frames in larger batches so mediaserverd IPC does not thrash the capture loop.
     private func replenishPreparedPhotoSettingsIfNeeded() {
         guard session.isRunning else { return }
         framesSincePreparedReplenish += 1
-        if framesSincePreparedReplenish >= 3 {
+        if framesSincePreparedReplenish >= 15 {
             framesSincePreparedReplenish = 0
-            let prepared = (0..<3).map { _ in makeRAWPhotoSettings() }
+            let prepared = (0..<8).map { _ in makeRAWPhotoSettings() }
             photoOutput.setPreparedPhotoSettingsArray(prepared, completionHandler: nil)
         }
     }
@@ -992,7 +992,7 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
             enableBurstHelpersIfSafe()
         }
         if photoOutput.isResponsiveCaptureEnabled {
-            maxInFlight = 2
+            maxInFlight = 3
         } else {
             maxInFlight = 1
         }
@@ -1246,16 +1246,16 @@ extension CaptureController: AVCapturePhotoCaptureDelegate {
             return
         }
 
-        // CRITICAL: copy then drop system buffer reference so next RAW can start.
+        // Release in-flight capture slot IMMEDIATELY now that systemBuffer is safely held.
+        // This overlaps the hardware sensor exposure and readout of the next frame with our buffer copy and metadata extraction!
+        releaseCaptureSlotIfNeeded()
+        replenishPreparedPhotoSettingsIfNeeded()
+
+        // CRITICAL: copy into our pooled buffer so system can recycle systemBuffer.
         guard let owned = copyBayerPixelBuffer(systemBuffer) else {
             print("[CaptureController] Failed to copy Bayer buffer")
             return
         }
-
-        // Release in-flight capture slot IMMEDIATELY now that system buffer has been copied into our owned pool buffer.
-        // This overlaps the hardware exposure/sensor readout of the next frame with our CPU metadata extraction!
-        releaseCaptureSlotIfNeeded()
-        replenishPreparedPhotoSettingsIfNeeded()
 
         let bufferFormat = CVPixelBufferGetPixelFormatType(owned)
         // Priority: device-model override → cached pattern → DNG metadata → OSType FourCC → session default → RGGB

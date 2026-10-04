@@ -29,14 +29,14 @@ enum RecordingFormat: String, CaseIterable, Identifiable {
 
     var width: Int {
         switch self {
-        case .openGate: return 1920
+        case .openGate: return 2016
         case .hd169: return 1920
         }
     }
 
     var height: Int {
         switch self {
-        case .openGate: return 1440
+        case .openGate: return 1512
         case .hd169: return 1080
         }
     }
@@ -63,8 +63,8 @@ enum RecordingFormat: String, CaseIterable, Identifiable {
 
     var suggestedBitratePreset: BitratePreset {
         switch self {
-        case .openGate: return .mbps100
-        case .hd169: return .mbps80
+        case .openGate: return .mbps150
+        case .hd169: return .mbps150
         }
     }
 
