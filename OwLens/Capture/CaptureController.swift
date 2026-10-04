@@ -69,6 +69,7 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
     private var isReconfiguringAudio = false
     /// Whether the capture timer runs in recording mode (tighter settings).
     private var isRecordingMode = false
+    private var isReconfiguringSession = false
 
     private var bayerBufferPool: CVPixelBufferPool?
     private var bayerPoolW: Int = 0
@@ -209,10 +210,13 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
                 return
             }
             let frameDuration = CMTime(value: 1, timescale: CMTimeScale(rate))
+            // Always invalidate maxFrameDuration first to prevent NSInvalidArgumentException if min > current max
+            camera.activeVideoMaxFrameDuration = .invalid
             camera.activeVideoMinFrameDuration = frameDuration
-            camera.activeVideoMaxFrameDuration = frameDuration
+            // Do NOT lock activeVideoMaxFrameDuration to frameDuration: leaving it unlocked prevents AVFoundation
+            // from dropping frames if sensor exposure/readout takes slightly longer than 33.3ms!
             let dims = CMVideoFormatDescriptionGetDimensions(camera.activeFormat.formatDescription)
-            print("[CaptureController] Sensor \(dims.width)x\(dims.height) locked @ exact \(rate)fps (preset .photo)")
+            print("[CaptureController] Sensor \(dims.width)x\(dims.height) cadence min-duration @ \(rate)fps (preset .photo)")
         } catch {
             print("[CaptureController] lockSensorToTargetFPS: \(error)")
         }
@@ -233,11 +237,15 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
             photoOutput.isResponsiveCaptureEnabled = true
             if bayerFormatsAvailable().isEmpty {
                 photoOutput.isResponsiveCaptureEnabled = false
-                maxInFlight = 1
+                maxInFlight = 2
                 print("[CaptureController] Responsive capture disabled — would remove Bayer RAW")
             } else {
                 maxInFlight = 3
             }
+        } else {
+            // Even without responsive capture, AVCapturePhotoOutput with .speed prioritization
+            // safely supports 2 in-flight frames, preventing the stop-and-wait bottleneck on Ultra-Wide!
+            maxInFlight = 2
         }
         if photoOutput.isFastCapturePrioritizationSupported {
             photoOutput.isFastCapturePrioritizationEnabled = true
@@ -247,7 +255,12 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
             }
         }
         if #available(iOS 16.0, *) {
-            cachedMaxPhotoDimensions = photoOutput.maxPhotoDimensions
+            if let dev = device,
+               let best = dev.activeFormat.supportedMaxPhotoDimensions.max(by: { ($0.width * $0.height) < ($1.width * $1.height) }) {
+                cachedMaxPhotoDimensions = best
+            } else {
+                cachedMaxPhotoDimensions = photoOutput.maxPhotoDimensions
+            }
         }
         if #available(iOS 18.0, *) {
             cachedShutterSoundSuppression = photoOutput.isShutterSoundSuppressionSupported
@@ -377,9 +390,26 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
     /// Warm capture pipeline for repeated RAW stills (WWDC: setPreparedPhotoSettingsArray).
     private func prepareRAWPhotoResources() {
         if let cam = device {
-            let dims = CMVideoFormatDescriptionGetDimensions(cam.activeFormat.formatDescription)
-            if dims.width > 0 && dims.height > 0 && rawPixelFormat != 0 {
-                prewarmBayerBufferPool(width: Int(dims.width), height: Int(dims.height), format: rawPixelFormat)
+            var targetW = 0
+            var targetH = 0
+            if #available(iOS 16.0, *) {
+                if let best = cam.activeFormat.supportedMaxPhotoDimensions.max(by: { ($0.width * $0.height) < ($1.width * $1.height) }) {
+                    targetW = Int(best.width)
+                    targetH = Int(best.height)
+                }
+            }
+            if targetW == 0 || targetH == 0 {
+                let dims = CMVideoFormatDescriptionGetDimensions(cam.activeFormat.formatDescription)
+                targetW = Int(dims.width)
+                targetH = Int(dims.height)
+            }
+            // Standard sensor resolution for 12MP Bayer RAW if video preview dimensions were reported
+            if targetW < 3000 || targetH < 2000 {
+                targetW = 4032
+                targetH = 3024
+            }
+            if targetW > 0 && targetH > 0 && rawPixelFormat != 0 {
+                prewarmBayerBufferPool(width: targetW, height: targetH, format: rawPixelFormat)
             }
         }
         let prepared = (0..<8).map { _ in makeRAWPhotoSettings() }
@@ -395,7 +425,7 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
     /// Keep AVFoundation photoOutput prepared settings primed during continuous capture burst.
     /// Replenishes every 15 frames in larger batches so mediaserverd IPC does not thrash the capture loop.
     private func replenishPreparedPhotoSettingsIfNeeded() {
-        guard session.isRunning else { return }
+        guard session.isRunning, !isReconfiguringSession else { return }
         framesSincePreparedReplenish += 1
         if framesSincePreparedReplenish >= 15 {
             framesSincePreparedReplenish = 0
@@ -409,12 +439,17 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
         settings.flashMode = .off
         settings.photoQualityPrioritization = .speed
         if #available(iOS 16.0, *) {
-            if let maxDims = cachedMaxPhotoDimensions {
+            if let dev = device {
+                let supported = dev.activeFormat.supportedMaxPhotoDimensions
+                if let maxDims = cachedMaxPhotoDimensions,
+                   supported.contains(where: { $0.width == maxDims.width && $0.height == maxDims.height }) {
+                    settings.maxPhotoDimensions = maxDims
+                } else if let best = supported.max(by: { ($0.width * $0.height) < ($1.width * $1.height) }) {
+                    cachedMaxPhotoDimensions = best
+                    settings.maxPhotoDimensions = best
+                }
+            } else if let maxDims = cachedMaxPhotoDimensions {
                 settings.maxPhotoDimensions = maxDims
-            } else {
-                let dims = photoOutput.maxPhotoDimensions
-                cachedMaxPhotoDimensions = dims
-                settings.maxPhotoDimensions = dims
             }
         }
         if #available(iOS 18.0, *) {
@@ -642,10 +677,23 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
                 return
             }
 
+            self.isReconfiguringSession = true
+            defer { self.isReconfiguringSession = false }
+
             let wasRunning = self.session.isRunning
             self.captureTimer?.cancel()
             self.captureTimer = nil
+            self.captureLock.withLock {
+                self.isCapturePending = false
+                self.inFlightCaptures = 0
+            }
             self.waitForInFlightClear(timeout: 0.5)
+
+            // Invalidate buffer pool from previous lens to reclaim memory immediately
+            self.bayerBufferPool = nil
+            self.bayerPoolW = 0
+            self.bayerPoolH = 0
+            self.bayerPoolFormat = 0
 
             let previousInput = self.videoInput
             let previousDevice = self.device
@@ -681,7 +729,7 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
 
                 self.session.sessionPreset = .photo
                 self.photoOutput.maxPhotoQualityPrioritization = .speed
-                self.maxInFlight = 1
+                self.maxInFlight = 2
                 self.session.commitConfiguration()
 
                 // Resolve Bayer *after* commit (list is empty mid-configuration)
@@ -702,7 +750,7 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
                         }
                         self.session.sessionPreset = .photo
                         self.photoOutput.maxPhotoQualityPrioritization = .speed
-                        self.maxInFlight = 1
+                        self.maxInFlight = 2
                         self.session.commitConfiguration()
                         try? self.applyDefaultCameraModes(on: prev)
                         try? self.resolveBayerRAWOrThrow(allowFallbackToOtherLenses: false)
@@ -715,11 +763,19 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
                 self.cachedWhiteLevel = nil
                 self.cachedISO = nil
                 self.cachedCFAPattern = nil
+                self.cachedKelvin = nil
+                self.cachedTint = nil
+                self.cachedFM1 = nil
+                self.cachedFM2 = nil
                 self.cachedColorMatrices = nil
                 self.lastComputedMatrixKelvin = nil
                 self.lastWBGains = nil
                 if #available(iOS 16.0, *) {
-                    self.cachedMaxPhotoDimensions = self.photoOutput.maxPhotoDimensions
+                    if let best = camera.activeFormat.supportedMaxPhotoDimensions.max(by: { ($0.width * $0.height) < ($1.width * $1.height) }) {
+                        self.cachedMaxPhotoDimensions = best
+                    } else {
+                        self.cachedMaxPhotoDimensions = self.photoOutput.maxPhotoDimensions
+                    }
                 }
                 if #available(iOS 18.0, *) {
                     self.cachedShutterSoundSuppression = self.photoOutput.isShutterSoundSuppressionSupported
@@ -994,7 +1050,7 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
         if photoOutput.isResponsiveCaptureEnabled {
             maxInFlight = 3
         } else {
-            maxInFlight = 1
+            maxInFlight = 2
         }
     }
 
@@ -1021,6 +1077,7 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
 
     private func captureOneRawFrame() {
         if isReconfiguringAudio { return }
+        guard session.isRunning, !isReconfiguringSession else { return }
 
         let canCapture: Bool = captureLock.withLock {
             if inFlightCaptures >= maxInFlight {
@@ -1071,7 +1128,7 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
     private func prewarmBayerBufferPool(width: Int, height: Int, format: OSType) {
         guard bayerBufferPool == nil || bayerPoolW != width || bayerPoolH != height || bayerPoolFormat != format else { return }
         let poolAttrs: [String: Any] = [
-            kCVPixelBufferPoolMinimumBufferCountKey as String: 32
+            kCVPixelBufferPoolMinimumBufferCountKey as String: 6
         ]
         let pbAttrs: [String: Any] = [
             kCVPixelBufferPixelFormatTypeKey as String: format,

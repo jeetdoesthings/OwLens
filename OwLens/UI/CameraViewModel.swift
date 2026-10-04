@@ -709,6 +709,7 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
             applyManualExposureAndWB()
             refreshStatusLine()
             isCameraReady = true
+            cameraReadyTime = Date()
             UIApplication.shared.isIdleTimerDisabled = true
             Self.cleanStaleTemporaryRecordings()
             print("[CameraViewModel] Camera session started · \(caps.marketingName) · lenses=\(availableLenses.map(\.shortLabel))")
@@ -716,6 +717,7 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
             errorMessage = error.localizedDescription
             statusText = "Camera failed"
             isCameraReady = false
+            cameraReadyTime = nil
             // If session fails due to no Bayer after all, treat as unsupported
             if (error as NSError).code == 4 {
                 isDeviceUnsupportedForLog = true
@@ -725,6 +727,8 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
     }
 
     func teardownCamera() {
+        isCameraReady = false
+        cameraReadyTime = nil
         isRecordingUnsafe = false
         UIApplication.shared.isIdleTimerDisabled = false
         levelMonitor.stop()
@@ -1172,10 +1176,13 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
                     let temperatureAndTint = AVCaptureDevice.WhiteBalanceTemperatureAndTintValues(temperature: kelvin, tint: tint)
                     let wbGains = device.deviceWhiteBalanceGains(for: temperatureAndTint)
                     let maxGain = device.maxWhiteBalanceGain
+                    let r = wbGains.redGain.isNaN ? 1.0 : max(1.0, min(maxGain, wbGains.redGain))
+                    let g = wbGains.greenGain.isNaN ? 1.0 : max(1.0, min(maxGain, wbGains.greenGain))
+                    let b = wbGains.blueGain.isNaN ? 1.0 : max(1.0, min(maxGain, wbGains.blueGain))
                     let clamped = AVCaptureDevice.WhiteBalanceGains(
-                        redGain: max(1.0, min(maxGain, wbGains.redGain)),
-                        greenGain: max(1.0, min(maxGain, wbGains.greenGain)),
-                        blueGain: max(1.0, min(maxGain, wbGains.blueGain))
+                        redGain: r,
+                        greenGain: g,
+                        blueGain: b
                     )
                     if device.isWhiteBalanceModeSupported(.locked) {
                         device.setWhiteBalanceModeLocked(with: clamped, completionHandler: nil)
@@ -1271,10 +1278,13 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
 
     private func clampWhiteBalanceGains(_ gains: AVCaptureDevice.WhiteBalanceGains, for device: AVCaptureDevice) -> AVCaptureDevice.WhiteBalanceGains {
         let maxGain = device.maxWhiteBalanceGain
+        let r = gains.redGain.isNaN ? 1.0 : max(1.0, min(maxGain, gains.redGain))
+        let g = gains.greenGain.isNaN ? 1.0 : max(1.0, min(maxGain, gains.greenGain))
+        let b = gains.blueGain.isNaN ? 1.0 : max(1.0, min(maxGain, gains.blueGain))
         return AVCaptureDevice.WhiteBalanceGains(
-            redGain: max(1.0, min(maxGain, gains.redGain)),
-            greenGain: max(1.0, min(maxGain, gains.greenGain)),
-            blueGain: max(1.0, min(maxGain, gains.blueGain))
+            redGain: r,
+            greenGain: g,
+            blueGain: b
         )
     }
 
@@ -1375,12 +1385,15 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
 
     // MARK: - Recording
 
-    private let initializationTime: Date = Date()
+    private var cameraReadyTime: Date?
 
     func toggleRecording() {
         guard isCameraReady, !isDeviceUnsupportedForLog, !isSaving else { return }
-        // Guard against any spurious triggers during initial view hierarchy stabilization
-        guard Date().timeIntervalSince(initializationTime) > 1.0 else { return }
+        // Guard against any spurious triggers during camera spin-up and initial stabilization
+        guard let readyTime = cameraReadyTime, Date().timeIntervalSince(readyTime) > 1.5 else {
+            print("[CameraViewModel] Ignored shutter toggle during camera stabilization window")
+            return
+        }
         Haptics.notification(.success)
         if isRecording {
             stopRecording()

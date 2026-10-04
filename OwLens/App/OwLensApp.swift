@@ -24,12 +24,14 @@ struct RootView: View {
 
     var body: some View {
         ZStack {
-            // Hardware Volume Button & Camera Control Shutter Interception
-            HardwareShutterInteractionView {
-                viewModel.toggleRecording()
+            // Hardware Volume Button & Camera Control Shutter Interception (active only after camera is ready)
+            if viewModel.isCameraReady {
+                HardwareShutterInteractionView {
+                    viewModel.toggleRecording()
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .allowsHitTesting(false)
             }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .allowsHitTesting(false)
 
             if permissionDenied {
                 permissionDeniedView
@@ -394,14 +396,21 @@ struct HardwareShutterInteractionView: UIViewRepresentable {
 
     final class Coordinator: NSObject {
         var onTrigger: () -> Void
+        private var viewAttachedTime: CFTimeInterval = 0
         private var lastTriggerTime: CFTimeInterval = 0
 
         init(onTrigger: @escaping () -> Void) {
             self.onTrigger = onTrigger
+            self.viewAttachedTime = CACurrentMediaTime()
         }
 
         func triggerAction() {
             let now = CACurrentMediaTime()
+            // Ignore any hardware button events during initial view/hardware stabilization window (2.0s)
+            guard now - viewAttachedTime > 2.0 else {
+                print("[HardwareShutter] Ignored shutter event during launch stabilization (age: \(now - viewAttachedTime)s)")
+                return
+            }
             guard now - lastTriggerTime > 0.4 else { return }
             lastTriggerTime = now
             DispatchQueue.main.async { [weak self] in
