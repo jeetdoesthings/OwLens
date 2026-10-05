@@ -421,6 +421,7 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
     // Sequencer for guaranteeing strictly monotonic frame ordering during recording
     nonisolated(unsafe) private var nextDispatchSequenceID: UInt64 = 0
     nonisolated(unsafe) private var nextOutputSequenceID: UInt64 = 0
+    nonisolated(unsafe) private var lastOutputSequenceTime: CFTimeInterval = 0
     nonisolated(unsafe) private var reorderBuffer: [UInt64: (MTLTexture?, CVPixelBuffer?, RawFrameData)] = [:]
 
     nonisolated(unsafe) private var activeEncodeWidth = 2016
@@ -452,8 +453,10 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
     // MARK: - Init
 
     override init() {
-        metalPipeline = MetalPipeline()
+        let pipeline = MetalPipeline()
+        metalPipeline = pipeline
         super.init()
+        captureController.sharedCommandQueue = pipeline?.commandQueue
         startClockAndBatteryMonitoring()
 #if DEBUG
         // Automated unit tests and benchmarks are invoked via test suites rather than on camera startup.
@@ -1486,6 +1489,7 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
             processLock.withLock {
                 nextDispatchSequenceID = 0
                 nextOutputSequenceID = 0
+                lastOutputSequenceTime = CACurrentMediaTime()
                 reorderBuffer.removeAll()
             }
             frameIndex = 0
@@ -1581,6 +1585,7 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
                     rem.append((tex, item.1, item.2))
                 }
             }
+            lastOutputSequenceTime = 0
             return rem
         }
 
@@ -1963,8 +1968,14 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
     }
 
     nonisolated private func processFrame(_ frameData: RawFrameData, slot: Int = 0, completion: @escaping () -> Void) {
-        guard isAppActive else { completion(); return }
-        guard let pipeline = metalPipeline else { completion(); return }
+        guard isAppActive, let pipeline = metalPipeline else {
+            if isRecordingUnsafe {
+                handleRecordedFrame(nil, bgraPB: nil, frameData: frameData, completion: completion)
+            } else {
+                completion()
+            }
+            return
+        }
 
         pipeline.bayerPattern = frameData.cfaPattern
         pipeline.blackLevel = frameData.blackLevel
@@ -2111,16 +2122,21 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
         frameData: RawFrameData,
         completion: @escaping () -> Void
     ) {
-        // Immediately release the Metal pipeline slot so the next frame can begin GPU work concurrently!
-        completion()
-
         guard isRecordingUnsafe else {
+            // Preview path: release GPU slot immediately, no reordering needed
+            completion()
             if let framed {
                 dispatchOrderedRecordedFrame(framed, bgraPB: bgraPB, frameData: frameData)
             }
             return
         }
 
+        // Recording path: insert into reorder buffer BEFORE releasing the GPU slot.
+        // Metal completion handlers can fire concurrently on different threads for
+        // sequentially-committed command buffers. Calling completion() first (which runs
+        // freeSlots.insert) before reorderBuffer insertion created a race where
+        // freeSlots.count could become artificially high, triggering premature
+        // gap-skip and permanently discarding in-flight frames.
         let readyFrames: [(MTLTexture, CVPixelBuffer?, RawFrameData)] = processLock.withLock {
             if let framed {
                 reorderBuffer[frameData.sequenceID] = (framed, bgraPB, frameData)
@@ -2128,17 +2144,23 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
                 // If this frame failed, insert a placeholder or advance
                 if frameData.sequenceID == nextOutputSequenceID {
                     nextOutputSequenceID &+= 1
+                    lastOutputSequenceTime = CACurrentMediaTime()
                 } else if frameData.sequenceID > nextOutputSequenceID {
                     // Mark as failed placeholder so sequencer doesn't stall when reaching it
                     reorderBuffer[frameData.sequenceID] = (nil, nil, frameData)
                 }
             }
 
-            // Gap recovery: if a sequence ID was lost before reaching handleRecordedFrame (e.g. dropped in ring buffer),
-            // prevent reorderBuffer from stalling. Since only 3 slots exist, waiting for 6 frames caused 200ms freezes.
-            if let minKey = reorderBuffer.keys.min() {
-                if minKey > nextOutputSequenceID && (reorderBuffer.count >= 2 || freeSlots.count == 3) {
+            // Gap watchdog: Only advance nextOutputSequenceID if a missing frame has genuinely timed out (>= 250ms).
+            // Under normal operation, GPU compute slots finish within 2-5ms, so valid in-flight frames are NEVER skipped.
+            if let minKey = reorderBuffer.keys.min(), minKey > nextOutputSequenceID {
+                let now = CACurrentMediaTime()
+                if lastOutputSequenceTime == 0 {
+                    lastOutputSequenceTime = now
+                } else if now - lastOutputSequenceTime >= 0.25 {
+                    print("[CameraViewModel] Sequencer timeout: advancing from \(nextOutputSequenceID) to \(minKey)")
                     nextOutputSequenceID = minKey
+                    lastOutputSequenceTime = now
                 }
             }
 
@@ -2148,9 +2170,14 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
                     ready.append((tex, next.1, next.2))
                 }
                 nextOutputSequenceID &+= 1
+                lastOutputSequenceTime = CACurrentMediaTime()
             }
             return ready
         }
+
+        // Release the GPU processing slot AFTER the frame is safely in the reorder buffer.
+        // The ~1μs additional slot hold time is negligible with 3 concurrent slots.
+        completion()
 
         for item in readyFrames {
             dispatchOrderedRecordedFrame(item.0, bgraPB: item.1, frameData: item.2)

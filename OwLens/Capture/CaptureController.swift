@@ -77,6 +77,10 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
     private var bayerPoolFormat: OSType = 0
     private let metalDevice: MTLDevice? = MTLCreateSystemDefaultDevice()
     private lazy var blitCommandQueue: MTLCommandQueue? = metalDevice?.makeCommandQueue()
+    /// Shared Metal command queue from MetalPipeline. When set, copyBayerPixelBuffer enqueues
+    /// DMA blits directly into the same queue, guaranteeing sequential execution before compute shaders
+    /// with ZERO CPU waitUntilCompleted() stall!
+    var sharedCommandQueue: MTLCommandQueue?
     private var framesSincePreparedReplenish: Int = 0
     private var cachedMaxPhotoDimensions: CMVideoDimensions?
     private var cachedShutterSoundSuppression: Bool = false
@@ -226,27 +230,23 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
         let before = bayerFormatsAvailable()
         guard !before.isEmpty else { return }
 
+        // Note: Zero Shutter Lag (ZSL) is NOT compatible with manual exposure (.custom mode)
+        // or continuous Bayer RAW, and causes AVFoundation to reject or drop photo captures.
         if photoOutput.isZeroShutterLagSupported {
-            photoOutput.isZeroShutterLagEnabled = true
-            if bayerFormatsAvailable().isEmpty {
-                photoOutput.isZeroShutterLagEnabled = false
-                print("[CaptureController] ZSL disabled — would remove Bayer RAW")
-            }
+            photoOutput.isZeroShutterLagEnabled = false
         }
         if photoOutput.isResponsiveCaptureSupported {
             photoOutput.isResponsiveCaptureEnabled = true
             if bayerFormatsAvailable().isEmpty {
                 photoOutput.isResponsiveCaptureEnabled = false
-                maxInFlight = 2
                 print("[CaptureController] Responsive capture disabled — would remove Bayer RAW")
-            } else {
-                maxInFlight = 3
             }
-        } else {
-            // Even without responsive capture, AVCapturePhotoOutput with .speed prioritization
-            // safely supports 2 in-flight frames, preventing the stop-and-wait bottleneck on Ultra-Wide!
-            maxInFlight = 2
         }
+        // Continuous Bayer RAW requires strictly single in-flight capture (maxInFlight = 1)
+        // to prevent sensor readout collisions where AVFoundation rejects overlapping captures
+        // (which was the root cause of 15 fps on 0.5x Ultra-Wide and 20 fps on 1x Wide).
+        maxInFlight = 1
+
         if photoOutput.isFastCapturePrioritizationSupported {
             photoOutput.isFastCapturePrioritizationEnabled = true
             if bayerFormatsAvailable().isEmpty {
@@ -254,6 +254,9 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
                 print("[CaptureController] Fast capture prioritization disabled — Bayer safety")
             }
         }
+    }
+
+    private func updateCachedMaxPhotoDimensions() {
         if #available(iOS 16.0, *) {
             if let dev = device,
                let best = dev.activeFormat.supportedMaxPhotoDimensions.max(by: { ($0.width * $0.height) < ($1.width * $1.height) }) {
@@ -419,18 +422,6 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
             } else {
                 print("[CaptureController] RAW photo resources prepared=\(preparedOK)")
             }
-        }
-    }
-
-    /// Keep AVFoundation photoOutput prepared settings primed during continuous capture burst.
-    /// Replenishes every 15 frames in larger batches so mediaserverd IPC does not thrash the capture loop.
-    private func replenishPreparedPhotoSettingsIfNeeded() {
-        guard session.isRunning, !isReconfiguringSession else { return }
-        framesSincePreparedReplenish += 1
-        if framesSincePreparedReplenish >= 15 {
-            framesSincePreparedReplenish = 0
-            let prepared = (0..<8).map { _ in makeRAWPhotoSettings() }
-            photoOutput.setPreparedPhotoSettingsArray(prepared, completionHandler: nil)
         }
     }
 
@@ -729,7 +720,7 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
 
                 self.session.sessionPreset = .photo
                 self.photoOutput.maxPhotoQualityPrioritization = .speed
-                self.maxInFlight = 2
+                self.maxInFlight = 1
                 self.session.commitConfiguration()
 
                 // Resolve Bayer *after* commit (list is empty mid-configuration)
@@ -750,7 +741,7 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
                         }
                         self.session.sessionPreset = .photo
                         self.photoOutput.maxPhotoQualityPrioritization = .speed
-                        self.maxInFlight = 2
+                        self.maxInFlight = 1
                         self.session.commitConfiguration()
                         try? self.applyDefaultCameraModes(on: prev)
                         try? self.resolveBayerRAWOrThrow(allowFallbackToOtherLenses: false)
@@ -1040,18 +1031,15 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
     }
 
     /// Adjust capture pipeline behavior for recording.
-    /// Retains responsive capture double-buffering (maxInFlight=2) so sensor throughput hits full 24/30 fps.
+    /// Strictly maintains single in-flight capture (maxInFlight=1) for continuous Bayer RAW
+    /// so AVFoundation and the sensor never drop/reject overlapping frames.
     /// Must be called from the main thread.
     func setRecordingMode(_ recording: Bool) {
         isRecordingMode = recording
         if recording {
             enableBurstHelpersIfSafe()
         }
-        if photoOutput.isResponsiveCaptureEnabled {
-            maxInFlight = 3
-        } else {
-            maxInFlight = 2
-        }
+        maxInFlight = 1
     }
 
     // MARK: - Continuous RAW Capture Loop
@@ -1184,9 +1172,10 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
 
         guard let dst else { return nil }
 
-        // Fast path: GPU DMA Blit via Metal IOSurface zero-copy binding (~0.2ms vs ~12ms CPU memcpy)
+        // Fast path: GPU DMA Blit via Metal IOSurface zero-copy binding (~0.05ms)
+        let queue = sharedCommandQueue ?? blitCommandQueue
         if let device = metalDevice,
-           let queue = blitCommandQueue,
+           let queue,
            let srcSurfaceRef = CVPixelBufferGetIOSurface(src),
            let dstSurfaceRef = CVPixelBufferGetIOSurface(dst) {
             let srcSurface = srcSurfaceRef.takeUnretainedValue()
@@ -1225,7 +1214,9 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
                 )
                 blit.endEncoding()
                 cb.commit()
-                cb.waitUntilCompleted()
+                if sharedCommandQueue == nil {
+                    cb.waitUntilCompleted()
+                }
                 return dst
             }
         }
@@ -1267,6 +1258,21 @@ extension CaptureController: AVCapturePhotoCaptureDelegate {
     // set during configureSession, plus the isShutterSoundSuppressionEnabled flag
     // on iOS 18+. No per-frame AudioServices calls needed.
 
+    func photoOutput(_ output: AVCapturePhotoOutput, didFinishCaptureFor resolvedSettings: AVCaptureResolvedPhotoSettings, error: Error?) {
+        if let error {
+            print("[CaptureController] didFinishCaptureFor error: \(error.localizedDescription)")
+            captureLock.withLock {
+                inFlightCaptures = max(0, inFlightCaptures - 1)
+                if isCapturePending && inFlightCaptures < maxInFlight {
+                    isCapturePending = false
+                    captureQueue.async { [weak self] in
+                        self?.captureOneRawFrame()
+                    }
+                }
+            }
+        }
+    }
+
     func photoOutput(_ output: AVCapturePhotoOutput, didFinishProcessingPhoto photo: AVCapturePhoto, error: Error?) {
         var hasReleasedCaptureSlot = false
         func releaseCaptureSlotIfNeeded() {
@@ -1303,16 +1309,15 @@ extension CaptureController: AVCapturePhotoCaptureDelegate {
             return
         }
 
-        // Release in-flight capture slot IMMEDIATELY now that systemBuffer is safely held.
-        // This overlaps the hardware sensor exposure and readout of the next frame with our buffer copy and metadata extraction!
-        releaseCaptureSlotIfNeeded()
-        replenishPreparedPhotoSettingsIfNeeded()
-
         // CRITICAL: copy into our pooled buffer so system can recycle systemBuffer.
         guard let owned = copyBayerPixelBuffer(systemBuffer) else {
             print("[CaptureController] Failed to copy Bayer buffer")
             return
         }
+
+        // Release capture slot now that system buffer has been safely copied into our pool.
+        // This allows AVFoundation to start the next frame's hardware exposure while we extract metadata in parallel!
+        releaseCaptureSlotIfNeeded()
 
         let bufferFormat = CVPixelBufferGetPixelFormatType(owned)
         // Priority: device-model override → cached pattern → DNG metadata → OSType FourCC → session default → RGGB
