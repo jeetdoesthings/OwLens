@@ -378,37 +378,11 @@ final class VideoWriter: @unchecked Sendable {
             }
         }
 
-        // True CFR timeline pacing with jitter deadband:
-        // By anchoring to cumulative elapsed time, we guarantee zero cumulative audio/video drift.
-        // A held frame is ONLY injected if cumulative elapsed time indicates that an entire frame
-        // period (>= 1.75 * interval) was genuinely dropped by camera hardware.
-        // Minor 5-25ms timer/sensor jitters never trigger duplicate frames, eliminating stutter
-        // while preserving rock-solid audio/video synchronization over arbitrarily long recordings.
         let elapsedSeconds: Double
         if let captureTime = captureTime, captureTime.isValid, sessionStartTime.isValid {
             elapsedSeconds = max(0, CMTimeSubtract(captureTime, sessionStartTime).seconds)
         } else {
             elapsedSeconds = max(0, now - startHostTime)
-        }
-
-        let expectedFrames = elapsedSeconds * targetFPS
-        let cumulativeDrift = expectedFrames - Double(frameCount)
-
-        if cumulativeDrift >= 1.75, let hold = lastPixelBuffer {
-            let missedSlots = min(10, Int(cumulativeDrift))
-            for _ in 0..<missedSlots {
-                guard input.isReadyForMoreMediaData else {
-                    droppedFrames += 1
-                    break
-                }
-                if writeCFR(hold, index: frameCount, adaptor: adaptor) {
-                    appendGyroMetadataLocked(index: frameCount, elapsedSeconds: elapsedSeconds)
-                    frameCount += 1
-                } else {
-                    droppedFrames += 1
-                    break
-                }
-            }
         }
 
         // Drain any pending audio buffers now that video input might have made room
@@ -660,21 +634,6 @@ final class VideoWriter: @unchecked Sendable {
             lock.unlock()
             completion(nil, NSError(domain: "OwLens", code: 100, userInfo: [NSLocalizedDescriptionKey: "Recording was not active"]))
             return
-        }
-
-        // Bounded pad to wall clock: pad hold frames to match audio duration cleanly
-        if let hold = lastPixelBuffer,
-           let adaptor = pixelBufferAdaptor,
-           let vIn = videoInput {
-            let elapsed = max(0, CACurrentMediaTime() - startHostTime)
-            let targetCount = min(Int64((elapsed * targetFPS).rounded()), frameCount + 15)
-            while frameCount < targetCount && vIn.isReadyForMoreMediaData {
-                if writeCFR(hold, index: frameCount, adaptor: adaptor) {
-                    frameCount += 1
-                } else {
-                    break
-                }
-            }
         }
 
         // Drain any remaining buffered audio

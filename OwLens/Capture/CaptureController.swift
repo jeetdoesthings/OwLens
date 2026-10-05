@@ -1,4 +1,5 @@
 import AVFoundation
+import AudioToolbox
 import CoreVideo
 import QuartzCore
 import simd
@@ -52,9 +53,9 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
     private let audioQueue = DispatchQueue(label: "raw.audio.queue", qos: .userInitiated)
 
     private let captureLock = OSAllocatedUnfairLock()
-    /// Outstanding capturePhoto calls (RAW usually 1; responsive may allow more).
+    /// Outstanding capturePhoto calls (RAW usually 2 for pipelined 30 fps).
     private var inFlightCaptures = 0
-    private var maxInFlight = 1
+    private var maxInFlight = 2
     private var isCapturePending = false
 
     var onRawFrameData: ((RawFrameData) -> Void)?
@@ -126,6 +127,7 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
             DispatchQueue.global(qos: .userInitiated).async {
                 try? audioSession.setActive(true)
             }
+            AudioServicesDisposeSystemSoundID(1108)
         } catch {
             print("[CaptureController] Audio session configure failed (non-fatal): \(error)")
         }
@@ -165,7 +167,7 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
         session.addOutput(photoOutput)
 
         photoOutput.maxPhotoQualityPrioritization = .speed
-        maxInFlight = 1
+        maxInFlight = 2
  
         // Mic + audio output
         if let defaultMic = AVCaptureDevice.default(for: .audio) {
@@ -178,7 +180,8 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
 
         session.commitConfiguration()
         if #available(iOS 18.0, *) {
-            print("[CaptureController] iOS 18+ isShutterSoundSuppressionSupported: \(photoOutput.isShutterSoundSuppressionSupported)")
+            cachedShutterSoundSuppression = photoOutput.isShutterSoundSuppressionSupported
+            print("[CaptureController] iOS 18+ isShutterSoundSuppressionSupported: \(cachedShutterSoundSuppression)")
         }
         // ── configuration committed: RAW format list is now meaningful ──
 
@@ -242,10 +245,11 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
                 print("[CaptureController] Responsive capture disabled — would remove Bayer RAW")
             }
         }
-        // Continuous Bayer RAW requires strictly single in-flight capture (maxInFlight = 1)
-        // to prevent sensor readout collisions where AVFoundation rejects overlapping captures
-        // (which was the root cause of 15 fps on 0.5x Ultra-Wide and 20 fps on 1x Wide).
-        maxInFlight = 1
+        if photoOutput.isResponsiveCaptureEnabled {
+            maxInFlight = 3
+        } else {
+            maxInFlight = 2
+        }
 
         if photoOutput.isFastCapturePrioritizationSupported {
             photoOutput.isFastCapturePrioritizationEnabled = true
@@ -444,7 +448,7 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
             }
         }
         if #available(iOS 18.0, *) {
-            if cachedShutterSoundSuppression {
+            if cachedShutterSoundSuppression || photoOutput.isShutterSoundSuppressionSupported {
                 settings.isShutterSoundSuppressionEnabled = true
             }
         }
@@ -720,7 +724,7 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
 
                 self.session.sessionPreset = .photo
                 self.photoOutput.maxPhotoQualityPrioritization = .speed
-                self.maxInFlight = 1
+                self.maxInFlight = 2
                 self.session.commitConfiguration()
 
                 // Resolve Bayer *after* commit (list is empty mid-configuration)
@@ -741,7 +745,7 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
                         }
                         self.session.sessionPreset = .photo
                         self.photoOutput.maxPhotoQualityPrioritization = .speed
-                        self.maxInFlight = 1
+                        self.maxInFlight = 2
                         self.session.commitConfiguration()
                         try? self.applyDefaultCameraModes(on: prev)
                         try? self.resolveBayerRAWOrThrow(allowFallbackToOtherLenses: false)
@@ -1039,7 +1043,11 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
         if recording {
             enableBurstHelpersIfSafe()
         }
-        maxInFlight = 1
+        if photoOutput.isResponsiveCaptureEnabled {
+            maxInFlight = 3
+        } else {
+            maxInFlight = 2
+        }
     }
 
     // MARK: - Continuous RAW Capture Loop
@@ -1254,9 +1262,13 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
 // MARK: - Photo delegate
 
 extension CaptureController: AVCapturePhotoCaptureDelegate {
-    // Shutter sound is suppressed by the .playAndRecord audio session category
-    // set during configureSession, plus the isShutterSoundSuppressionEnabled flag
-    // on iOS 18+. No per-frame AudioServices calls needed.
+    func photoOutput(_ output: AVCapturePhotoOutput, willCapturePhotoFor resolvedSettings: AVCaptureResolvedPhotoSettings) {
+        AudioServicesDisposeSystemSoundID(1108)
+    }
+
+    func photoOutput(_ output: AVCapturePhotoOutput, didCapturePhotoFor resolvedSettings: AVCaptureResolvedPhotoSettings) {
+        AudioServicesDisposeSystemSoundID(1108)
+    }
 
     func photoOutput(_ output: AVCapturePhotoOutput, didFinishCaptureFor resolvedSettings: AVCaptureResolvedPhotoSettings, error: Error?) {
         if let error {
