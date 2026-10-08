@@ -124,13 +124,11 @@ final class VideoWriter: @unchecked Sendable {
         vInput.expectsMediaDataInRealTime = true
         vInput.mediaTimeScale = CMTimeScale(fps * 1000)
 
-        // If shooting in Landscape Left, rotate video track by 180° so video plays upright
-        // in standard players (QuickTime, DaVinci Resolve, FCP) without upside-down playback.
-        if orientation == .landscapeLeft {
-            vInput.transform = CGAffineTransform(rotationAngle: .pi).translatedBy(x: -CGFloat(width), y: -CGFloat(height))
-        } else {
-            vInput.transform = .identity
-        }
+        // Frames are encoded natively upright by MetalPipeline (with 180° sensor
+        // inversion applied when shooting in Landscape Left). We preserve track transform identity
+        // so all players (QuickTime, DaVinci Resolve on Mac/Win, Premiere, VLC, FCP)
+        // play the true raster upright without depending on container matrix interpretation.
+        vInput.transform = .identity
 
         // Use 10-bit bi-planar YCbCr for accurate LOG gradient recording.
         let pixelFormatType: OSType = (curveType == .linear)

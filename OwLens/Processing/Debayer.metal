@@ -725,6 +725,7 @@ struct CropParams {
     float scaleY;
     float startX;
     float startY;
+    int   flip180;
 };
 
 kernel void cropAndResampleBilinear(
@@ -737,8 +738,11 @@ kernel void cropAndResampleBilinear(
 
     constexpr sampler s(coord::pixel, address::clamp_to_edge, filter::linear);
 
-    float srcX = metal::fma(float(gid.x), crop.scaleX, crop.startX);
-    float srcY = metal::fma(float(gid.y), crop.scaleY, crop.startY);
+    float effectiveX = crop.flip180 ? float(dst.get_width() - 1 - gid.x) : float(gid.x);
+    float effectiveY = crop.flip180 ? float(dst.get_height() - 1 - gid.y) : float(gid.y);
+
+    float srcX = metal::fma(effectiveX, crop.scaleX, crop.startX);
+    float srcY = metal::fma(effectiveY, crop.scaleY, crop.startY);
 
     dst.write(src.sample(s, float2(srcX, srcY)), gid);
 }

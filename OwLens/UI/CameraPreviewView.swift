@@ -74,7 +74,8 @@ struct CameraPreviewView: UIViewRepresentable {
     var showDisplayLUT: Bool = false
     var overlayOnly: Bool = false
     var targetFPS: Double = 30.0
- 
+    var orientation: UIInterfaceOrientation = .landscapeRight
+
     func makeUIView(context: Context) -> MTKView {
         let mtkView = MTKView(frame: .zero, device: metalPipeline.device)
         mtkView.delegate = context.coordinator
@@ -119,6 +120,7 @@ struct CameraPreviewView: UIViewRepresentable {
         context.coordinator.showFocusPeaking = showFocusPeaking
         context.coordinator.showDisplayLUT = showDisplayLUT
         context.coordinator.targetFPS = targetFPS
+        context.coordinator.orientation = orientation
         context.coordinator.isAppActive = UIApplication.shared.applicationState == .active
         if context.coordinator.overlayOnly != overlayOnly {
             context.coordinator.overlayOnly = overlayOnly
@@ -156,6 +158,7 @@ struct CameraPreviewView: UIViewRepresentable {
         var showDisplayLUT: Bool = false
         var overlayOnly: Bool = false
         var targetFPS: Double = 30.0
+        var orientation: UIInterfaceOrientation = .landscapeRight
         /// Cached app state — updated from MainActor via updateUIView, read on render thread.
         var isAppActive: Bool = true
         /// No redundant-draw guard needed: the display link runs at 30 fps and frames

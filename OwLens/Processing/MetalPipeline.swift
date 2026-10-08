@@ -3,6 +3,7 @@ import MetalKit
 import CoreVideo
 import simd
 import os
+import UIKit
 
 /// Wraps a non-Sendable value so it can be captured by a `@Sendable` closure
 /// (e.g. `MTLTexture`, `CVPixelBuffer?`, or completion callbacks inside
@@ -81,6 +82,7 @@ struct CropParams {
     var scaleY: Float
     var startX: Float
     var startY: Float
+    var flip180: Int32
 }
 
 enum ProcessingQuality {
@@ -239,6 +241,9 @@ final class MetalPipeline: @unchecked Sendable {
 
     /// Adaptive edge sharpness strength (0.0 = off, 0.5 = natural cinema sharpness, 1.0 = sharp).
     var sharpnessStrength: Float = 0.5
+
+    /// Active interface orientation: when .landscapeLeft, the pipeline inverts the 180° sensor image so preview and recording are natively upright.
+    var orientation: UIInterfaceOrientation = .landscapeRight
 
     init?(customLibraryURL: URL? = nil) {
         guard let device = MTLCreateSystemDefaultDevice(),
@@ -719,13 +724,15 @@ final class MetalPipeline: @unchecked Sendable {
             enc.endEncoding()
         }
 
-        // Final crop and scale into target aspect ratio & resolution
+        // Final crop and scale into target aspect ratio & resolution (inverting 180° when in Landscape Left)
+        let shouldFlip180 = (orientation == .landscapeLeft)
         let scaledTex = cropToAspectAndScale(
             fusedOut,
             targetWidth: encodeWidth,
             targetHeight: encodeHeight,
             destinationTexture: nil,
             slot: slot,
+            flip180: shouldFlip180,
             cb: commandBuffer
         ) ?? fusedOut
 
@@ -791,18 +798,18 @@ final class MetalPipeline: @unchecked Sendable {
         }
     }
 
-    func scale(_ texture: MTLTexture, width: Int, height: Int, destinationTexture: MTLTexture? = nil, slot: Int = 0, cb: MTLCommandBuffer) -> MTLTexture? {
-        return cropToAspectAndScale(texture, targetWidth: width, targetHeight: height, destinationTexture: destinationTexture, slot: slot, cb: cb)
+    func scale(_ texture: MTLTexture, width: Int, height: Int, destinationTexture: MTLTexture? = nil, slot: Int = 0, flip180: Bool = false, cb: MTLCommandBuffer) -> MTLTexture? {
+        return cropToAspectAndScale(texture, targetWidth: width, targetHeight: height, destinationTexture: destinationTexture, slot: slot, flip180: flip180, cb: cb)
     }
 
-    func cropToAspectAndScale(_ texture: MTLTexture, targetWidth: Int, targetHeight: Int, destinationTexture: MTLTexture? = nil, slot: Int = 0, cb: MTLCommandBuffer) -> MTLTexture? {
+    func cropToAspectAndScale(_ texture: MTLTexture, targetWidth: Int, targetHeight: Int, destinationTexture: MTLTexture? = nil, slot: Int = 0, flip180: Bool = false, cb: MTLCommandBuffer) -> MTLTexture? {
         guard targetWidth > 0, targetHeight > 0 else { return nil }
         let srcW = texture.width
         let srcH = texture.height
         guard srcW > 0, srcH > 0 else { return nil }
 
-        // Exact dimension match: zero-cost bypass (or fast format conversion / blit)
-        if srcW == targetWidth && srcH == targetHeight {
+        // Exact dimension match: zero-cost bypass (or fast format conversion / blit) only if not flipping 180°
+        if srcW == targetWidth && srcH == targetHeight && !flip180 {
             if let dst = destinationTexture {
                 if dst.pixelFormat != texture.pixelFormat {
                     if let enc = cb.makeComputeCommandEncoder() {
@@ -859,7 +866,7 @@ final class MetalPipeline: @unchecked Sendable {
         enc.setComputePipelineState(cropAndResamplePipeline)
         enc.setTexture(texture, index: 0)
         enc.setTexture(dst, index: 1)
-        var params = CropParams(scaleX: scaleX, scaleY: scaleY, startX: startX, startY: startY)
+        var params = CropParams(scaleX: scaleX, scaleY: scaleY, startX: startX, startY: startY, flip180: flip180 ? 1 : 0)
         enc.setBytes(&params, length: MemoryLayout<CropParams>.stride, index: 0)
         dispatch(enc, width: targetWidth, height: targetHeight, threadsPerGroup: cropAndResampleThreads)
         enc.endEncoding()
@@ -888,7 +895,7 @@ final class MetalPipeline: @unchecked Sendable {
             enc.setComputePipelineState(cropAndResamplePipeline)
             enc.setTexture(texture, index: 0)
             enc.setTexture(output, index: 1)
-            var params = CropParams(scaleX: scaleX, scaleY: scaleY, startX: startX, startY: startY)
+            var params = CropParams(scaleX: scaleX, scaleY: scaleY, startX: startX, startY: startY, flip180: 0)
             enc.setBytes(&params, length: MemoryLayout<CropParams>.stride, index: 0)
             dispatch(enc, width: width, height: height, threadsPerGroup: cropAndResampleThreads)
             enc.endEncoding()

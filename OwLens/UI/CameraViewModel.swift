@@ -60,6 +60,7 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
     private var wasAutoFocusBeforeRecording = true
     private var wasAutoWBBeforeRecording = false
     @Published var thermalState: ProcessInfo.ThermalState = .nominal
+    @Published var currentOrientation: UIInterfaceOrientation = .landscapeRight
     @Published var selectedCurve: LogCurveType = .sLog3Approx {
         didSet {
             guard !isRecording else { return }
@@ -428,6 +429,8 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
     nonisolated(unsafe) private var activeEncodeHeight = 1512
     nonisolated(unsafe) private var activeFPS: Double = 30
     nonisolated(unsafe) private var isRecordingUnsafe = false
+    nonisolated(unsafe) private var currentOrientationUnsafe: UIInterfaceOrientation = .landscapeRight
+    nonisolated(unsafe) private var recordingOrientationUnsafe: UIInterfaceOrientation = .landscapeRight
     nonisolated(unsafe) private var isAudioMutedUnsafe = false
     nonisolated(unsafe) private var showScopesUnsafe = true
     nonisolated(unsafe) private var lastScopeUpdateTime: CFTimeInterval = 0
@@ -581,8 +584,48 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
             }
         }
 
+        UIDevice.current.beginGeneratingDeviceOrientationNotifications()
+        NotificationCenter.default.publisher(for: UIDevice.orientationDidChangeNotification)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                self?.updateOrientation()
+            }
+            .store(in: &cancellables)
+        updateOrientation()
+
         updateStorageEstimate()
         startStorageMonitor()
+    }
+
+    @MainActor
+    func updateOrientation() {
+        let activeScene = UIApplication.shared.connectedScenes
+            .compactMap { $0 as? UIWindowScene }
+            .first { $0.activationState == .foregroundActive }
+            ?? UIApplication.shared.connectedScenes.compactMap({ $0 as? UIWindowScene }).first
+
+        let detected: UIInterfaceOrientation
+        if let sceneOrientation = activeScene?.interfaceOrientation, sceneOrientation.isLandscape {
+            detected = sceneOrientation
+        } else {
+            let devOrientation = UIDevice.current.orientation
+            if devOrientation == .landscapeRight {
+                detected = .landscapeLeft
+            } else if devOrientation == .landscapeLeft {
+                detected = .landscapeRight
+            } else {
+                detected = currentOrientation
+            }
+        }
+
+        if detected != currentOrientation {
+            currentOrientation = detected
+            currentOrientationUnsafe = detected
+            if !isRecordingUnsafe {
+                metalPipeline?.orientation = detected
+            }
+            print("[CameraViewModel] Orientation updated to: \(detected == .landscapeLeft ? "Landscape Left (Inverted)" : "Landscape Right (Standard)")")
+        }
     }
 
     private func handleAppInactive() {
@@ -1456,12 +1499,10 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
 
         let includeAudio = selectedAudioSource.portUID != nil
 
-        let interfaceOrientation: UIInterfaceOrientation
-        if let scene = UIApplication.shared.connectedScenes.first as? UIWindowScene {
-            interfaceOrientation = scene.interfaceOrientation
-        } else {
-            interfaceOrientation = .landscapeRight
-        }
+        updateOrientation()
+        let recordOrientation = currentOrientation
+        recordingOrientationUnsafe = recordOrientation
+        metalPipeline?.orientation = recordOrientation
 
         videoWriter.onLowDiskSpace = { [weak self] in
             Task { @MainActor [weak self] in
@@ -1482,7 +1523,7 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
                 includeAudio: includeAudio,
                 curveType: selectedCurve,
                 codec: selectedCodec,
-                orientation: interfaceOrientation
+                orientation: recordOrientation
             )
             isRecording = true
             isRecordingUnsafe = true
@@ -1505,7 +1546,7 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
             }
             statusText = "REC · \(selectedFormat.shortLabel) · \(selectedFPS.label)fps · \(selectedCodec.displayName)"
             let capsLine = capabilities?.diagnosticSummary ?? ""
-            print("[CameraViewModel] Recording start \(selectedFormat.width)x\(selectedFormat.height) CFR \(selectedFPS.label) \(selectedCodec.displayName) orientation=\(interfaceOrientation.rawValue)\n\(capsLine)")
+            print("[CameraViewModel] Recording start \(selectedFormat.width)x\(selectedFormat.height) CFR \(selectedFPS.label) \(selectedCodec.displayName) orientation=\(recordOrientation.rawValue)\n\(capsLine)")
         } catch {
             errorMessage = "Record failed: \(error.localizedDescription)"
             print("[CameraViewModel] Failed to start recording: \(error)")
@@ -1625,6 +1666,7 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
     @MainActor
     private func endSaveTask() {
         isSaving = false
+        updateOrientation()
         if saveBackgroundTask != .invalid {
             let task = saveBackgroundTask
             saveBackgroundTask = .invalid
@@ -2036,6 +2078,8 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
 
         let w = activeEncodeWidth
         let h = activeEncodeHeight
+
+        pipeline.orientation = isRecordingUnsafe ? recordingOrientationUnsafe : currentOrientationUnsafe
 
         if isRecordingUnsafe {
             // ── Recording ──
