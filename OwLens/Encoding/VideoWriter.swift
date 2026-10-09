@@ -370,23 +370,11 @@ final class VideoWriter: @unchecked Sendable {
             drainPrerollAudioBuffersLocked()
         }
 
-        let rawPTS: CMTime
-        if let captureTime = captureTime, captureTime.isValid, sessionStartTime.isValid {
-            let diff = CMTimeSubtract(captureTime, sessionStartTime)
-            rawPTS = CMTimeCompare(diff, .zero) > 0 ? diff : .zero
-        } else {
-            rawPTS = CMTime(seconds: max(0, now - startHostTime), preferredTimescale: 60000)
-        }
-
-        // Guarantee strictly monotonic presentation timestamps for AVAssetWriter
-        let currentPTS: CMTime
-        if lastVideoPTS.isValid && CMTimeCompare(rawPTS, lastVideoPTS) <= 0 {
-            currentPTS = CMTimeAdd(lastVideoPTS, CMTime(value: 1, timescale: 60000))
-        } else {
-            currentPTS = rawPTS
-        }
-
-        let elapsedSeconds = currentPTS.seconds
+        // Strict Constant Frame Rate (CFR):
+        // Each frame i is mathematically presented at t = i / targetFPS.
+        // For 24 fps, this generates exact 24.00000 fps timestamps: 0.000s, 0.041667s, 0.083333s...
+        let currentPTS = CMTime(value: frameCount * 1000, timescale: CMTimeScale(round(targetFPS * 1000.0)))
+        let elapsedSeconds = Double(frameCount) / targetFPS
 
         // Drain any pending audio buffers now that video input might have made room
         drainPendingAudioBuffersLocked()
@@ -678,6 +666,11 @@ final class VideoWriter: @unchecked Sendable {
         let drops = droppedFrames
         let fps = targetFPS
         let videoDurationSeconds = (videoEndTime.isValid && videoEndTime.seconds > 0) ? videoEndTime.seconds : (Double(total) / fps)
+
+        if let writer = assetWriter, writer.status == .writing, videoEndTime.isValid {
+            writer.endSession(atSourceTime: videoEndTime)
+        }
+
         lock.unlock()
 
         vIn?.markAsFinished()
