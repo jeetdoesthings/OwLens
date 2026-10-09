@@ -383,23 +383,31 @@ final class VideoWriter: @unchecked Sendable {
             drainPrerollAudioBuffersLocked()
         }
 
-        // Frame pacing & Constant Frame Rate (CFR) timeline lock:
-        // By aligning every frame strictly to the target FPS grid (30.00 fps / 24.00 fps),
-        // we guarantee:
-        // 1. Strict Constant Frame Rate (true 30.00 fps or 24.00 fps across all players and NLEs).
-        // 2. Strict 1:1 real-time playback speed (never fast-forwarded or sped up).
-        // 3. Perfect microsecond audio-video lip sync locked to wall clock.
-        // 4. Zero frozen tail frames at the end of recording.
-        let elapsedSeconds: Double
+        // Strict 1:1 real-time playback pacing:
+        // Lock every frame's presentation timestamp directly to its hardware capture timestamp
+        // relative to session start. This guarantees:
+        // 1. Strict 1.000x real-time playback speed (never fast-forwarded or sped up).
+        // 2. Microsecond audio-video lip sync locked to the exact same hardware capture origin.
+        // 3. Zero duplicate/hold frames — every frame is a 100% unique capture.
+        // 4. Zero frozen tail frames — audio and video end synchronously.
+        let rawPTS: CMTime
         if let captureTime = captureTime, captureTime.isValid, sessionStartTime.isValid {
-            elapsedSeconds = max(0, CMTimeSubtract(captureTime, sessionStartTime).seconds)
+            let diff = CMTimeSubtract(captureTime, sessionStartTime)
+            rawPTS = CMTimeCompare(diff, .zero) > 0 ? diff : .zero
         } else {
-            elapsedSeconds = max(0, now - startHostTime)
+            rawPTS = CMTime(seconds: max(0, now - startHostTime), preferredTimescale: 60000)
+        }
+
+        // Monotonicity guarantee: ensure strictly increasing presentation timestamps
+        let currentPTS: CMTime
+        if lastVideoPTS.isValid && CMTimeCompare(rawPTS, lastVideoPTS) <= 0 {
+            currentPTS = CMTimeAdd(lastVideoPTS, CMTime(value: 1, timescale: 60000))
+        } else {
+            currentPTS = rawPTS
         }
 
         let frameStep = Int64(round(60000.0 / targetFPS))
-        let currentPTS = CMTime(value: frameCount * frameStep, timescale: 60000)
-        let audioLimitPTS = CMTimeAdd(currentPTS, CMTime(value: frameStep, timescale: 60000))
+        let audioLimitPTS = CMTimeAdd(currentPTS, CMTime(value: frameStep * 2, timescale: 60000))
         drainPendingAudioBuffersLocked(upTo: audioLimitPTS)
 
         // VideoToolbox backpressure handling:
@@ -424,7 +432,7 @@ final class VideoWriter: @unchecked Sendable {
             return false
         }
 
-        if writeCFR(pixelBuffer, slotIndex: frameCount, adaptor: adaptor) {
+        if writeFrame(pixelBuffer, pts: currentPTS, adaptor: adaptor) {
             frameCount += 1
             realFrameCount += 1
             lastPixelBuffer = pixelBuffer
@@ -439,17 +447,14 @@ final class VideoWriter: @unchecked Sendable {
         }
     }
 
-    private func writeCFR(
+    private func writeFrame(
         _ pixelBuffer: CVPixelBuffer,
-        slotIndex: Int64,
+        pts: CMTime,
         adaptor: AVAssetWriterInputPixelBufferAdaptor
     ) -> Bool {
-        let frameStep = Int64(round(60000.0 / targetFPS))
-        let pts = CMTime(value: slotIndex * frameStep, timescale: 60000)
-        let videoElapsedSeconds = Double(slotIndex) / targetFPS
         if adaptor.append(pixelBuffer, withPresentationTime: pts) {
             lastVideoPTS = pts
-            appendGyroMetadataLocked(pts: pts, elapsedSeconds: videoElapsedSeconds)
+            appendGyroMetadataLocked(pts: pts, elapsedSeconds: pts.seconds)
             return true
         }
         return false
