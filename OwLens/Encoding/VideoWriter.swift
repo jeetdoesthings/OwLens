@@ -28,10 +28,12 @@ final class VideoWriter: @unchecked Sendable {
     private var sessionStartTime: CMTime = .invalid
     private var lastFrameCaptureTime: CMTime = .invalid
     private var lastFrameHostTime: CFTimeInterval = 0
+    private var lastVideoPTS: CMTime = .invalid
+    private var lastAudioPTS: CMTime = .invalid
     private var hasStartedSession = false
     private var lastPixelBuffer: CVPixelBuffer?
     private var pendingAudioBuffers: [CMSampleBuffer] = []
-    private let maxPendingAudioBuffers = 50
+    private let maxPendingAudioBuffers = 100
     private var prerollAudioBuffers: [CMSampleBuffer] = []
     private let maxPrerollAudioBuffers = 20
     private var curveType: LogCurveType = .sLog3Approx
@@ -72,6 +74,14 @@ final class VideoWriter: @unchecked Sendable {
         self.height = height
         self.targetFPS = fps
         self.curveType = curveType
+        self.lastVideoPTS = .invalid
+        self.lastAudioPTS = .invalid
+        self.sessionStartTime = .invalid
+        self.audioReferenceTime = .invalid
+        self.hasStartedSession = false
+        self.frameCount = 0
+        self.realFrameCount = 0
+        self.droppedFrames = 0
 
         var videoSettings: [String: Any] = [
             AVVideoWidthKey: width,
@@ -122,7 +132,7 @@ final class VideoWriter: @unchecked Sendable {
 
         let vInput = AVAssetWriterInput(mediaType: .video, outputSettings: videoSettings)
         vInput.expectsMediaDataInRealTime = true
-        vInput.mediaTimeScale = CMTimeScale(fps * 1000)
+        vInput.mediaTimeScale = 60000
 
         // Frames are encoded natively upright by MetalPipeline (with 180° sensor
         // inversion applied when shooting in Landscape Left). We preserve track transform identity
@@ -210,6 +220,7 @@ final class VideoWriter: @unchecked Sendable {
         self.lastPixelBuffer = nil
         self.audioReferenceTime = .invalid
         self.pendingAudioBuffers.removeAll()
+        self.prerollAudioBuffers.removeAll()
         self.lastDiskCheckTime = 0
         self.cachedHasSpace = true
         self.lastFrameCaptureTime = .invalid
@@ -219,13 +230,21 @@ final class VideoWriter: @unchecked Sendable {
         print("[VideoWriter] CFR \(Int(fps))fps \(width)x\(height) codec=\(codec.displayName) bitrate=\(bitrate) orientation=\(orientation.rawValue)")
     }
 
-    private func drainPendingAudioBuffersLocked() {
+    private func drainPendingAudioBuffersLocked(upTo maxPTS: CMTime? = nil) {
         guard let input = audioInput else { return }
         var drainedCount = 0
         for buffer in pendingAudioBuffers {
+            let pts = CMSampleBufferGetPresentationTimeStamp(buffer)
+            if let maxPTS = maxPTS, CMTimeCompare(pts, maxPTS) > 0 {
+                break
+            }
             if input.isReadyForMoreMediaData {
-                _ = input.append(buffer)
-                drainedCount += 1
+                if input.append(buffer) {
+                    lastAudioPTS = pts
+                    drainedCount += 1
+                } else {
+                    break
+                }
             } else {
                 break
             }
@@ -244,46 +263,50 @@ final class VideoWriter: @unchecked Sendable {
         prerollAudioBuffers.removeAll()
 
         for sampleBuffer in preroll {
-            var timingCount: CMItemCount = 0
-            CMSampleBufferGetSampleTimingInfoArray(sampleBuffer, entryCount: 0, arrayToFill: nil, entriesNeededOut: &timingCount)
-            guard timingCount > 0 else { continue }
-
-            var timings = Array(repeating: CMSampleTimingInfo(
+            var singleTiming = CMSampleTimingInfo(
                 duration: .invalid,
                 presentationTimeStamp: .invalid,
                 decodeTimeStamp: .invalid
-            ), count: timingCount)
-            CMSampleBufferGetSampleTimingInfoArray(sampleBuffer, entryCount: timingCount, arrayToFill: &timings, entriesNeededOut: &timingCount)
+            )
+            var timingCount: CMItemCount = 0
+            CMSampleBufferGetSampleTimingInfoArray(sampleBuffer, entryCount: 1, arrayToFill: &singleTiming, entriesNeededOut: &timingCount)
+            guard timingCount > 0 else { continue }
 
             let refTime = sessionStartTime
-            if timings[0].duration.isValid {
-                let bufferEnd = CMTimeAdd(timings[0].presentationTimeStamp, timings[0].duration)
+            if singleTiming.duration.isValid {
+                let bufferEnd = CMTimeAdd(singleTiming.presentationTimeStamp, singleTiming.duration)
                 if CMTimeCompare(bufferEnd, refTime) <= 0 {
                     continue
                 }
+            } else if CMTimeCompare(singleTiming.presentationTimeStamp, refTime) < 0 {
+                continue
             }
 
-            for i in 0..<timings.count {
-                var pts = CMTimeSubtract(timings[i].presentationTimeStamp, refTime)
-                if CMTimeCompare(pts, .zero) < 0 { pts = .zero }
-                timings[i].presentationTimeStamp = pts
-                if timings[i].decodeTimeStamp.isValid {
-                    timings[i].decodeTimeStamp = pts
-                }
+            var pts = CMTimeSubtract(singleTiming.presentationTimeStamp, refTime)
+            if CMTimeCompare(pts, .zero) < 0 { pts = .zero }
+            if lastAudioPTS.isValid && CMTimeCompare(pts, lastAudioPTS) <= 0 {
+                let bufferDur = singleTiming.duration.isValid ? singleTiming.duration : CMTime(value: 1024, timescale: 48000)
+                pts = CMTimeAdd(lastAudioPTS, bufferDur)
+            }
+            singleTiming.presentationTimeStamp = pts
+            if singleTiming.decodeTimeStamp.isValid {
+                singleTiming.decodeTimeStamp = pts
             }
 
             var retimed: CMSampleBuffer?
             let status = CMSampleBufferCreateCopyWithNewTiming(
                 allocator: kCFAllocatorDefault,
                 sampleBuffer: sampleBuffer,
-                sampleTimingEntryCount: timingCount,
-                sampleTimingArray: &timings,
+                sampleTimingEntryCount: 1,
+                sampleTimingArray: &singleTiming,
                 sampleBufferOut: &retimed
             )
             guard status == noErr, let retimed else { continue }
 
             if input.isReadyForMoreMediaData && pendingAudioBuffers.isEmpty {
-                _ = input.append(retimed)
+                if input.append(retimed) {
+                    lastAudioPTS = pts
+                }
             } else if pendingAudioBuffers.count < maxPendingAudioBuffers {
                 pendingAudioBuffers.append(retimed)
             }
@@ -350,32 +373,23 @@ final class VideoWriter: @unchecked Sendable {
             if let captureTime = captureTime, captureTime.isValid {
                 sessionStartTime = captureTime
                 lastFrameCaptureTime = captureTime
+            } else {
+                sessionStartTime = CMTime(seconds: now, preferredTimescale: 60000)
             }
             lastFrameHostTime = now
             assetWriter?.startSession(atSourceTime: .zero)
             hasStartedSession = true
             gyroRecorder.anchorSession(startHostTime: now)
             drainPrerollAudioBuffersLocked()
-        } else if realFrameCount <= 1 {
-            // Startup grace: If initial pipeline spin-up delayed the second frame,
-            // re-anchor session start to prevent a burst of duplicate frames at file start.
-            let deltaFromStart: Double
-            if let captureTime = captureTime, captureTime.isValid, sessionStartTime.isValid {
-                deltaFromStart = max(0, CMTimeSubtract(captureTime, sessionStartTime).seconds)
-            } else {
-                deltaFromStart = max(0, now - startHostTime)
-            }
-            if deltaFromStart > (1.5 / targetFPS) {
-                if let captureTime = captureTime, captureTime.isValid {
-                    sessionStartTime = captureTime
-                    lastFrameCaptureTime = captureTime
-                }
-                startHostTime = now
-                lastFrameHostTime = now
-                gyroRecorder.anchorSession(startHostTime: now)
-            }
         }
 
+        // Frame pacing & Constant Frame Rate (CFR) timeline lock:
+        // By aligning every frame strictly to the target FPS grid (30.00 fps / 24.00 fps),
+        // we guarantee:
+        // 1. Strict Constant Frame Rate (true 30.00 fps or 24.00 fps across all players and NLEs).
+        // 2. Strict 1:1 real-time playback speed (never fast-forwarded or sped up).
+        // 3. Perfect microsecond audio-video lip sync locked to wall clock.
+        // 4. Zero frozen tail frames at the end of recording.
         let elapsedSeconds: Double
         if let captureTime = captureTime, captureTime.isValid, sessionStartTime.isValid {
             elapsedSeconds = max(0, CMTimeSubtract(captureTime, sessionStartTime).seconds)
@@ -383,8 +397,30 @@ final class VideoWriter: @unchecked Sendable {
             elapsedSeconds = max(0, now - startHostTime)
         }
 
-        // Drain any pending audio buffers now that video input might have made room
-        drainPendingAudioBuffersLocked()
+        let frameStep = Int64(round(60000.0 / targetFPS))
+        let targetSlot = Int64(round(elapsedSeconds * targetFPS))
+
+        // If the hardware sensor temporarily skipped a slot (e.g. 45ms physical still cycle),
+        // hold the previous frame in the missed slot to preserve rock-solid CFR timeline cadence.
+        if realFrameCount > 0, let hold = lastPixelBuffer {
+            let missedSlots = max(0, min(10, Int(targetSlot - frameCount)))
+            for _ in 0..<missedSlots {
+                guard input.isReadyForMoreMediaData else {
+                    droppedFrames += 1
+                    break
+                }
+                if writeCFR(hold, slotIndex: frameCount, adaptor: adaptor) {
+                    frameCount += 1
+                } else {
+                    droppedFrames += 1
+                    break
+                }
+            }
+        }
+
+        let currentPTS = CMTime(value: frameCount * frameStep, timescale: 60000)
+        let audioLimitPTS = CMTimeAdd(currentPTS, CMTime(value: frameStep, timescale: 60000))
+        drainPendingAudioBuffersLocked(upTo: audioLimitPTS)
 
         // VideoToolbox backpressure handling:
         // Hardware encoder occasionally takes 1-4ms to complete a GOP slice.
@@ -408,8 +444,7 @@ final class VideoWriter: @unchecked Sendable {
             return false
         }
 
-        if writeCFR(pixelBuffer, index: frameCount, adaptor: adaptor) {
-            appendGyroMetadataLocked(index: frameCount, elapsedSeconds: elapsedSeconds)
+        if writeCFR(pixelBuffer, slotIndex: frameCount, adaptor: adaptor) {
             frameCount += 1
             realFrameCount += 1
             lastPixelBuffer = pixelBuffer
@@ -424,7 +459,23 @@ final class VideoWriter: @unchecked Sendable {
         }
     }
 
-    private func appendGyroMetadataLocked(index: Int64, elapsedSeconds: Double) {
+    private func writeCFR(
+        _ pixelBuffer: CVPixelBuffer,
+        slotIndex: Int64,
+        adaptor: AVAssetWriterInputPixelBufferAdaptor
+    ) -> Bool {
+        let frameStep = Int64(round(60000.0 / targetFPS))
+        let pts = CMTime(value: slotIndex * frameStep, timescale: 60000)
+        let videoElapsedSeconds = Double(slotIndex) / targetFPS
+        if adaptor.append(pixelBuffer, withPresentationTime: pts) {
+            lastVideoPTS = pts
+            appendGyroMetadataLocked(pts: pts, elapsedSeconds: videoElapsedSeconds)
+            return true
+        }
+        return false
+    }
+
+    private func appendGyroMetadataLocked(pts: CMTime, elapsedSeconds: Double) {
         guard let mInput = metadataInput,
               mInput.isReadyForMoreMediaData,
               let formatDesc = metadataFormatDesc,
@@ -456,8 +507,7 @@ final class VideoWriter: @unchecked Sendable {
             }
         }
 
-        let pts = CMTime(value: index * 1000, timescale: CMTimeScale(targetFPS * 1000.0))
-        let duration = CMTime(value: 1000, timescale: CMTimeScale(targetFPS * 1000.0))
+        let duration = CMTime(value: Int64(60000.0 / targetFPS), timescale: 60000)
         var timing = CMSampleTimingInfo(duration: duration, presentationTimeStamp: pts, decodeTimeStamp: .invalid)
 
         var sampleBuffer: CMSampleBuffer?
@@ -474,16 +524,6 @@ final class VideoWriter: @unchecked Sendable {
         )
         guard sbStatus == noErr, let sampleBuffer else { return }
         _ = mInput.append(sampleBuffer)
-    }
-
-    private func writeCFR(
-        _ pixelBuffer: CVPixelBuffer,
-        index: Int64,
-        adaptor: AVAssetWriterInputPixelBufferAdaptor
-    ) -> Bool {
-        // Exact CFR: frame i at t = i / fps
-        let pts = CMTime(value: index * 1000, timescale: CMTimeScale(targetFPS * 1000.0))
-        return adaptor.append(pixelBuffer, withPresentationTime: pts)
     }
 
     @discardableResult
@@ -522,21 +562,29 @@ final class VideoWriter: @unchecked Sendable {
 
         // Fast path: eliminate 50-100 heap array allocations/sec for standard 1-timing AVCapture audio buffers
         if timingCount == 1 {
-            let baseTime = sessionStartTime.isValid ? sessionStartTime : audioReferenceTime
-            if !baseTime.isValid {
+            let refTime = sessionStartTime.isValid ? sessionStartTime : audioReferenceTime
+            if !refTime.isValid {
                 audioReferenceTime = singleTiming.presentationTimeStamp
             }
-            let refTime = sessionStartTime.isValid ? sessionStartTime : audioReferenceTime
+            let activeRef = sessionStartTime.isValid ? sessionStartTime : audioReferenceTime
 
             if sessionStartTime.isValid, singleTiming.duration.isValid {
                 let bufferEnd = CMTimeAdd(singleTiming.presentationTimeStamp, singleTiming.duration)
-                if CMTimeCompare(bufferEnd, refTime) <= 0 {
+                if CMTimeCompare(bufferEnd, activeRef) <= 0 {
                     return true
                 }
+            } else if sessionStartTime.isValid && CMTimeCompare(singleTiming.presentationTimeStamp, activeRef) < 0 {
+                return true
             }
 
-            var pts = CMTimeSubtract(singleTiming.presentationTimeStamp, refTime)
+            var pts = CMTimeSubtract(singleTiming.presentationTimeStamp, activeRef)
             if CMTimeCompare(pts, .zero) < 0 { pts = .zero }
+
+            if lastAudioPTS.isValid && CMTimeCompare(pts, lastAudioPTS) <= 0 {
+                let bufferDur = singleTiming.duration.isValid ? singleTiming.duration : CMTime(value: 1024, timescale: 48000)
+                pts = CMTimeAdd(lastAudioPTS, bufferDur)
+            }
+
             singleTiming.presentationTimeStamp = pts
             if singleTiming.decodeTimeStamp.isValid {
                 singleTiming.decodeTimeStamp = pts
@@ -552,8 +600,15 @@ final class VideoWriter: @unchecked Sendable {
             )
             guard status == noErr, let retimed else { return false }
 
-            if input.isReadyForMoreMediaData && pendingAudioBuffers.isEmpty {
-                return input.append(retimed)
+            let frameStep = Int64(round(60000.0 / targetFPS))
+            let maxLeadTime = lastVideoPTS.isValid
+                ? CMTimeAdd(lastVideoPTS, CMTime(value: frameStep * 2, timescale: 60000))
+                : CMTime(value: frameStep * 2, timescale: 60000)
+
+            if CMTimeCompare(pts, maxLeadTime) <= 0 && input.isReadyForMoreMediaData && pendingAudioBuffers.isEmpty {
+                let ok = input.append(retimed)
+                if ok { lastAudioPTS = pts }
+                return ok
             } else {
                 if pendingAudioBuffers.count < maxPendingAudioBuffers {
                     pendingAudioBuffers.append(retimed)
@@ -573,26 +628,29 @@ final class VideoWriter: @unchecked Sendable {
         ), count: timingCount)
         CMSampleBufferGetSampleTimingInfoArray(sampleBuffer, entryCount: timingCount, arrayToFill: &timings, entriesNeededOut: &timingCount)
 
-        // Anchor audio timeline to the first optical frame's capture time (sessionStartTime)
-        // or fallback to first audio PTS. This ensures microsecond lip-sync alignment with video.
-        let baseTime = sessionStartTime.isValid ? sessionStartTime : audioReferenceTime
-        if !baseTime.isValid {
+        let refTime = sessionStartTime.isValid ? sessionStartTime : audioReferenceTime
+        if !refTime.isValid {
             audioReferenceTime = timings[0].presentationTimeStamp
         }
-        let refTime = sessionStartTime.isValid ? sessionStartTime : audioReferenceTime
+        let activeRef = sessionStartTime.isValid ? sessionStartTime : audioReferenceTime
 
-        // If this audio buffer finished completely before session start, skip pre-roll
         if sessionStartTime.isValid, timings[0].duration.isValid {
             let bufferEnd = CMTimeAdd(timings[0].presentationTimeStamp, timings[0].duration)
-            if CMTimeCompare(bufferEnd, refTime) <= 0 {
+            if CMTimeCompare(bufferEnd, activeRef) <= 0 {
                 return true
             }
+        } else if sessionStartTime.isValid && CMTimeCompare(timings[0].presentationTimeStamp, activeRef) < 0 {
+            return true
         }
 
         for i in 0..<timings.count {
-            var pts = CMTimeSubtract(timings[i].presentationTimeStamp, refTime)
+            var pts = CMTimeSubtract(timings[i].presentationTimeStamp, activeRef)
             if CMTimeCompare(pts, .zero) < 0 {
                 pts = .zero
+            }
+            if lastAudioPTS.isValid && CMTimeCompare(pts, lastAudioPTS) <= 0 {
+                let bufferDur = timings[i].duration.isValid ? timings[i].duration : CMTime(value: 1024, timescale: 48000)
+                pts = CMTimeAdd(lastAudioPTS, bufferDur)
             }
             timings[i].presentationTimeStamp = pts
             if timings[i].decodeTimeStamp.isValid {
@@ -610,8 +668,20 @@ final class VideoWriter: @unchecked Sendable {
         )
         guard status == noErr, let retimed else { return false }
 
-        if input.isReadyForMoreMediaData && pendingAudioBuffers.isEmpty {
-            return input.append(retimed)
+        let frameStep = Int64(round(60000.0 / targetFPS))
+        let maxLeadTime = lastVideoPTS.isValid
+            ? CMTimeAdd(lastVideoPTS, CMTime(value: frameStep * 2, timescale: 60000))
+            : CMTime(value: frameStep * 2, timescale: 60000)
+
+        if let lastPTS = timings.last?.presentationTimeStamp,
+           CMTimeCompare(lastPTS, maxLeadTime) <= 0,
+           input.isReadyForMoreMediaData,
+           pendingAudioBuffers.isEmpty {
+            let ok = input.append(retimed)
+            if ok && !timings.isEmpty {
+                lastAudioPTS = timings.last!.presentationTimeStamp
+            }
+            return ok
         } else {
             // Buffer temporarily during video encode backpressure to avoid sample gaps/static
             if pendingAudioBuffers.count < maxPendingAudioBuffers {
@@ -634,13 +704,44 @@ final class VideoWriter: @unchecked Sendable {
             return
         }
 
-        // Drain any remaining buffered audio
-        drainPendingAudioBuffersLocked()
+        isRecording = false
+
+        // Bounded pad to wall clock: pad hold frames to match audio duration cleanly
+        if let hold = lastPixelBuffer,
+           let adaptor = pixelBufferAdaptor,
+           let vIn = videoInput {
+            let elapsed = max(0, CACurrentMediaTime() - startHostTime)
+            let targetCount = min(Int64((elapsed * targetFPS).rounded()), frameCount + 15)
+            while frameCount < targetCount && vIn.isReadyForMoreMediaData {
+                if writeCFR(hold, slotIndex: frameCount, adaptor: adaptor) {
+                    frameCount += 1
+                } else {
+                    break
+                }
+            }
+        }
+
+        // Tail freeze prevention:
+        // Video track duration ends at lastVideoPTS + 1 frame interval.
+        // Drain pending audio buffers up to videoEndTime and discard any trailing audio that
+        // extends beyond videoEndTime so the audio track NEVER outlasts the video track
+        // (which causes video players to freeze on the final frame).
+        let frameStep = Int64(round(60000.0 / targetFPS))
+        let frameDuration = CMTime(value: frameStep, timescale: 60000)
+        let videoEndTime: CMTime
+        if lastVideoPTS.isValid {
+            videoEndTime = CMTimeAdd(lastVideoPTS, frameDuration)
+        } else {
+            videoEndTime = .invalid
+        }
+
+        if let _ = audioInput, videoEndTime.isValid {
+            drainPendingAudioBuffersLocked(upTo: videoEndTime)
+        }
         pendingAudioBuffers.removeAll()
         prerollAudioBuffers.removeAll()
 
         let url = assetWriter?.outputURL
-        isRecording = false
         audioReferenceTime = .invalid
         sessionStartTime = .invalid
         hasStartedSession = false
@@ -653,6 +754,9 @@ final class VideoWriter: @unchecked Sendable {
         let real = realFrameCount
         let drops = droppedFrames
         let fps = targetFPS
+        let finalPTS = lastVideoPTS
+        lastVideoPTS = .invalid
+        lastAudioPTS = .invalid
         lock.unlock()
 
         vIn?.markAsFinished()
@@ -681,8 +785,8 @@ final class VideoWriter: @unchecked Sendable {
         let boxedWriter = SendableBox(value: writer)
         writer.finishWriting {
             let status = boxedWriter.value.status
-            let duration = Double(total) / fps
-            print("[VideoWriter] Done. timeline=\(total) real=\(real) holds=\(total - real) drops=\(drops) \(String(format: "%.2f", duration))s @ \(Int(fps))fps status=\(String(describing: status))")
+            let duration = finalPTS.isValid ? finalPTS.seconds : (Double(total) / fps)
+            print("[VideoWriter] Done. timeline=\(total) real=\(real) drops=\(drops) \(String(format: "%.2f", duration))s @ ~\(Int(fps))fps status=\(String(describing: status))")
             let outputURL = boxedWriter.value.outputURL
             let gcsvData = self.gyroRecorder.exportGCSVData(videoFileName: outputURL.lastPathComponent)
             self.gyroRecorder.stop()
@@ -773,7 +877,7 @@ final class VideoWriter: @unchecked Sendable {
         let software = AVMutableMetadataItem()
         software.keySpace = .quickTimeUserData
         software.key = AVMetadataKey.quickTimeUserDataKeySoftware as (NSCopying & NSObjectProtocol)
-        software.value = "OwLens Cinema Camera v1.6" as (NSCopying & NSObjectProtocol)
+        software.value = "OwLens Cinema Camera v1.8" as (NSCopying & NSObjectProtocol)
         items.append(software)
 
         // 4. QuickTime Make

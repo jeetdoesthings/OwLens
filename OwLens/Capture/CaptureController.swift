@@ -31,6 +31,7 @@ struct RawFrameData {
     let sgamutMatrix: simd_float3x3?
     let timestamp: CMTime
     var sequenceID: UInt64 = 0
+    var isRecordingFrame: Bool = false
     let kelvin: Float?
     let tint: Float?
 }
@@ -53,10 +54,11 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
     private let audioQueue = DispatchQueue(label: "raw.audio.queue", qos: .userInitiated)
 
     private let captureLock = OSAllocatedUnfairLock()
-    /// Outstanding capturePhoto calls (RAW usually 2 for pipelined 30 fps).
+    /// Outstanding capturePhoto calls (RAW: 2 for pipelined 30 fps; 3 with responsive capture).
     private var inFlightCaptures = 0
     private var maxInFlight = 2
     private var isCapturePending = false
+    private var activeCaptureIDs: Set<Int64> = []
 
     var onRawFrameData: ((RawFrameData) -> Void)?
     var onAudioSample: ((CMSampleBuffer) -> Void)?
@@ -220,10 +222,9 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
             // Always invalidate maxFrameDuration first to prevent NSInvalidArgumentException if min > current max
             camera.activeVideoMaxFrameDuration = .invalid
             camera.activeVideoMinFrameDuration = frameDuration
-            // Do NOT lock activeVideoMaxFrameDuration to frameDuration: leaving it unlocked prevents AVFoundation
-            // from dropping frames if sensor exposure/readout takes slightly longer than 33.3ms!
+            camera.activeVideoMaxFrameDuration = frameDuration
             let dims = CMVideoFormatDescriptionGetDimensions(camera.activeFormat.formatDescription)
-            print("[CaptureController] Sensor \(dims.width)x\(dims.height) cadence min-duration @ \(rate)fps (preset .photo)")
+            print("[CaptureController] Sensor \(dims.width)x\(dims.height) cadence locked @ \(rate)fps (preset .photo)")
         } catch {
             print("[CaptureController] lockSensorToTargetFPS: \(error)")
         }
@@ -724,7 +725,7 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
 
                 self.session.sessionPreset = .photo
                 self.photoOutput.maxPhotoQualityPrioritization = .speed
-                self.maxInFlight = 2
+                self.maxInFlight = 3
                 self.session.commitConfiguration()
 
                 // Resolve Bayer *after* commit (list is empty mid-configuration)
@@ -745,7 +746,7 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
                         }
                         self.session.sessionPreset = .photo
                         self.photoOutput.maxPhotoQualityPrioritization = .speed
-                        self.maxInFlight = 2
+                        self.maxInFlight = 3
                         self.session.commitConfiguration()
                         try? self.applyDefaultCameraModes(on: prev)
                         try? self.resolveBayerRAWOrThrow(allowFallbackToOtherLenses: false)
@@ -1103,12 +1104,36 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
 
         // Unique settings object every shot (required). Type matches prepared array.
         let settings = makeRAWPhotoSettings()
+        captureLock.withLock {
+            activeCaptureIDs.insert(settings.uniqueID)
+        }
         photoOutput.capturePhoto(with: settings, delegate: self)
     }
 
-    private func endInFlight() {
+    private func endInFlight(uniqueID: Int64? = nil) {
         captureLock.withLock {
+            if let uid = uniqueID {
+                activeCaptureIDs.remove(uid)
+            }
             inFlightCaptures = max(0, inFlightCaptures - 1)
+        }
+    }
+
+    private func releaseCaptureSlot(for uniqueID: Int64) {
+        let triggerPending: Bool = captureLock.withLock {
+            guard activeCaptureIDs.remove(uniqueID) != nil else { return false }
+            inFlightCaptures = max(0, inFlightCaptures - 1)
+            let trigger = isCapturePending && inFlightCaptures < maxInFlight
+            if trigger {
+                isCapturePending = false
+            }
+            return trigger
+        }
+
+        if triggerPending {
+            captureQueue.async { [weak self] in
+                self?.captureOneRawFrame()
+            }
         }
     }
 
@@ -1124,7 +1149,7 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
     private func prewarmBayerBufferPool(width: Int, height: Int, format: OSType) {
         guard bayerBufferPool == nil || bayerPoolW != width || bayerPoolH != height || bayerPoolFormat != format else { return }
         let poolAttrs: [String: Any] = [
-            kCVPixelBufferPoolMinimumBufferCountKey as String: 6
+            kCVPixelBufferPoolMinimumBufferCountKey as String: 12
         ]
         let pbAttrs: [String: Any] = [
             kCVPixelBufferPixelFormatTypeKey as String: format,
@@ -1268,49 +1293,20 @@ extension CaptureController: AVCapturePhotoCaptureDelegate {
 
     func photoOutput(_ output: AVCapturePhotoOutput, didCapturePhotoFor resolvedSettings: AVCaptureResolvedPhotoSettings) {
         AudioServicesDisposeSystemSoundID(1108)
+        // Immediately release the hardware capture slot as soon as physical shutter completes.
+        // This allows the next photo to begin exposing with ZERO idle wait on the sensor.
+        releaseCaptureSlot(for: resolvedSettings.uniqueID)
     }
 
     func photoOutput(_ output: AVCapturePhotoOutput, didFinishCaptureFor resolvedSettings: AVCaptureResolvedPhotoSettings, error: Error?) {
         if let error {
             print("[CaptureController] didFinishCaptureFor error: \(error.localizedDescription)")
-            captureLock.withLock {
-                inFlightCaptures = max(0, inFlightCaptures - 1)
-                if isCapturePending && inFlightCaptures < maxInFlight {
-                    isCapturePending = false
-                    captureQueue.async { [weak self] in
-                        self?.captureOneRawFrame()
-                    }
-                }
-            }
         }
+        // Safety: release slot in case didCapturePhotoFor was skipped due to early error
+        releaseCaptureSlot(for: resolvedSettings.uniqueID)
     }
 
     func photoOutput(_ output: AVCapturePhotoOutput, didFinishProcessingPhoto photo: AVCapturePhoto, error: Error?) {
-        var hasReleasedCaptureSlot = false
-        func releaseCaptureSlotIfNeeded() {
-            guard !hasReleasedCaptureSlot else { return }
-            hasReleasedCaptureSlot = true
-            let triggerPending: Bool = captureLock.withLock {
-                inFlightCaptures = max(0, inFlightCaptures - 1)
-                let trigger = isCapturePending && inFlightCaptures < maxInFlight
-                if trigger {
-                    isCapturePending = false
-                }
-                return trigger
-            }
-
-            if triggerPending {
-                captureQueue.async { [weak self] in
-                    self?.captureOneRawFrame()
-                }
-            }
-        }
-
-        // Safety fallback if an error or early exit occurs before the buffer is copied
-        defer {
-            releaseCaptureSlotIfNeeded()
-        }
-
         if let error {
             print("[CaptureController] Capture error: \(error.localizedDescription)")
             return
@@ -1321,15 +1317,10 @@ extension CaptureController: AVCapturePhotoCaptureDelegate {
             return
         }
 
-        // CRITICAL: copy into our pooled buffer so system can recycle systemBuffer.
         guard let owned = copyBayerPixelBuffer(systemBuffer) else {
             print("[CaptureController] Failed to copy Bayer buffer")
             return
         }
-
-        // Release capture slot now that system buffer has been safely copied into our pool.
-        // This allows AVFoundation to start the next frame's hardware exposure while we extract metadata in parallel!
-        releaseCaptureSlotIfNeeded()
 
         let bufferFormat = CVPixelBufferGetPixelFormatType(owned)
         // Priority: device-model override → cached pattern → DNG metadata → OSType FourCC → session default → RGGB

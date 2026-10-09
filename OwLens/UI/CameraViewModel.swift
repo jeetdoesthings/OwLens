@@ -418,6 +418,9 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
     private let recordingQueue = DispatchQueue(label: "com.owlens.recording", qos: .userInteractive)
     nonisolated private let processLock = OSAllocatedUnfairLock()
     nonisolated(unsafe) private var freeSlots: Set<Int> = [0, 1, 2]
+    nonisolated(unsafe) private var inFlightRecordingSlots: Set<Int> = []
+    nonisolated(unsafe) private var isCapturingForRecording = false
+    nonisolated(unsafe) private var isAudioRecordingActive = false
 
     // Sequencer for guaranteeing strictly monotonic frame ordering during recording
     nonisolated(unsafe) private var nextDispatchSequenceID: UInt64 = 0
@@ -575,10 +578,10 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
         captureController.onAudioSample = { [weak self] sample in
             guard let self else { return }
             self.processAudioSample(sample)
-            // isRecordingUnsafe set from MainActor when record starts/stops
-            if self.isRecordingUnsafe {
+            // Forward audio to videoWriter strictly while recording and audio capture are active
+            if self.isRecordingUnsafe && self.isAudioRecordingActive {
                 self.recordingQueue.async { [weak self] in
-                    guard let self, self.isRecordingUnsafe else { return }
+                    guard let self, self.isRecordingUnsafe, self.isAudioRecordingActive else { return }
                     _ = self.videoWriter.appendAudio(sampleBuffer: sample)
                 }
             }
@@ -1527,14 +1530,20 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
             )
             isRecording = true
             isRecordingUnsafe = true
+            isAudioRecordingActive = true
             processLock.withLock {
+                isCapturingForRecording = true
                 nextDispatchSequenceID = 0
                 nextOutputSequenceID = 0
                 lastOutputSequenceTime = CACurrentMediaTime()
                 reorderBuffer.removeAll()
+                inFlightRecordingSlots.removeAll()
             }
             frameIndex = 0
             frameCount = 0
+            droppedFrames = 0
+            lastReportedDrops = 0
+            frameBuffer.resetRecordingDrops()
             recordingStartTime = recordingDate
             recordingDuration = "00:00"
             activePanel = nil
@@ -1600,6 +1609,10 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
 
         isRecording = false
         isSaving = true
+        isAudioRecordingActive = false
+        processLock.withLock {
+            isCapturingForRecording = false
+        }
         videoWriter.onLowDiskSpace = nil
         recordingTimer?.invalidate()
         recordingTimer = nil
@@ -1618,54 +1631,84 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
             }
         }
 
-        let remaining: [(MTLTexture, CVPixelBuffer?, RawFrameData)] = processLock.withLock {
-            let bufferedKeys = reorderBuffer.keys.sorted()
-            var rem: [(MTLTexture, CVPixelBuffer?, RawFrameData)] = []
-            for k in bufferedKeys {
-                if let item = reorderBuffer.removeValue(forKey: k), let tex = item.0 {
-                    rem.append((tex, item.1, item.2))
-                }
-            }
-            lastOutputSequenceTime = 0
-            return rem
-        }
-
-        for item in remaining {
-            dispatchOrderedRecordedFrame(item.0, bgraPB: item.1, frameData: item.2, isTailFlush: true)
-        }
-
-        recordingQueue.async { [weak self] in
-            guard let self else { return }
-            self.isRecordingUnsafe = false
-            self.videoWriter.finish { [weak self] url, error in
-                self?.processQueue.async {
-                    self?.metalPipeline?.trimMemory()
-                }
-                guard let url else {
-                    Task { @MainActor [weak self] in
-                        self?.statusText = "Save failed"
-                        self?.errorMessage = error?.localizedDescription ?? "Recording ended with no frames"
-                        self?.endSaveTask()
-                    }
-                    return
-                }
-                Task { @MainActor [weak self] in
-                    await self?.saveFinishedRecording(at: url)
-                }
-            }
-        }
+        drainAndFinalizeRecording()
 
         frameCount = Int(frameIndex)
-        let realNote = "frames=\(frameCount) drops=\(droppedFrames) fps=\(selectedFPS.label) fmt=\(selectedFormat.shortLabel)"
+        let totalDrops = frameBuffer.recordingDroppedCount + videoWriter.droppedFrames
+        droppedFrames = totalDrops
+        let realNote = "frames=\(frameCount) drops=\(totalDrops) fps=\(selectedFPS.label) fmt=\(selectedFormat.shortLabel)"
         print("[CameraViewModel] Recording stopped \(realNote)")
         if let caps = capabilities {
             print("[CameraViewModel] Tester diagnostics:\n\(caps.diagnosticSummary)\n\(realNote)")
         }
     }
 
+    private func drainAndFinalizeRecording() {
+        DispatchQueue.global(qos: .userInteractive).async { [weak self] in
+            guard let self else { return }
+
+            // 1. Wait for all in-flight recording frames in frameBuffer and GPU slots to finish processing
+            let startDrain = CACurrentMediaTime()
+            var drainComplete = false
+
+            while !drainComplete && (CACurrentMediaTime() - startDrain < 1.0) {
+                let isDrained = self.processLock.withLock {
+                    return !self.frameBuffer.hasRecordingFrames() && self.inFlightRecordingSlots.isEmpty
+                }
+                if isDrained {
+                    drainComplete = true
+                } else {
+                    usleep(5000) // 5ms sleep between polls
+                }
+            }
+
+            // 2. Flush any remaining items in reorderBuffer
+            let remaining: [(MTLTexture, CVPixelBuffer?, RawFrameData)] = self.processLock.withLock {
+                let bufferedKeys = self.reorderBuffer.keys.sorted()
+                var rem: [(MTLTexture, CVPixelBuffer?, RawFrameData)] = []
+                for k in bufferedKeys {
+                    if let item = self.reorderBuffer.removeValue(forKey: k), let tex = item.0 {
+                        rem.append((tex, item.1, item.2))
+                    }
+                }
+                self.lastOutputSequenceTime = 0
+                return rem
+            }
+
+            for item in remaining {
+                self.dispatchOrderedRecordedFrame(item.0, bgraPB: item.1, frameData: item.2, isTailFlush: true)
+            }
+
+            // 3. Mark isRecordingUnsafe = false and finalize on recordingQueue.
+            // All videoWriter.appendFrame calls dispatched to recordingQueue will finish before videoWriter.finish runs.
+            self.recordingQueue.async { [weak self] in
+                guard let self else { return }
+                self.isRecordingUnsafe = false
+                self.videoWriter.finish { [weak self] url, error in
+                    self?.processQueue.async {
+                        self?.metalPipeline?.trimMemory()
+                    }
+                    guard let url else {
+                        Task { @MainActor [weak self] in
+                            self?.statusText = "Save failed"
+                            self?.errorMessage = error?.localizedDescription ?? "Recording ended with no frames"
+                            self?.endSaveTask()
+                        }
+                        return
+                    }
+                    Task { @MainActor [weak self] in
+                        await self?.saveFinishedRecording(at: url)
+                    }
+                }
+            }
+        }
+    }
+
     @MainActor
     private func endSaveTask() {
         isSaving = false
+        droppedFrames = 0
+        lastReportedDrops = 0
         updateOrientation()
         if saveBackgroundTask != .invalid {
             let task = saveBackgroundTask
@@ -1955,7 +1998,9 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
         // Never enqueue GPU work while backgrounded (IOGPUMetalError 00000006)
         guard isAppActive else { return }
 
-        frameBuffer.enqueue(frameData)
+        var frame = frameData
+        frame.isRecordingFrame = processLock.withLock { isCapturingForRecording }
+        frameBuffer.enqueue(frame)
         scheduleProcess()
     }
 
@@ -1973,13 +2018,17 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
 
     nonisolated private func drainBuffer(slot: Int) {
         var frame: RawFrameData?
-        if isRecordingUnsafe {
+        let hasRec = frameBuffer.hasRecordingFrames()
+        if hasRec {
             // FIFO during recording: process every single captured frame in order without skipping
             frame = frameBuffer.dequeue()
             if var f = frame {
-                processLock.withLock {
-                    f.sequenceID = nextDispatchSequenceID
-                    nextDispatchSequenceID &+= 1
+                if f.isRecordingFrame {
+                    processLock.withLock {
+                        f.sequenceID = nextDispatchSequenceID
+                        nextDispatchSequenceID &+= 1
+                        inFlightRecordingSlots.insert(slot)
+                    }
                 }
                 frame = f
             }
@@ -2000,6 +2049,7 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
         processFrame(frame, slot: slot) { [weak self] in
             guard let self else { return }
             let remaining: Int = self.processLock.withLock {
+                self.inFlightRecordingSlots.remove(slot)
                 self.freeSlots.insert(slot)
                 return self.frameBuffer.currentCount
             }
@@ -2011,7 +2061,7 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
 
     nonisolated private func processFrame(_ frameData: RawFrameData, slot: Int = 0, completion: @escaping () -> Void) {
         guard isAppActive, let pipeline = metalPipeline else {
-            if isRecordingUnsafe {
+            if frameData.isRecordingFrame {
                 handleRecordedFrame(nil, bgraPB: nil, frameData: frameData, completion: completion)
             } else {
                 completion()
@@ -2079,9 +2129,9 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
         let w = activeEncodeWidth
         let h = activeEncodeHeight
 
-        pipeline.orientation = isRecordingUnsafe ? recordingOrientationUnsafe : currentOrientationUnsafe
+        pipeline.orientation = frameData.isRecordingFrame ? recordingOrientationUnsafe : currentOrientationUnsafe
 
-        if isRecordingUnsafe {
+        if frameData.isRecordingFrame {
             // ── Recording ──
             let isThermalElevated = (metalPipeline?.thermalState.rawValue ?? 0) >= ProcessInfo.ThermalState.serious.rawValue
             pipeline.processingQuality = isThermalElevated ? .previewFast : .recordQuality
@@ -2117,7 +2167,7 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
                 case 3: cfaName = "BGGR"
                 default: cfaName = "?\(frameData.cfaPattern)"
                 }
-                let drops = frameBuffer.droppedCount
+                let drops = 0
                 updateScopesIfNeeded(from: framed, pipeline: pipeline)
 
                 // Submit texture directly to PreviewFeed for zero-allocation rendering on MTKView
@@ -2166,7 +2216,7 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
         frameData: RawFrameData,
         completion: @escaping () -> Void
     ) {
-        guard isRecordingUnsafe else {
+        guard frameData.isRecordingFrame else {
             // Preview path: release GPU slot immediately, no reordering needed
             completion()
             if let framed {
@@ -2244,18 +2294,16 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
         case 3: cfaName = "BGGR"
         default: cfaName = "?\(frameData.cfaPattern)"
         }
-        let drops = frameBuffer.droppedCount
+        let drops = frameData.isRecordingFrame ? (frameBuffer.recordingDroppedCount + videoWriter.droppedFrames) : 0
 
         updateScopesIfNeeded(from: framed, pipeline: metalPipeline)
 
-        if let bgraPB, (isRecordingUnsafe || isTailFlush) {
+        if let bgraPB, (frameData.isRecordingFrame || isTailFlush) {
             let timestamp = frameData.timestamp
             recordingQueue.async { [weak self] in
                 guard let self else { return }
-                if isTailFlush || self.isRecordingUnsafe {
-                    if self.videoWriter.appendFrame(pixelBuffer: bgraPB, captureTime: timestamp) {
-                        self.frameIndex += 1
-                    }
+                if self.videoWriter.appendFrame(pixelBuffer: bgraPB, captureTime: timestamp) {
+                    self.frameIndex += 1
                 }
             }
         }
