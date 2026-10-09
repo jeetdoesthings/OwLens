@@ -711,6 +711,11 @@ final class VideoWriter: @unchecked Sendable {
         let finalPTS = lastVideoPTS
         lastVideoPTS = .invalid
         lastAudioPTS = .invalid
+
+        if let writer = assetWriter, writer.status == .writing, videoEndTime.isValid {
+            writer.endSession(atSourceTime: videoEndTime)
+        }
+
         lock.unlock()
 
         vIn?.markAsFinished()

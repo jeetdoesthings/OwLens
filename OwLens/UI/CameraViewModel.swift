@@ -1206,6 +1206,8 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
                 let maxD = device.activeFormat.maxExposureDuration
                 if CMTimeCompare(shutterDuration, minD) < 0 { shutterDuration = minD }
                 if CMTimeCompare(shutterDuration, maxD) > 0 { shutterDuration = maxD }
+                let maxFrameDuration = CMTime(value: 1, timescale: CMTimeScale(fps))
+                if CMTimeCompare(shutterDuration, maxFrameDuration) > 0 { shutterDuration = maxFrameDuration }
 
                 if device.isExposureModeSupported(.custom) {
                     device.setExposureModeCustom(duration: shutterDuration, iso: clampedISO, completionHandler: nil)
