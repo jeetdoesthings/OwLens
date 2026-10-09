@@ -310,30 +310,6 @@ struct ControlsView: View {
             .disabled(isTopLocked)
             .opacity(isTopLocked ? 0.4 : 1.0)
 
-            // FPS Button (24 / 30 - single tap cycles, long-press opens drawer)
-            HStack(spacing: 0) {
-                Text(viewModel.selectedFPS.label)
-                    .font(.appMono(.bold, size: 12))
-                    .foregroundColor(isTopLocked ? OwLensTheme.textDisabled : OwLensTheme.textPrimary)
-                    .lineLimit(1)
-                    .fixedSize()
-            }
-            .frame(width: 40, height: 30)
-            .glassPanel(cornerRadius: OwLensTheme.radiusCard)
-            .contentShape(Rectangle())
-            .onTapGesture {
-                guard !isTopLocked else { return }
-                Haptics.selection()
-                viewModel.cycleFPS()
-            }
-            .onLongPressGesture(minimumDuration: 0.45) {
-                guard !isTopLocked else { return }
-                Haptics.impact(.medium)
-                viewModel.togglePanel(.fps)
-            }
-            .disabled(isTopLocked)
-            .opacity(isTopLocked ? 0.4 : 1.0)
-
             // Log Profile Selector Button (Single tap cycles, long-press opens drawer)
             HStack(spacing: 5) {
                 Text(viewModel.selectedCurve.shortLabel)
@@ -405,6 +381,14 @@ struct ControlsView: View {
 
     private var rightStatusGroup: some View {
         HStack(spacing: 6) {
+            // Informational only — 24 fps is fixed for RAW capture and is not a control.
+            Text("24 FPS")
+                .font(.appMono(.bold, size: 9))
+                .foregroundColor(OwLensTheme.textSecondary)
+                .lineLimit(1)
+                .fixedSize()
+                .allowsHitTesting(false)
+
             timeIndicator
 
             batteryIndicator
@@ -701,7 +685,7 @@ struct ControlsView: View {
             case .focus:
                 focusDrawerContent
 
-            case .format, .fps:
+            case .format:
                 formatDrawerContent
 
             case .bitrate:
@@ -851,9 +835,9 @@ struct ControlsView: View {
             if viewModel.isAutoWhiteBalanceEnabled {
                 HStack(spacing: 6) {
                     Circle()
-                        .fill(OwLensTheme.audioNominal)
+                        .fill(viewModel.isAutoWhiteBalanceAdjusting ? OwLensTheme.amberWarning : OwLensTheme.audioNominal)
                         .frame(width: 5, height: 5)
-                    Text("LIVE AWB: \(Int(viewModel.wbKelvin))K · Tint \(Int(viewModel.wbTint))")
+                    Text("LIVE AWB: \(Int(viewModel.wbKelvin))K · Tint \(Int(viewModel.wbTint))\(viewModel.isAutoWhiteBalanceAdjusting ? " (Adjusting)" : "")")
                         .font(.appMono(.medium, size: 10))
                         .foregroundColor(OwLensTheme.textSecondary)
                 }
@@ -1018,76 +1002,6 @@ struct ControlsView: View {
                 }
             }
 
-            // Frame Rate Section
-            VStack(alignment: .leading, spacing: 5) {
-                Text("FRAME RATE")
-                    .font(.appMono(.medium, size: 8))
-                    .foregroundColor(OwLensTheme.textMuted)
-
-                HStack(spacing: 6) {
-                    ForEach(CaptureFrameRate.allCases) { rate in
-                        let isSelected = viewModel.selectedFPS == rate
-                        Button {
-                            Haptics.selection()
-                            viewModel.selectedFPS = rate
-                        } label: {
-                            VStack(spacing: 2) {
-                                Text(rate.displayName)
-                                    .font(.appFont(isSelected ? .semiBold : .regular, size: 11))
-                                    .foregroundColor(isSelected ? .black : OwLensTheme.textPrimary)
-                                Text(rate == .fps24 ? "Cinema" : "Broadcast")
-                                    .font(.appMono(.regular, size: 8))
-                                    .foregroundColor(isSelected ? .black.opacity(0.5) : OwLensTheme.textMuted)
-                            }
-                            .frame(maxWidth: .infinity)
-                            .padding(.vertical, 8)
-                            .background(
-                                RoundedRectangle(cornerRadius: OwLensTheme.radiusCard, style: .continuous)
-                                    .fill(isSelected ? OwLensTheme.glassActive : OwLensTheme.glassBase)
-                            )
-                            .overlay(
-                                RoundedRectangle(cornerRadius: OwLensTheme.radiusCard, style: .continuous)
-                                    .strokeBorder(isSelected ? Color.clear : OwLensTheme.glassBorder, lineWidth: 0.5)
-                            )
-                            .contentShape(Rectangle())
-                        }
-                        .buttonStyle(.plain)
-                    }
-                }
-            }
-        }
-    }
-
-    private var fpsDrawerContent: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            drawerHeader(title: "FRAME RATE")
-
-            HStack(spacing: 6) {
-                ForEach(CaptureFrameRate.allCases) { rate in
-                    let isSelected = viewModel.selectedFPS == rate
-                    Button {
-                        Haptics.selection()
-                        viewModel.selectedFPS = rate
-                    } label: {
-                        VStack(spacing: 2) {
-                            Text(rate.displayName)
-                                .font(.appFont(isSelected ? .semiBold : .regular, size: 11))
-                                .foregroundColor(isSelected ? .black : OwLensTheme.textPrimary)
-                            Text(rate == .fps24 ? "Cinema" : "Broadcast")
-                                .font(.appFont(.regular, size: 8))
-                                .foregroundColor(isSelected ? .black.opacity(0.5) : OwLensTheme.textMuted)
-                        }
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 8)
-                        .background(
-                            RoundedRectangle(cornerRadius: OwLensTheme.radiusCard, style: .continuous)
-                                .fill(isSelected ? OwLensTheme.glassActive : OwLensTheme.glassBase)
-                        )
-                        .contentShape(Rectangle())
-                    }
-                    .buttonStyle(.plain)
-                }
-            }
         }
     }
 

@@ -19,7 +19,7 @@
   - **Apple Log 2 & Sony S-Log3:** Standards-compliant implementation of published Apple Log 2 and Sony S-Log3 (S-Gamut3.Cine) opto-electronic transfer functions.
   - **Smooth $C^1$-Continuous Highlight Shoulder:** Hermite cubic highlight roll-off with terminal slope $s_1 = 0.0$ and pure norm-preserving chromaticity scaling, eliminating clipping cliffs, posterization rings, and noise-induced temporal saturation shimmer.
   - **Calibrated Physical $\cos^4\theta$ Lens Shading Correction:** Dynamic concentric radial optical model counteracting lens vignetting across Ultra-Wide, Wide, and Telephoto lenses.
-- **Rock-Solid Constant Frame Rate (CFR):** Strict 24.000 fps and 30.000 fps timeline synchronization with pre-warmed buffer pools, sub-millisecond audio sync, and startup stall bridging to guarantee zero dropped or frozen hold frames.
+- **Rock-Solid Constant Frame Rate (CFR):** Strict 24.000 fps timeline synchronization with pre-warmed buffer pools and sub-millisecond audio sync.
 - **Embedded Gyroscope & Gyroflow Motion Logging:** Dual-mode motion logging with embedded Google CAMM metadata track and automatic `.gcsv` sidecar file generation in the iOS Files app (`OwLens Gyro`), ready for instant zero-sync stabilization in Gyroflow and DaVinci Resolve.
 - **Dual Viewfinder Monitoring:**
   - **Real-Time Rec.709 Preview (709):** One-touch toggle between unadulterated Log monitoring and a calibrated Rec.709 display LUT, with high-frequency focus peaking and diagonal clipping zebras.

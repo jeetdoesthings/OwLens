@@ -31,7 +31,6 @@ struct RawFrameData {
     let sgamutMatrix: simd_float3x3?
     let timestamp: CMTime
     var sequenceID: UInt64 = 0
-    var isRecordingFrame: Bool = false
     let kelvin: Float?
     let tint: Float?
 }
@@ -54,7 +53,7 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
     private let audioQueue = DispatchQueue(label: "raw.audio.queue", qos: .userInitiated)
 
     private let captureLock = OSAllocatedUnfairLock()
-    /// Outstanding capturePhoto calls (RAW: 4 for pipelined 30 fps; 5 with responsive capture).
+    /// Outstanding capturePhoto calls (RAW: 4 for pipelined 24 fps; 5 with responsive capture).
     private var inFlightCaptures = 0
     private var maxInFlight = 4
     private var isCapturePending = false
@@ -65,8 +64,8 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
 
     private var rawPixelFormat: OSType = 0
     private var formatCFAPattern: Int32 = 0
-    private var targetFPS: Double = 30
-    private var minFrameInterval: Double = 1.0 / 30.0
+    private var targetFPS: Double = 24
+    private var minFrameInterval: Double = 1.0 / 24.0
     private var lastCaptureStart: CFTimeInterval = 0
     private var selectedAudioPortUID: String?
     private var isReconfiguringAudio = false
@@ -181,6 +180,8 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
         }
 
         session.commitConfiguration()
+        // Use the active camera's maximum native RAW dimension. On this device that
+        // is 12 MP, so capture remains full quality without artificial downscaling.
         if #available(iOS 16.0, *) {
             updateCachedMaxPhotoDimensions()
             if let maxDims = cachedMaxPhotoDimensions {
@@ -225,7 +226,8 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
                 return
             }
             let frameDuration = CMTime(value: 1, timescale: CMTimeScale(rate))
-            // Invalidate maxFrameDuration first to avoid min > max exception, then lock both min and max to frameDuration
+            // Keep sensor timing fixed. Leaving max duration open lets the sensor
+            // silently extend its cadence below 24 fps under the photo preset.
             camera.activeVideoMaxFrameDuration = .invalid
             camera.activeVideoMinFrameDuration = frameDuration
             camera.activeVideoMaxFrameDuration = frameDuration
@@ -271,13 +273,8 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
         if #available(iOS 16.0, *) {
             if let dev = device {
                 let supported = dev.activeFormat.supportedMaxPhotoDimensions
-                // Cap continuous RAW burst photo dimensions to 12MP (<= 4032x3024).
-                // Selecting 48MP (8064x6048) on 48MP sensors drops sensor readout below 20 fps.
-                let suitable = supported.filter { $0.width <= 4032 && $0.height <= 3024 }
-                if let best12MP = suitable.max(by: { ($0.width * $0.height) < ($1.width * $1.height) }) {
-                    cachedMaxPhotoDimensions = best12MP
-                } else if let minSupported = supported.min(by: { ($0.width * $0.height) < ($1.width * $1.height) }) {
-                    cachedMaxPhotoDimensions = minSupported
+                if let maximum = supported.max(by: { ($0.width * $0.height) < ($1.width * $1.height) }) {
+                    cachedMaxPhotoDimensions = maximum
                 }
             } else {
                 cachedMaxPhotoDimensions = photoOutput.maxPhotoDimensions
@@ -318,7 +315,7 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
             session.beginConfiguration()
             session.sessionPreset = .photo
             photoOutput.maxPhotoQualityPrioritization = .speed
-            maxInFlight = 1
+            maxInFlight = 4
             session.commitConfiguration()
 
             for _ in 0..<8 {
@@ -414,8 +411,7 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
             var targetW = 0
             var targetH = 0
             if #available(iOS 16.0, *) {
-                let suitable = cam.activeFormat.supportedMaxPhotoDimensions.filter { $0.width <= 4032 && $0.height <= 3024 }
-                if let best = suitable.max(by: { ($0.width * $0.height) < ($1.width * $1.height) }) {
+                if let best = cam.activeFormat.supportedMaxPhotoDimensions.max(by: { ($0.width * $0.height) < ($1.width * $1.height) }) {
                     targetW = Int(best.width)
                     targetH = Int(best.height)
                 }
@@ -424,11 +420,6 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
                 let dims = CMVideoFormatDescriptionGetDimensions(cam.activeFormat.formatDescription)
                 targetW = Int(dims.width)
                 targetH = Int(dims.height)
-            }
-            // Standard sensor resolution for 12MP Bayer RAW if video preview dimensions were reported
-            if targetW < 3000 || targetH < 2000 {
-                targetW = 4032
-                targetH = 3024
             }
             if targetW > 0 && targetH > 0 && rawPixelFormat != 0 {
                 prewarmBayerBufferPool(width: targetW, height: targetH, format: rawPixelFormat)
@@ -444,16 +435,15 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
         }
     }
 
-    /// Keep AVFoundation photoOutput prepared settings primed during continuous capture burst.
-    /// Replenishes every 4 frames so capture never reverts to unprepared/cold ISP mode.
+    /// Keep AVFoundation's RAW settings pool warm during a long burst. Without
+    /// replenishment it can fall back to the slower, unprepared still path.
     private func replenishPreparedPhotoSettingsIfNeeded() {
         guard session.isRunning else { return }
         framesSincePreparedReplenish += 1
-        if framesSincePreparedReplenish >= 4 {
-            framesSincePreparedReplenish = 0
-            let prepared = (0..<4).map { _ in makeRAWPhotoSettings() }
-            photoOutput.setPreparedPhotoSettingsArray(prepared, completionHandler: nil)
-        }
+        guard framesSincePreparedReplenish >= 4 else { return }
+        framesSincePreparedReplenish = 0
+        let prepared = (0..<4).map { _ in makeRAWPhotoSettings() }
+        photoOutput.setPreparedPhotoSettingsArray(prepared, completionHandler: nil)
     }
 
     private func makeRAWPhotoSettings() -> AVCapturePhotoSettings {
@@ -465,12 +455,12 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
                 settings.maxPhotoDimensions = maxDims
             } else if let dev = device {
                 let supported = dev.activeFormat.supportedMaxPhotoDimensions
-                let suitable = supported.filter { $0.width <= 4032 && $0.height <= 3024 }
-                let best = suitable.max(by: { ($0.width * $0.height) < ($1.width * $1.height) }) ?? supported.min(by: { ($0.width * $0.height) < ($1.width * $1.height) })
-                if let best {
+                if let best = supported.max(by: { ($0.width * $0.height) < ($1.width * $1.height) }) {
                     cachedMaxPhotoDimensions = best
                     settings.maxPhotoDimensions = best
                 }
+            } else if let maxDims = cachedMaxPhotoDimensions {
+                settings.maxPhotoDimensions = maxDims
             }
         }
         if #available(iOS 18.0, *) {
@@ -707,6 +697,7 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
             self.captureLock.withLock {
                 self.isCapturePending = false
                 self.inFlightCaptures = 0
+                self.activeCaptureIDs.removeAll()
             }
             self.waitForInFlightClear(timeout: 0.5)
 
@@ -791,12 +782,9 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
                 self.cachedColorMatrices = nil
                 self.lastComputedMatrixKelvin = nil
                 self.lastWBGains = nil
-                if #available(iOS 16.0, *) {
-                    if let best = camera.activeFormat.supportedMaxPhotoDimensions.max(by: { ($0.width * $0.height) < ($1.width * $1.height) }) {
-                        self.cachedMaxPhotoDimensions = best
-                    } else {
-                        self.cachedMaxPhotoDimensions = self.photoOutput.maxPhotoDimensions
-                    }
+                self.updateCachedMaxPhotoDimensions()
+                if #available(iOS 16.0, *), let maxDims = self.cachedMaxPhotoDimensions {
+                    self.photoOutput.maxPhotoDimensions = maxDims
                 }
                 if #available(iOS 18.0, *) {
                     self.cachedShutterSoundSuppression = self.photoOutput.isShutterSoundSuppressionSupported
@@ -1042,7 +1030,7 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
     }
 
     func setCaptureFPS(_ fps: Double) {
-        let clamped = max(1, min(30, fps))
+        let clamped = 24.0
         // Stop the timer on the capture queue first to prevent firing mid-change.
         captureQueue.async { [weak self] in
             guard let self else { return }
@@ -1066,8 +1054,7 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
     }
 
     /// Adjust capture pipeline behavior for recording.
-    /// Maintains 4-frame queue depth for continuous 30 fps Bayer RAW burst
-    /// so AVFoundation sensor exposure and ISP readout stay continuously pipelined.
+    /// Maintains a deep pipeline so sensor exposure and RAW delivery overlap.
     /// Must be called from the main thread.
     func setRecordingMode(_ recording: Bool) {
         isRecordingMode = recording
@@ -1106,16 +1093,12 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
         if isReconfiguringAudio { return }
         guard session.isRunning, !isReconfiguringSession else { return }
 
-        let settings = makeRAWPhotoSettings()
-        let photoID = settings.uniqueID
-
         let canCapture: Bool = captureLock.withLock {
             if inFlightCaptures >= maxInFlight {
                 isCapturePending = true
                 return false
             }
             inFlightCaptures += 1
-            activeCaptureIDs.insert(photoID)
             isCapturePending = false
             lastCaptureStart = CACurrentMediaTime()
             return true
@@ -1131,11 +1114,16 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
                 rawPixelFormat = first
                 formatCFAPattern = Self.cfaPattern(forBayerFormat: first)
             } else {
-                endInFlight(uniqueID: photoID)
+                endInFlight()
                 return
             }
         }
 
+        // Unique settings object every shot (required). Type matches prepared array.
+        let settings = makeRAWPhotoSettings()
+        captureLock.withLock {
+            activeCaptureIDs.insert(settings.uniqueID)
+        }
         photoOutput.capturePhoto(with: settings, delegate: self)
     }
 
@@ -1177,6 +1165,8 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
 
     private func prewarmBayerBufferPool(width: Int, height: Int, format: OSType) {
         guard bayerBufferPool == nil || bayerPoolW != width || bayerPoolH != height || bayerPoolFormat != format else { return }
+        // Enough ownership for the photo delivery queue, three Metal slots, and
+        // the encoder to overlap without recycling a RAW IOSurface in use.
         let poolAttrs: [String: Any] = [
             kCVPixelBufferPoolMinimumBufferCountKey as String: 16
         ]
@@ -1276,6 +1266,10 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
                 )
                 blit.endEncoding()
                 cb.commit()
+                // The photo framework may recycle `src` immediately after its
+                // delegate returns. Do not publish `dst` until this DMA copy is
+                // complete; otherwise the queued frames contend for/reuse an
+                // IOSurface and the RAW burst collapses under load.
                 cb.waitUntilCompleted()
                 return dst
             }
@@ -1320,8 +1314,9 @@ extension CaptureController: AVCapturePhotoCaptureDelegate {
 
     func photoOutput(_ output: AVCapturePhotoOutput, didCapturePhotoFor resolvedSettings: AVCaptureResolvedPhotoSettings) {
         AudioServicesDisposeSystemSoundID(1108)
-        // Immediately release the hardware capture slot as soon as physical shutter/sensor exposure completes.
-        // This allows the next photo to begin exposing with ZERO idle wait on the sensor.
+        // Release capture slot IMMEDIATELY when the sensor exposure completes.
+        // This allows AVFoundation to expose the next frame on the sensor while
+        // the ISP processes/unpacks the current frame in parallel, unlocking full sensor framerate!
         releaseCaptureSlot(for: resolvedSettings.uniqueID)
     }
 
@@ -1329,11 +1324,15 @@ extension CaptureController: AVCapturePhotoCaptureDelegate {
         if let error {
             print("[CaptureController] didFinishCaptureFor error: \(error.localizedDescription)")
         }
-        // Safety: release slot in case didCapturePhotoFor was skipped due to early error
+        // Fallback cleanup in case didCapturePhotoFor was not invoked
         releaseCaptureSlot(for: resolvedSettings.uniqueID)
     }
 
     func photoOutput(_ output: AVCapturePhotoOutput, didFinishProcessingPhoto photo: AVCapturePhoto, error: Error?) {
+        defer {
+            releaseCaptureSlot(for: photo.resolvedSettings.uniqueID)
+        }
+
         if let error {
             print("[CaptureController] Capture error: \(error.localizedDescription)")
             return
@@ -1394,17 +1393,18 @@ extension CaptureController: AVCapturePhotoCaptureDelegate {
         let smoothedKelvin: Float?
         let smoothedTint: Float?
         if let dev = device, let gains = activeGains {
+            let clampedGains = Self.clampWhiteBalanceGains(gains, for: dev)
             if let lastG = lastWBGains,
-               abs(lastG.redGain - gains.redGain) < 0.005,
-               abs(lastG.greenGain - gains.greenGain) < 0.005,
-               abs(lastG.blueGain - gains.blueGain) < 0.005,
+               abs(lastG.redGain - clampedGains.redGain) < 0.005,
+               abs(lastG.greenGain - clampedGains.greenGain) < 0.005,
+               abs(lastG.blueGain - clampedGains.blueGain) < 0.005,
                let cachedK = cachedKelvin,
                let cachedT = cachedTint {
                 smoothedKelvin = cachedK
                 smoothedTint = cachedT
             } else {
-                lastWBGains = gains
-                let tempAndTint = dev.temperatureAndTintValues(for: gains)
+                lastWBGains = clampedGains
+                let tempAndTint = dev.temperatureAndTintValues(for: clampedGains)
                 let kelvin = tempAndTint.temperature
                 let tint = tempAndTint.tint
                 let prevK = cachedKelvin ?? kelvin
@@ -1579,6 +1579,14 @@ extension CaptureController: AVCapturePhotoCaptureDelegate {
             if let f = floatFromAny(item) { vals.append(f) }
         }
         return vals.count == 9 ? vals : nil
+    }
+
+    static func clampWhiteBalanceGains(_ gains: AVCaptureDevice.WhiteBalanceGains, for device: AVCaptureDevice) -> AVCaptureDevice.WhiteBalanceGains {
+        let maxGain = device.maxWhiteBalanceGain
+        let r = gains.redGain.isNaN ? 1.0 : max(1.0, min(maxGain, gains.redGain))
+        let g = gains.greenGain.isNaN ? 1.0 : max(1.0, min(maxGain, gains.greenGain))
+        let b = gains.blueGain.isNaN ? 1.0 : max(1.0, min(maxGain, gains.blueGain))
+        return AVCaptureDevice.WhiteBalanceGains(redGain: r, greenGain: g, blueGain: b)
     }
 
     private static func normalizeMatrixRows(_ m: simd_float3x3) -> simd_float3x3 {

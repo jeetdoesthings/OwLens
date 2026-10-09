@@ -2,19 +2,14 @@ import AVFoundation
 import CoreGraphics
 import Foundation
 
-/// Capture / encode frame rate — **24 and 30 only**.
-/// Output is constant-frame-rate; missing RAW stills are held so file is true 24/30 fps.
+/// Capture / encode frame rate — locked to cinema 24 fps for the RAW pipeline.
 enum CaptureFrameRate: Double, CaseIterable, Identifiable {
     case fps24 = 24
-    case fps30 = 30
 
     var id: Double { rawValue }
 
     var label: String {
-        switch self {
-        case .fps24: return "24"
-        case .fps30: return "30"
-        }
+        "24"
     }
 
     var displayName: String { "\(label) fps" }

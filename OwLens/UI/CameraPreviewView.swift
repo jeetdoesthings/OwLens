@@ -5,7 +5,7 @@ import QuartzCore
 import os
 
 /// Thread-safe texture delivery pipe from the Metal pipeline to MTKView.
-/// Completely bypasses SwiftUI's view body evaluation loop at 24/30 fps,
+/// Completely bypasses SwiftUI's view body evaluation loop at 24 fps,
 /// scheduling direct layer updates onto the MTKView.
 final class PreviewFeed: @unchecked Sendable {
     private let lock = OSAllocatedUnfairLock()
@@ -73,7 +73,7 @@ struct CameraPreviewView: UIViewRepresentable {
     @Binding var showFocusPeaking: Bool
     var showDisplayLUT: Bool = false
     var overlayOnly: Bool = false
-    var targetFPS: Double = 30.0
+    var targetFPS: Double = 24.0
     var orientation: UIInterfaceOrientation = .landscapeRight
 
     func makeUIView(context: Context) -> MTKView {
@@ -157,11 +157,11 @@ struct CameraPreviewView: UIViewRepresentable {
         var showFocusPeaking: Bool = false
         var showDisplayLUT: Bool = false
         var overlayOnly: Bool = false
-        var targetFPS: Double = 30.0
+        var targetFPS: Double = 24.0
         var orientation: UIInterfaceOrientation = .landscapeRight
         /// Cached app state — updated from MainActor via updateUIView, read on render thread.
         var isAppActive: Bool = true
-        /// No redundant-draw guard needed: the display link runs at 30 fps and frames
+        /// No redundant-draw guard needed: the display link runs at 24 fps and frames
         /// arrive at ~24 fps. The ~6 extra fullscreen blits per second are negligible.
         private let renderCommandQueue: MTLCommandQueue?
         private let renderPipeline: MTLRenderPipelineState?

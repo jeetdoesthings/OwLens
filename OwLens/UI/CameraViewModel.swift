@@ -84,7 +84,7 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
             refreshStatusLine()
         }
     }
-    @Published var selectedFPS: CaptureFrameRate = .fps30 {
+    @Published var selectedFPS: CaptureFrameRate = .fps24 {
         didSet {
             guard !controlsLocked, !isRecording else { return }
             captureController.setCaptureFPS(selectedFPS.rawValue)
@@ -216,6 +216,7 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
     @Published var isAutoWhiteBalanceEnabled: Bool = false {
         didSet {
             guard oldValue != isAutoWhiteBalanceEnabled else { return }
+            metalPipeline?.isAutoWBEnabled = isAutoWhiteBalanceEnabled
             if !isAutoWhiteBalanceEnabled {
                 wbStopIndex = ExposureStops.nearestIndex(in: wbStops, to: wbKelvin)
             }
@@ -418,9 +419,6 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
     private let recordingQueue = DispatchQueue(label: "com.owlens.recording", qos: .userInteractive)
     nonisolated private let processLock = OSAllocatedUnfairLock()
     nonisolated(unsafe) private var freeSlots: Set<Int> = [0, 1, 2]
-    nonisolated(unsafe) private var inFlightRecordingSlots: Set<Int> = []
-    nonisolated(unsafe) private var isCapturingForRecording = false
-    nonisolated(unsafe) private var isAudioRecordingActive = false
 
     // Sequencer for guaranteeing strictly monotonic frame ordering during recording
     nonisolated(unsafe) private var nextDispatchSequenceID: UInt64 = 0
@@ -432,6 +430,7 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
     nonisolated(unsafe) private var activeEncodeHeight = 1512
     nonisolated(unsafe) private var activeFPS: Double = 30
     nonisolated(unsafe) private var isRecordingUnsafe = false
+    nonisolated(unsafe) private var isAudioRecordingActive = false
     nonisolated(unsafe) private var currentOrientationUnsafe: UIInterfaceOrientation = .landscapeRight
     nonisolated(unsafe) private var recordingOrientationUnsafe: UIInterfaceOrientation = .landscapeRight
     nonisolated(unsafe) private var isAudioMutedUnsafe = false
@@ -452,7 +451,7 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
     nonisolated(unsafe) private var latestSGamutMatrix: simd_float3x3?
 
     enum ControlPanel: String, Identifiable {
-        case exposure, iso, shutter, wb, focus, fps, format, bitrate, mic, lens, save, logCurve
+        case exposure, iso, shutter, wb, focus, format, bitrate, mic, lens, save, logCurve
         var id: String { rawValue }
     }
 
@@ -1206,8 +1205,6 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
                 let maxD = device.activeFormat.maxExposureDuration
                 if CMTimeCompare(shutterDuration, minD) < 0 { shutterDuration = minD }
                 if CMTimeCompare(shutterDuration, maxD) > 0 { shutterDuration = maxD }
-                let maxFrameDuration = CMTime(value: 1, timescale: CMTimeScale(fps))
-                if CMTimeCompare(shutterDuration, maxFrameDuration) > 0 { shutterDuration = maxFrameDuration }
 
                 if device.isExposureModeSupported(.custom) {
                     device.setExposureModeCustom(duration: shutterDuration, iso: clampedISO, completionHandler: nil)
@@ -1264,13 +1261,13 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
     private func freezeAutoWhiteBalance(on device: AVCaptureDevice) {
         guard isAutoWhiteBalanceEnabled else { return }
         let currentGains = device.deviceWhiteBalanceGains
-        let tempTint = device.temperatureAndTintValues(for: currentGains)
+        let clamped = clampWhiteBalanceGains(currentGains, for: device)
+        let tempTint = device.temperatureAndTintValues(for: clamped)
         wbKelvin = max(2000, min(10000, tempTint.temperature))
         wbStopIndex = ExposureStops.nearestIndex(in: wbStops, to: wbKelvin)
-        wbTint = tempTint.tint
+        wbTint = max(-50.0, min(50.0, tempTint.tint))
         isAutoWhiteBalanceEnabled = false
         isAutoWhiteBalanceAdjusting = false
-        let clamped = clampWhiteBalanceGains(currentGains, for: device)
         if device.isWhiteBalanceModeSupported(.locked) {
             device.setWhiteBalanceModeLocked(with: clamped)
         }
@@ -1534,18 +1531,13 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
             isRecordingUnsafe = true
             isAudioRecordingActive = true
             processLock.withLock {
-                isCapturingForRecording = true
                 nextDispatchSequenceID = 0
                 nextOutputSequenceID = 0
                 lastOutputSequenceTime = CACurrentMediaTime()
                 reorderBuffer.removeAll()
-                inFlightRecordingSlots.removeAll()
             }
             frameIndex = 0
             frameCount = 0
-            droppedFrames = 0
-            lastReportedDrops = 0
-            frameBuffer.resetRecordingDrops()
             recordingStartTime = recordingDate
             recordingDuration = "00:00"
             activePanel = nil
@@ -1612,9 +1604,6 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
         isRecording = false
         isSaving = true
         isAudioRecordingActive = false
-        processLock.withLock {
-            isCapturingForRecording = false
-        }
         videoWriter.onLowDiskSpace = nil
         recordingTimer?.invalidate()
         recordingTimer = nil
@@ -1633,84 +1622,54 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
             }
         }
 
-        drainAndFinalizeRecording()
+        let remaining: [(MTLTexture, CVPixelBuffer?, RawFrameData)] = processLock.withLock {
+            let bufferedKeys = reorderBuffer.keys.sorted()
+            var rem: [(MTLTexture, CVPixelBuffer?, RawFrameData)] = []
+            for k in bufferedKeys {
+                if let item = reorderBuffer.removeValue(forKey: k), let tex = item.0 {
+                    rem.append((tex, item.1, item.2))
+                }
+            }
+            lastOutputSequenceTime = 0
+            return rem
+        }
+
+        for item in remaining {
+            dispatchOrderedRecordedFrame(item.0, bgraPB: item.1, frameData: item.2, isTailFlush: true)
+        }
+
+        recordingQueue.async { [weak self] in
+            guard let self else { return }
+            self.isRecordingUnsafe = false
+            self.videoWriter.finish { [weak self] url, error in
+                self?.processQueue.async {
+                    self?.metalPipeline?.trimMemory()
+                }
+                guard let url else {
+                    Task { @MainActor [weak self] in
+                        self?.statusText = "Save failed"
+                        self?.errorMessage = error?.localizedDescription ?? "Recording ended with no frames"
+                        self?.endSaveTask()
+                    }
+                    return
+                }
+                Task { @MainActor [weak self] in
+                    await self?.saveFinishedRecording(at: url)
+                }
+            }
+        }
 
         frameCount = Int(frameIndex)
-        let totalDrops = frameBuffer.recordingDroppedCount + videoWriter.droppedFrames
-        droppedFrames = totalDrops
-        let realNote = "frames=\(frameCount) drops=\(totalDrops) fps=\(selectedFPS.label) fmt=\(selectedFormat.shortLabel)"
+        let realNote = "frames=\(frameCount) drops=\(droppedFrames) fps=\(selectedFPS.label) fmt=\(selectedFormat.shortLabel)"
         print("[CameraViewModel] Recording stopped \(realNote)")
         if let caps = capabilities {
             print("[CameraViewModel] Tester diagnostics:\n\(caps.diagnosticSummary)\n\(realNote)")
         }
     }
 
-    private func drainAndFinalizeRecording() {
-        DispatchQueue.global(qos: .userInteractive).async { [weak self] in
-            guard let self else { return }
-
-            // 1. Wait for all in-flight recording frames in frameBuffer and GPU slots to finish processing
-            let startDrain = CACurrentMediaTime()
-            var drainComplete = false
-
-            while !drainComplete && (CACurrentMediaTime() - startDrain < 1.0) {
-                let isDrained = self.processLock.withLock {
-                    return !self.frameBuffer.hasRecordingFrames() && self.inFlightRecordingSlots.isEmpty
-                }
-                if isDrained {
-                    drainComplete = true
-                } else {
-                    usleep(5000) // 5ms sleep between polls
-                }
-            }
-
-            // 2. Flush any remaining items in reorderBuffer
-            let remaining: [(MTLTexture, CVPixelBuffer?, RawFrameData)] = self.processLock.withLock {
-                let bufferedKeys = self.reorderBuffer.keys.sorted()
-                var rem: [(MTLTexture, CVPixelBuffer?, RawFrameData)] = []
-                for k in bufferedKeys {
-                    if let item = self.reorderBuffer.removeValue(forKey: k), let tex = item.0 {
-                        rem.append((tex, item.1, item.2))
-                    }
-                }
-                self.lastOutputSequenceTime = 0
-                return rem
-            }
-
-            for item in remaining {
-                self.dispatchOrderedRecordedFrame(item.0, bgraPB: item.1, frameData: item.2, isTailFlush: true)
-            }
-
-            // 3. Mark isRecordingUnsafe = false and finalize on recordingQueue.
-            // All videoWriter.appendFrame calls dispatched to recordingQueue will finish before videoWriter.finish runs.
-            self.recordingQueue.async { [weak self] in
-                guard let self else { return }
-                self.isRecordingUnsafe = false
-                self.videoWriter.finish { [weak self] url, error in
-                    self?.processQueue.async {
-                        self?.metalPipeline?.trimMemory()
-                    }
-                    guard let url else {
-                        Task { @MainActor [weak self] in
-                            self?.statusText = "Save failed"
-                            self?.errorMessage = error?.localizedDescription ?? "Recording ended with no frames"
-                            self?.endSaveTask()
-                        }
-                        return
-                    }
-                    Task { @MainActor [weak self] in
-                        await self?.saveFinishedRecording(at: url)
-                    }
-                }
-            }
-        }
-    }
-
     @MainActor
     private func endSaveTask() {
         isSaving = false
-        droppedFrames = 0
-        lastReportedDrops = 0
         updateOrientation()
         if saveBackgroundTask != .invalid {
             let task = saveBackgroundTask
@@ -2000,9 +1959,7 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
         // Never enqueue GPU work while backgrounded (IOGPUMetalError 00000006)
         guard isAppActive else { return }
 
-        var frame = frameData
-        frame.isRecordingFrame = processLock.withLock { isCapturingForRecording }
-        frameBuffer.enqueue(frame)
+        frameBuffer.enqueue(frameData)
         scheduleProcess()
     }
 
@@ -2020,17 +1977,13 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
 
     nonisolated private func drainBuffer(slot: Int) {
         var frame: RawFrameData?
-        let hasRec = frameBuffer.hasRecordingFrames()
-        if hasRec {
+        if isRecordingUnsafe {
             // FIFO during recording: process every single captured frame in order without skipping
             frame = frameBuffer.dequeue()
             if var f = frame {
-                if f.isRecordingFrame {
-                    processLock.withLock {
-                        f.sequenceID = nextDispatchSequenceID
-                        nextDispatchSequenceID &+= 1
-                        inFlightRecordingSlots.insert(slot)
-                    }
+                processLock.withLock {
+                    f.sequenceID = nextDispatchSequenceID
+                    nextDispatchSequenceID &+= 1
                 }
                 frame = f
             }
@@ -2051,7 +2004,6 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
         processFrame(frame, slot: slot) { [weak self] in
             guard let self else { return }
             let remaining: Int = self.processLock.withLock {
-                self.inFlightRecordingSlots.remove(slot)
                 self.freeSlots.insert(slot)
                 return self.frameBuffer.currentCount
             }
@@ -2063,7 +2015,7 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
 
     nonisolated private func processFrame(_ frameData: RawFrameData, slot: Int = 0, completion: @escaping () -> Void) {
         guard isAppActive, let pipeline = metalPipeline else {
-            if frameData.isRecordingFrame {
+            if isRecordingUnsafe {
                 handleRecordedFrame(nil, bgraPB: nil, frameData: frameData, completion: completion)
             } else {
                 completion()
@@ -2131,9 +2083,9 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
         let w = activeEncodeWidth
         let h = activeEncodeHeight
 
-        pipeline.orientation = frameData.isRecordingFrame ? recordingOrientationUnsafe : currentOrientationUnsafe
+        pipeline.orientation = isRecordingUnsafe ? recordingOrientationUnsafe : currentOrientationUnsafe
 
-        if frameData.isRecordingFrame {
+        if isRecordingUnsafe {
             // ── Recording ──
             let isThermalElevated = (metalPipeline?.thermalState.rawValue ?? 0) >= ProcessInfo.ThermalState.serious.rawValue
             pipeline.processingQuality = isThermalElevated ? .previewFast : .recordQuality
@@ -2169,7 +2121,7 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
                 case 3: cfaName = "BGGR"
                 default: cfaName = "?\(frameData.cfaPattern)"
                 }
-                let drops = 0
+                let drops = frameBuffer.droppedCount
                 updateScopesIfNeeded(from: framed, pipeline: pipeline)
 
                 // Submit texture directly to PreviewFeed for zero-allocation rendering on MTKView
@@ -2218,7 +2170,7 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
         frameData: RawFrameData,
         completion: @escaping () -> Void
     ) {
-        guard frameData.isRecordingFrame else {
+        guard isRecordingUnsafe else {
             // Preview path: release GPU slot immediately, no reordering needed
             completion()
             if let framed {
@@ -2296,16 +2248,18 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
         case 3: cfaName = "BGGR"
         default: cfaName = "?\(frameData.cfaPattern)"
         }
-        let drops = frameData.isRecordingFrame ? (frameBuffer.recordingDroppedCount + videoWriter.droppedFrames) : 0
+        let drops = frameBuffer.droppedCount
 
         updateScopesIfNeeded(from: framed, pipeline: metalPipeline)
 
-        if let bgraPB, (frameData.isRecordingFrame || isTailFlush) {
+        if let bgraPB, (isRecordingUnsafe || isTailFlush) {
             let timestamp = frameData.timestamp
             recordingQueue.async { [weak self] in
                 guard let self else { return }
-                if self.videoWriter.appendFrame(pixelBuffer: bgraPB, captureTime: timestamp) {
-                    self.frameIndex += 1
+                if isTailFlush || self.isRecordingUnsafe {
+                    if self.videoWriter.appendFrame(pixelBuffer: bgraPB, captureTime: timestamp) {
+                        self.frameIndex += 1
+                    }
                 }
             }
         }
@@ -2358,8 +2312,9 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
                     wbKelvin = clampedTemp
                     wbStopIndex = ExposureStops.nearestIndex(in: wbStops, to: clampedTemp)
                 }
-                if abs(wbTint - tintVal) >= 1.0 {
-                    wbTint = tintVal
+                let clampedTint = max(-50.0, min(50.0, tintVal))
+                if abs(wbTint - clampedTint) >= 1.0 {
+                    wbTint = clampedTint
                 }
             } else if let gains = frameData.whiteBalanceGains {
                 let clamped = clampWhiteBalanceGains(gains, for: device)
@@ -2369,8 +2324,9 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
                     wbKelvin = temp
                     wbStopIndex = ExposureStops.nearestIndex(in: wbStops, to: temp)
                 }
-                if abs(wbTint - temperatureAndTint.tint) >= 1.0 {
-                    wbTint = temperatureAndTint.tint
+                let clampedTint = max(-50.0, min(50.0, temperatureAndTint.tint))
+                if abs(wbTint - clampedTint) >= 1.0 {
+                    wbTint = clampedTint
                 }
             }
             let isAdj = device.isAdjustingWhiteBalance

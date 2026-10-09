@@ -13,25 +13,13 @@ final class RawFrameBuffer {
     private var readIndex = 0
     private var count = 0
     private let lock = OSAllocatedUnfairLock()
-    private var _recordingDroppedCount: Int = 0
-
-    /// Returns the number of real recording frames dropped due to buffer overrun.
-    /// Preview frames skipped to maintain real-time UI are never counted here.
-    var recordingDroppedCount: Int {
-        lock.withLock { _recordingDroppedCount }
-    }
+    private var _droppedCount: Int = 0
 
     var droppedCount: Int {
-        lock.withLock { _recordingDroppedCount }
+        lock.withLock { _droppedCount }
     }
 
-    func resetRecordingDrops() {
-        lock.withLock {
-            _recordingDroppedCount = 0
-        }
-    }
-
-    init(capacity: Int = 16) {
+    init(capacity: Int = 3) {
         self.capacity = max(1, capacity)
         self.buffer = Array(repeating: nil, count: self.capacity)
     }
@@ -41,13 +29,10 @@ final class RawFrameBuffer {
         lock.withLock {
             if count == capacity {
                 // Drop oldest
-                let old = buffer[readIndex]
-                if old?.isRecordingFrame == true {
-                    _recordingDroppedCount += 1
-                }
                 buffer[readIndex] = nil
                 readIndex = (readIndex + 1) % capacity
                 count -= 1
+                _droppedCount += 1
             }
 
             buffer[writeIndex] = frame
@@ -77,14 +62,11 @@ final class RawFrameBuffer {
             let dropped = count - 1
             if dropped > 0 {
                 for i in 0..<dropped {
-                    let old = buffer[(readIndex + i) % capacity]
-                    if old?.isRecordingFrame == true {
-                        _recordingDroppedCount += 1
-                    }
                     buffer[(readIndex + i) % capacity] = nil
                 }
                 readIndex = (readIndex + dropped) % capacity
                 count -= dropped
+                _droppedCount += dropped
             }
 
             let frame = buffer[readIndex]
@@ -109,20 +91,6 @@ final class RawFrameBuffer {
             writeIndex = 0
             readIndex = 0
             count = 0
-            _recordingDroppedCount = 0
-        }
-    }
-
-    /// Check if any unread frame in the buffer belongs to an active recording session.
-    func hasRecordingFrames() -> Bool {
-        lock.withLock {
-            guard count > 0 else { return false }
-            for i in 0..<count {
-                if buffer[(readIndex + i) % capacity]?.isRecordingFrame == true {
-                    return true
-                }
-            }
-            return false
         }
     }
 }
