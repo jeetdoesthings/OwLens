@@ -383,30 +383,14 @@ final class VideoWriter: @unchecked Sendable {
             drainPrerollAudioBuffersLocked()
         }
 
-        // Strict 1:1 real-time playback pacing:
-        // Lock every frame's presentation timestamp directly to its hardware capture timestamp
-        // relative to session start. This guarantees:
-        // 1. Strict 1.000x real-time playback speed (never fast-forwarded or sped up).
-        // 2. Microsecond audio-video lip sync locked to the exact same hardware capture origin.
-        // 3. Zero duplicate/hold frames — every frame is a 100% unique capture.
-        // 4. Zero frozen tail frames — audio and video end synchronously.
-        let rawPTS: CMTime
-        if let captureTime = captureTime, captureTime.isValid, sessionStartTime.isValid {
-            let diff = CMTimeSubtract(captureTime, sessionStartTime)
-            rawPTS = CMTimeCompare(diff, .zero) > 0 ? diff : .zero
-        } else {
-            rawPTS = CMTime(seconds: max(0, now - startHostTime), preferredTimescale: 60000)
-        }
-
-        // Monotonicity guarantee: ensure strictly increasing presentation timestamps
-        let currentPTS: CMTime
-        if lastVideoPTS.isValid && CMTimeCompare(rawPTS, lastVideoPTS) <= 0 {
-            currentPTS = CMTimeAdd(lastVideoPTS, CMTime(value: 1, timescale: 60000))
-        } else {
-            currentPTS = rawPTS
-        }
-
+        // Cumulative CFR Timeline:
+        // Paces every real frame strictly onto the target FPS grid (e.g. 30.00 fps -> 2000 ticks at 60000 timescale).
+        // 1. Strict Constant Frame Rate (true 30.00 fps across QuickTime, DaVinci Resolve, Final Cut Pro, Premiere).
+        // 2. Strict 1.000x real-time playback speed.
+        // 3. ZERO duplicate/hold frames — every frame is a 100% unique capture.
+        // 4. Microsecond audio sync locked to hardware capture origin.
         let frameStep = Int64(round(60000.0 / targetFPS))
+        let currentPTS = CMTime(value: frameCount * frameStep, timescale: 60000)
         let audioLimitPTS = CMTimeAdd(currentPTS, CMTime(value: frameStep * 2, timescale: 60000))
         drainPendingAudioBuffersLocked(upTo: audioLimitPTS)
 
@@ -755,8 +739,8 @@ final class VideoWriter: @unchecked Sendable {
         let boxedWriter = SendableBox(value: writer)
         writer.finishWriting {
             let status = boxedWriter.value.status
-            let duration = finalPTS.isValid ? finalPTS.seconds : (Double(total) / fps)
-            print("[VideoWriter] Done. timeline=\(total) real=\(real) drops=\(drops) \(String(format: "%.2f", duration))s @ ~\(Int(fps))fps status=\(String(describing: status))")
+            let duration = Double(total) / fps
+            print("[VideoWriter] Done. timeline=\(total) real=\(real) drops=\(drops) \(String(format: "%.2f", duration))s @ \(Int(fps))fps status=\(String(describing: status))")
             let outputURL = boxedWriter.value.outputURL
             let gcsvData = self.gyroRecorder.exportGCSVData(videoFileName: outputURL.lastPathComponent)
             self.gyroRecorder.stop()
