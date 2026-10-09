@@ -56,7 +56,7 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
     private let captureLock = OSAllocatedUnfairLock()
     /// Outstanding capturePhoto calls (RAW: 2 for pipelined 30 fps; 3 with responsive capture).
     private var inFlightCaptures = 0
-    private var maxInFlight = 2
+    private var maxInFlight = 4
     private var isCapturePending = false
     private var activeCaptureIDs: Set<Int64> = []
 
@@ -169,7 +169,7 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
         session.addOutput(photoOutput)
 
         photoOutput.maxPhotoQualityPrioritization = .speed
-        maxInFlight = 2
+        maxInFlight = 4
  
         // Mic + audio output
         if let defaultMic = AVCaptureDevice.default(for: .audio) {
@@ -247,9 +247,9 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
             }
         }
         if photoOutput.isResponsiveCaptureEnabled {
-            maxInFlight = 3
+            maxInFlight = 5
         } else {
-            maxInFlight = 2
+            maxInFlight = 4
         }
 
         if photoOutput.isFastCapturePrioritizationSupported {
@@ -420,7 +420,7 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
                 prewarmBayerBufferPool(width: targetW, height: targetH, format: rawPixelFormat)
             }
         }
-        let prepared = (0..<8).map { _ in makeRAWPhotoSettings() }
+        let prepared = (0..<16).map { _ in makeRAWPhotoSettings() }
         photoOutput.setPreparedPhotoSettingsArray(prepared) { preparedOK, error in
             if let error {
                 print("[CaptureController] prepare RAW settings failed: \(error)")
@@ -725,7 +725,7 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
 
                 self.session.sessionPreset = .photo
                 self.photoOutput.maxPhotoQualityPrioritization = .speed
-                self.maxInFlight = 3
+                self.maxInFlight = 4
                 self.session.commitConfiguration()
 
                 // Resolve Bayer *after* commit (list is empty mid-configuration)
@@ -746,7 +746,7 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
                         }
                         self.session.sessionPreset = .photo
                         self.photoOutput.maxPhotoQualityPrioritization = .speed
-                        self.maxInFlight = 3
+                        self.maxInFlight = 4
                         self.session.commitConfiguration()
                         try? self.applyDefaultCameraModes(on: prev)
                         try? self.resolveBayerRAWOrThrow(allowFallbackToOtherLenses: false)
@@ -1045,9 +1045,9 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
             enableBurstHelpersIfSafe()
         }
         if photoOutput.isResponsiveCaptureEnabled {
-            maxInFlight = 3
+            maxInFlight = 5
         } else {
-            maxInFlight = 2
+            maxInFlight = 4
         }
     }
 
@@ -1149,7 +1149,7 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
     private func prewarmBayerBufferPool(width: Int, height: Int, format: OSType) {
         guard bayerBufferPool == nil || bayerPoolW != width || bayerPoolH != height || bayerPoolFormat != format else { return }
         let poolAttrs: [String: Any] = [
-            kCVPixelBufferPoolMinimumBufferCountKey as String: 12
+            kCVPixelBufferPoolMinimumBufferCountKey as String: 16
         ]
         let pbAttrs: [String: Any] = [
             kCVPixelBufferPixelFormatTypeKey as String: format,
