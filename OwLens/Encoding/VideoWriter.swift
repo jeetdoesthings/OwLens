@@ -398,26 +398,6 @@ final class VideoWriter: @unchecked Sendable {
         }
 
         let frameStep = Int64(round(60000.0 / targetFPS))
-        let targetSlot = Int64(round(elapsedSeconds * targetFPS))
-
-        // If the hardware sensor temporarily skipped a slot (e.g. 45ms physical still cycle),
-        // hold the previous frame in the missed slot to preserve rock-solid CFR timeline cadence.
-        if realFrameCount > 0, let hold = lastPixelBuffer {
-            let missedSlots = max(0, min(10, Int(targetSlot - frameCount)))
-            for _ in 0..<missedSlots {
-                guard input.isReadyForMoreMediaData else {
-                    droppedFrames += 1
-                    break
-                }
-                if writeCFR(hold, slotIndex: frameCount, adaptor: adaptor) {
-                    frameCount += 1
-                } else {
-                    droppedFrames += 1
-                    break
-                }
-            }
-        }
-
         let currentPTS = CMTime(value: frameCount * frameStep, timescale: 60000)
         let audioLimitPTS = CMTimeAdd(currentPTS, CMTime(value: frameStep, timescale: 60000))
         drainPendingAudioBuffersLocked(upTo: audioLimitPTS)
@@ -705,21 +685,6 @@ final class VideoWriter: @unchecked Sendable {
         }
 
         isRecording = false
-
-        // Bounded pad to wall clock: pad hold frames to match audio duration cleanly
-        if let hold = lastPixelBuffer,
-           let adaptor = pixelBufferAdaptor,
-           let vIn = videoInput {
-            let elapsed = max(0, CACurrentMediaTime() - startHostTime)
-            let targetCount = min(Int64((elapsed * targetFPS).rounded()), frameCount + 15)
-            while frameCount < targetCount && vIn.isReadyForMoreMediaData {
-                if writeCFR(hold, slotIndex: frameCount, adaptor: adaptor) {
-                    frameCount += 1
-                } else {
-                    break
-                }
-            }
-        }
 
         // Tail freeze prevention:
         // Video track duration ends at lastVideoPTS + 1 frame interval.

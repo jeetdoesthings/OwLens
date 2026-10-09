@@ -219,10 +219,9 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
                 return
             }
             let frameDuration = CMTime(value: 1, timescale: CMTimeScale(rate))
-            // Always invalidate maxFrameDuration first to prevent NSInvalidArgumentException if min > current max
+            // Leave maxFrameDuration invalid so sensor readout and exposure cadence are never throttled
             camera.activeVideoMaxFrameDuration = .invalid
             camera.activeVideoMinFrameDuration = frameDuration
-            camera.activeVideoMaxFrameDuration = frameDuration
             let dims = CMVideoFormatDescriptionGetDimensions(camera.activeFormat.formatDescription)
             print("[CaptureController] Sensor \(dims.width)x\(dims.height) cadence locked @ \(rate)fps (preset .photo)")
         } catch {
@@ -383,7 +382,7 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
                 if photoOutput.isResponsiveCaptureSupported { photoOutput.isResponsiveCaptureEnabled = false }
                 if photoOutput.isFastCapturePrioritizationSupported { photoOutput.isFastCapturePrioritizationEnabled = false }
             }
-            maxInFlight = 1
+            maxInFlight = 4
             session.commitConfiguration()
             try? applyDefaultCameraModes(on: camera)
             lockSensorToTargetFPS(on: camera, fps: targetFPS)
