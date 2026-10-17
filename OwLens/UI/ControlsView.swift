@@ -543,11 +543,11 @@ struct ControlsView: View {
                 viewModel.togglePanel(.focus)
             }
 
-            // Bitrate
+            // Codec & Bitrate
             deckTile(
-                title: "BITRATE",
-                value: "\(viewModel.selectedBitrate.label)M",
-                subvalue: viewModel.selectedCodec.rawValue.uppercased(),
+                title: viewModel.selectedCodec == .hevc ? "BITRATE" : "CODEC",
+                value: viewModel.selectedCodec == .hevc ? "\(viewModel.selectedBitrate.label)M" : (viewModel.selectedCodec == .proRes422HQ ? "HQ" : "422"),
+                subvalue: viewModel.selectedCodec == .hevc ? "HEVC" : "PRORES",
                 isSelected: viewModel.activePanel == .bitrate,
                 isDisabled: viewModel.isRecording || viewModel.isSaving || viewModel.controlsLocked,
                 width: 68
@@ -1006,34 +1006,93 @@ struct ControlsView: View {
     }
 
     private var bitrateDrawerContent: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            drawerHeader(title: "BITRATE")
+        VStack(alignment: .leading, spacing: 12) {
+            drawerHeader(title: "CODEC & BITRATE")
 
-            HStack(spacing: 6) {
-                ForEach(BitratePreset.allCases.filter { $0.rawValue <= viewModel.selectedFormat.maxBitratePreset.rawValue }) { bit in
-                    let isSelected = viewModel.selectedBitrate == bit
-                    Button {
-                        Haptics.selection()
-                        viewModel.selectedBitrate = bit
-                    } label: {
-                        VStack(spacing: 2) {
-                            Text(bit.displayName)
-                                .font(.appMono(isSelected ? .semiBold : .regular, size: 11))
-                                .foregroundColor(isSelected ? .black : OwLensTheme.textPrimary)
-                            Text(bit == viewModel.selectedFormat.suggestedBitratePreset ? "Rec" : "HEVC")
-                                .font(.appMono(.regular, size: 8))
-                                .foregroundColor(isSelected ? .black.opacity(0.5) : OwLensTheme.textMuted)
+            // Codec Selection Section
+            VStack(alignment: .leading, spacing: 5) {
+                Text("CODEC")
+                    .font(.appMono(.medium, size: 8))
+                    .foregroundColor(OwLensTheme.textMuted)
+
+                HStack(spacing: 6) {
+                    ForEach(VideoCodecOption.availableCases) { codec in
+                        let isSelected = viewModel.selectedCodec == codec
+                        Button {
+                            Haptics.selection()
+                            viewModel.selectedCodec = codec
+                        } label: {
+                            VStack(spacing: 2) {
+                                Text(codec.displayName)
+                                    .font(.appFont(isSelected ? .semiBold : .regular, size: 11))
+                                    .foregroundColor(isSelected ? .black : OwLensTheme.textPrimary)
+                                Text(codec == .hevc ? "10-bit H.265" : "Intra-frame")
+                                    .font(.appMono(.regular, size: 8))
+                                    .foregroundColor(isSelected ? .black.opacity(0.5) : OwLensTheme.textMuted)
+                            }
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 8)
+                            .background(
+                                RoundedRectangle(cornerRadius: OwLensTheme.radiusCard, style: .continuous)
+                                    .fill(isSelected ? OwLensTheme.glassActive : OwLensTheme.glassBase)
+                            )
+                            .overlay(
+                                RoundedRectangle(cornerRadius: OwLensTheme.radiusCard, style: .continuous)
+                                    .strokeBorder(isSelected ? Color.clear : OwLensTheme.glassBorder, lineWidth: 0.5)
+                            )
+                            .contentShape(Rectangle())
                         }
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 8)
-                        .background(
-                            RoundedRectangle(cornerRadius: OwLensTheme.radiusCard, style: .continuous)
-                                .fill(isSelected ? OwLensTheme.glassActive : OwLensTheme.glassBase)
-                        )
-                        .contentShape(Rectangle())
+                        .buttonStyle(.plain)
                     }
-                    .buttonStyle(.plain)
                 }
+
+                if !VideoCodecOption.isProResSupported {
+                    Text("ProRes hardware encoding requires iPhone 13 Pro or newer (A15+).")
+                        .font(.appFont(.regular, size: 9.5))
+                        .foregroundColor(OwLensTheme.textMuted)
+                        .padding(.top, 2)
+                }
+            }
+
+            // Bitrate Section (Active for HEVC; informational for ProRes)
+            if viewModel.selectedCodec == .hevc {
+                VStack(alignment: .leading, spacing: 5) {
+                    Text("HEVC BITRATE")
+                        .font(.appMono(.medium, size: 8))
+                        .foregroundColor(OwLensTheme.textMuted)
+
+                    HStack(spacing: 6) {
+                        ForEach(BitratePreset.allCases.filter { $0.rawValue <= viewModel.selectedFormat.maxBitratePreset.rawValue }) { bit in
+                            let isSelected = viewModel.selectedBitrate == bit
+                            Button {
+                                Haptics.selection()
+                                viewModel.selectedBitrate = bit
+                            } label: {
+                                VStack(spacing: 2) {
+                                    Text(bit.displayName)
+                                        .font(.appMono(isSelected ? .semiBold : .regular, size: 11))
+                                        .foregroundColor(isSelected ? .black : OwLensTheme.textPrimary)
+                                    Text(bit == viewModel.selectedFormat.suggestedBitratePreset ? "Rec" : "Target")
+                                        .font(.appMono(.regular, size: 8))
+                                        .foregroundColor(isSelected ? .black.opacity(0.5) : OwLensTheme.textMuted)
+                                }
+                                .frame(maxWidth: .infinity)
+                                .padding(.vertical, 8)
+                                .background(
+                                    RoundedRectangle(cornerRadius: OwLensTheme.radiusCard, style: .continuous)
+                                        .fill(isSelected ? OwLensTheme.glassActive : OwLensTheme.glassBase)
+                                )
+                                .contentShape(Rectangle())
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                }
+            } else {
+                Text(viewModel.selectedCodec == .proRes422HQ ? "ProRes 422 HQ records at ~235 Mbps intra-frame mastering quality." : "ProRes 422 records at ~156 Mbps intra-frame mastering quality.")
+                    .font(.appFont(.regular, size: 10.5))
+                    .foregroundColor(OwLensTheme.textSecondary)
+                    .padding(.top, 2)
             }
         }
     }

@@ -425,7 +425,7 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
                 prewarmBayerBufferPool(width: targetW, height: targetH, format: rawPixelFormat)
             }
         }
-        let prepared = (0..<16).map { _ in makeRAWPhotoSettings() }
+        let prepared = (0..<24).map { _ in makeRAWPhotoSettings() }
         photoOutput.setPreparedPhotoSettingsArray(prepared) { preparedOK, error in
             if let error {
                 print("[CaptureController] prepare RAW settings failed: \(error)")
@@ -435,15 +435,17 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
         }
     }
 
-    /// Keep AVFoundation's RAW settings pool warm during a long burst. Without
-    /// replenishment it can fall back to the slower, unprepared still path.
+    /// Keep AVFoundation's RAW settings pool warm during a long burst without flooding mediaserverd.
     private func replenishPreparedPhotoSettingsIfNeeded() {
         guard session.isRunning else { return }
         framesSincePreparedReplenish += 1
-        guard framesSincePreparedReplenish >= 4 else { return }
+        guard framesSincePreparedReplenish >= 16 else { return }
         framesSincePreparedReplenish = 0
-        let prepared = (0..<4).map { _ in makeRAWPhotoSettings() }
-        photoOutput.setPreparedPhotoSettingsArray(prepared, completionHandler: nil)
+        let currentCount = photoOutput.preparedPhotoSettingsArray.count
+        if currentCount < 6 {
+            let prepared = (0..<16).map { _ in makeRAWPhotoSettings() }
+            photoOutput.setPreparedPhotoSettingsArray(prepared, completionHandler: nil)
+        }
     }
 
     private func makeRAWPhotoSettings() -> AVCapturePhotoSettings {
@@ -1168,7 +1170,7 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
         // Enough ownership for the photo delivery queue, three Metal slots, and
         // the encoder to overlap without recycling a RAW IOSurface in use.
         let poolAttrs: [String: Any] = [
-            kCVPixelBufferPoolMinimumBufferCountKey as String: 16
+            kCVPixelBufferPoolMinimumBufferCountKey as String: 32
         ]
         let pbAttrs: [String: Any] = [
             kCVPixelBufferPixelFormatTypeKey as String: format,
@@ -1225,7 +1227,8 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
         guard let dst else { return nil }
 
         // Fast path: GPU DMA Blit via Metal IOSurface zero-copy binding (~0.05ms)
-        let queue = sharedCommandQueue ?? blitCommandQueue
+        // Use dedicated blit queue so DMA copy never waits behind heavy Metal compute kernels
+        let queue = blitCommandQueue ?? sharedCommandQueue
         if let device = metalDevice,
            let queue,
            let srcSurfaceRef = CVPixelBufferGetIOSurface(src),

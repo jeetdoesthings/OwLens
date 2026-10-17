@@ -402,8 +402,8 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
     let captureController = CaptureController()
     nonisolated let metalPipeline: MetalPipeline?
     nonisolated private let videoWriter = VideoWriter()
-    /// Capacity 16: absorb burst stalls while keeping latency low.
-    nonisolated(unsafe) private let frameBuffer = RawFrameBuffer(capacity: 16)
+    /// Capacity 32: absorb burst stalls without dropping frames during disk writes or thermal spikes.
+    nonisolated(unsafe) private let frameBuffer = RawFrameBuffer(capacity: 32)
 
     private var cancellables = Set<AnyCancellable>()
     /// Debounce rapid slider changes to avoid blocking the main thread on lockForConfiguration().
@@ -424,6 +424,7 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
     nonisolated(unsafe) private var nextDispatchSequenceID: UInt64 = 0
     nonisolated(unsafe) private var nextOutputSequenceID: UInt64 = 0
     nonisolated(unsafe) private var lastOutputSequenceTime: CFTimeInterval = 0
+    nonisolated(unsafe) private var gapStartTime: CFTimeInterval = 0
     nonisolated(unsafe) private var reorderBuffer: [UInt64: (MTLTexture?, CVPixelBuffer?, RawFrameData)] = [:]
 
     nonisolated(unsafe) private var activeEncodeWidth = 2016
@@ -1349,7 +1350,7 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
         case .sLog3Approx:
             cMatrix = latestSGamutMatrix ?? WhiteBalanceParams.defaultSensorToSGamut3Cine
         }
-        metalPipeline?.headroomScale = 1.0
+        metalPipeline?.headroomScale = LogCurve.defaultRMax(for: selectedCurve)
         metalPipeline?.wbParams = WhiteBalanceParams(
             gains: SIMD3<Float>(
                 max(gains.redGain / g, 0.01),
@@ -1534,6 +1535,7 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
                 nextDispatchSequenceID = 0
                 nextOutputSequenceID = 0
                 lastOutputSequenceTime = CACurrentMediaTime()
+                gapStartTime = 0
                 reorderBuffer.removeAll()
             }
             frameIndex = 0
@@ -1631,6 +1633,7 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
                 }
             }
             lastOutputSequenceTime = 0
+            gapStartTime = 0
             return rem
         }
 
@@ -2059,10 +2062,10 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
             pipeline.headroomScale = 1.0
         case .appleLog2:
             cMatrix = latestColorMatrix ?? WhiteBalanceParams.defaultSensorToBT2020
-            pipeline.headroomScale = 1.0
+            pipeline.headroomScale = LogCurve.defaultRMax(for: .appleLog2)
         case .sLog3Approx:
             cMatrix = latestSGamutMatrix ?? WhiteBalanceParams.defaultSensorToSGamut3Cine
-            pipeline.headroomScale = 1.0
+            pipeline.headroomScale = LogCurve.defaultRMax(for: .sLog3Approx)
         }
 
         if pipeline.isAutoWBEnabled, let gains = frameData.whiteBalanceGains {
@@ -2186,30 +2189,37 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
         // freeSlots.count could become artificially high, triggering premature
         // gap-skip and permanently discarding in-flight frames.
         let readyFrames: [(MTLTexture, CVPixelBuffer?, RawFrameData)] = processLock.withLock {
-            if let framed {
+            if frameData.sequenceID < nextOutputSequenceID {
+                // Stale frame after timeout skip — do not insert into reorderBuffer!
+            } else if let framed {
                 reorderBuffer[frameData.sequenceID] = (framed, bgraPB, frameData)
             } else {
-                // If this frame failed, insert a placeholder or advance
                 if frameData.sequenceID == nextOutputSequenceID {
                     nextOutputSequenceID &+= 1
-                    lastOutputSequenceTime = CACurrentMediaTime()
-                } else if frameData.sequenceID > nextOutputSequenceID {
-                    // Mark as failed placeholder so sequencer doesn't stall when reaching it
+                    gapStartTime = 0
+                } else {
                     reorderBuffer[frameData.sequenceID] = (nil, nil, frameData)
                 }
+            }
+
+            // Prune any stray keys older than nextOutputSequenceID
+            if reorderBuffer.keys.contains(where: { $0 < nextOutputSequenceID }) {
+                reorderBuffer = reorderBuffer.filter { $0.key >= nextOutputSequenceID }
             }
 
             // Gap watchdog: Only advance nextOutputSequenceID if a missing frame has genuinely timed out (>= 250ms).
             // Under normal operation, GPU compute slots finish within 2-5ms, so valid in-flight frames are NEVER skipped.
             if let minKey = reorderBuffer.keys.min(), minKey > nextOutputSequenceID {
                 let now = CACurrentMediaTime()
-                if lastOutputSequenceTime == 0 {
-                    lastOutputSequenceTime = now
-                } else if now - lastOutputSequenceTime >= 0.25 {
+                if gapStartTime == 0 {
+                    gapStartTime = now
+                } else if now - gapStartTime >= 0.25 {
                     print("[CameraViewModel] Sequencer timeout: advancing from \(nextOutputSequenceID) to \(minKey)")
                     nextOutputSequenceID = minKey
-                    lastOutputSequenceTime = now
+                    gapStartTime = 0
                 }
+            } else {
+                gapStartTime = 0
             }
 
             var ready: [(MTLTexture, CVPixelBuffer?, RawFrameData)] = []
@@ -2218,7 +2228,7 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
                     ready.append((tex, next.1, next.2))
                 }
                 nextOutputSequenceID &+= 1
-                lastOutputSequenceTime = CACurrentMediaTime()
+                gapStartTime = 0
             }
             return ready
         }

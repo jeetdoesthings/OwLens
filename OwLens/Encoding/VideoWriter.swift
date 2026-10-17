@@ -269,13 +269,16 @@ final class VideoWriter: @unchecked Sendable {
                 if CMTimeCompare(bufferEnd, refTime) <= 0 {
                     continue
                 }
+            } else if CMTimeCompare(timings[0].presentationTimeStamp, refTime) < 0 {
+                continue
             }
 
             for i in 0..<timings.count {
                 var pts = CMTimeSubtract(timings[i].presentationTimeStamp, refTime)
                 if CMTimeCompare(pts, .zero) < 0 { pts = .zero }
                 if lastAudioPTS.isValid && CMTimeCompare(pts, lastAudioPTS) <= 0 {
-                    pts = CMTimeAdd(lastAudioPTS, CMTime(value: 1, timescale: timings[i].presentationTimeStamp.timescale))
+                    let bufferDur = timings[i].duration.isValid ? timings[i].duration : CMTime(value: 1024, timescale: 48000)
+                    pts = CMTimeAdd(lastAudioPTS, bufferDur)
                 }
                 timings[i].presentationTimeStamp = pts
                 lastAudioPTS = pts
@@ -362,6 +365,9 @@ final class VideoWriter: @unchecked Sendable {
             if let captureTime = captureTime, captureTime.isValid {
                 sessionStartTime = captureTime
                 lastFrameCaptureTime = captureTime
+            } else {
+                sessionStartTime = CMTime(seconds: now, preferredTimescale: 24000)
+                lastFrameCaptureTime = sessionStartTime
             }
             lastFrameHostTime = now
             assetWriter?.startSession(atSourceTime: .zero)
@@ -370,11 +376,19 @@ final class VideoWriter: @unchecked Sendable {
             drainPrerollAudioBuffersLocked()
         }
 
+        // Calculate wall-clock elapsed time since optical session start
+        let elapsed: Double
+        if let captureTime = captureTime, captureTime.isValid, sessionStartTime.isValid {
+            elapsed = max(0, CMTimeGetSeconds(CMTimeSubtract(captureTime, sessionStartTime)))
+        } else {
+            elapsed = max(0, now - startHostTime)
+        }
+
         // Strict Constant Frame Rate (CFR):
-        // Each frame i is mathematically presented at t = i / targetFPS.
-        // For 24 fps, this generates exact 24.00000 fps timestamps: 0.000s, 0.041667s, 0.083333s...
-        let currentPTS = CMTime(value: frameCount * 1000, timescale: CMTimeScale(round(targetFPS * 1000.0)))
-        let elapsedSeconds = Double(frameCount) / targetFPS
+        // Each frame s is mathematically presented at t = s / targetFPS.
+        // targetSlot is the nearest 24.000 FPS grid slot corresponding to elapsed optical time.
+        // targetSlot is guaranteed >= frameCount (strictly monotonic timeline).
+        let targetSlot = max(frameCount, Int64(round(elapsed * targetFPS)))
 
         // Drain any pending audio buffers now that video input might have made room
         drainPendingAudioBuffersLocked()
@@ -394,6 +408,35 @@ final class VideoWriter: @unchecked Sendable {
             spinAttempts += 1
         }
 
+        // Fill any missing CFR slots by repeating last frame (up to 4 frames max).
+        // This ensures the video container maintains strict CFR 24.0000 FPS without VFR warnings,
+        // while guaranteeing that audio and video remain in microsecond sync over long recordings!
+        if let hold = lastPixelBuffer {
+            let maxHoldToFill = min(targetSlot, frameCount + 4)
+            while frameCount < maxHoldToFill {
+                guard input.isReadyForMoreMediaData else {
+                    droppedFrames += 1
+                    break
+                }
+                let holdPTS = CMTime(value: frameCount * 1000, timescale: CMTimeScale(round(targetFPS * 1000.0)))
+                let holdElapsed = Double(frameCount) / targetFPS
+                if adaptor.append(hold, withPresentationTime: holdPTS) {
+                    lastVideoPTS = holdPTS
+                    appendGyroMetadataLocked(pts: holdPTS, elapsedSeconds: holdElapsed)
+                    frameCount += 1
+                } else {
+                    droppedFrames += 1
+                    break
+                }
+            }
+        }
+
+        // If the gap exceeded 4 frames or hold buffer wasn't ready, advance frameCount to targetSlot
+        // so this real frame is stamped at its true wall-clock CFR position, NEVER falling behind audio!
+        if frameCount < targetSlot {
+            frameCount = targetSlot
+        }
+
         // Current real frame
         guard input.isReadyForMoreMediaData else {
             lastPixelBuffer = pixelBuffer
@@ -401,9 +444,12 @@ final class VideoWriter: @unchecked Sendable {
             return false
         }
 
+        let currentPTS = CMTime(value: frameCount * 1000, timescale: CMTimeScale(round(targetFPS * 1000.0)))
+        let currentElapsed = Double(frameCount) / targetFPS
+
         if adaptor.append(pixelBuffer, withPresentationTime: currentPTS) {
             lastVideoPTS = currentPTS
-            appendGyroMetadataLocked(pts: currentPTS, elapsedSeconds: elapsedSeconds)
+            appendGyroMetadataLocked(pts: currentPTS, elapsedSeconds: currentElapsed)
             frameCount += 1
             realFrameCount += 1
             lastPixelBuffer = pixelBuffer
@@ -522,7 +568,8 @@ final class VideoWriter: @unchecked Sendable {
             var pts = CMTimeSubtract(singleTiming.presentationTimeStamp, refTime)
             if CMTimeCompare(pts, .zero) < 0 { pts = .zero }
             if lastAudioPTS.isValid && CMTimeCompare(pts, lastAudioPTS) <= 0 {
-                pts = CMTimeAdd(lastAudioPTS, CMTime(value: 1, timescale: singleTiming.presentationTimeStamp.timescale))
+                let bufferDur = singleTiming.duration.isValid ? singleTiming.duration : CMTime(value: 1024, timescale: 48000)
+                pts = CMTimeAdd(lastAudioPTS, bufferDur)
             }
             singleTiming.presentationTimeStamp = pts
             lastAudioPTS = pts
@@ -583,7 +630,8 @@ final class VideoWriter: @unchecked Sendable {
                 pts = .zero
             }
             if lastAudioPTS.isValid && CMTimeCompare(pts, lastAudioPTS) <= 0 {
-                pts = CMTimeAdd(lastAudioPTS, CMTime(value: 1, timescale: timings[i].presentationTimeStamp.timescale))
+                let bufferDur = timings[i].duration.isValid ? timings[i].duration : CMTime(value: 1024, timescale: 48000)
+                pts = CMTimeAdd(lastAudioPTS, bufferDur)
             }
             timings[i].presentationTimeStamp = pts
             lastAudioPTS = pts

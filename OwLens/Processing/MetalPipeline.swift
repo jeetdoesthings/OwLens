@@ -214,11 +214,11 @@ final class MetalPipeline: @unchecked Sendable {
 
     var curveType: LogCurveType = .sLog3Approx {
         didSet {
-            headroomScale = 1.0
+            headroomScale = LogCurve.defaultRMax(for: curveType)
         }
     }
-    /// Scene reflectance headroom multiplier (1.0 preserves exact standard scene reflectance).
-    var headroomScale: Float = 1.0
+    /// Scene reflectance headroom multiplier: sensor [0, 1] -> R [0, headroomScale].
+    var headroomScale: Float = LogCurve.defaultRMax(for: .sLog3Approx)
     var wbParams: WhiteBalanceParams = .identity
     var bayerPattern: Int32 = 0
     var blackLevel: Float = 0
@@ -673,9 +673,11 @@ final class MetalPipeline: @unchecked Sendable {
             bayerH = fullH
         }
 
-        // Defect pixel correction: skipped when CFA binning is active because 2x2 averaging
-        // naturally cancels isolated hot/stuck pixels without an extra GPU round-trip.
-        if !canReduceRaw && bayerW <= 3000 {
+        // Defect pixel correction: eliminates hot/stuck sensor photosites using an adaptive
+        // 4-element sorting network median filter. Runs for recording to ensure pristine masters,
+        // and whenever unbinned Bayer is processed.
+        let shouldRunDPC = (processingQuality == .recordQuality || !canReduceRaw) && bayerW <= 4096
+        if shouldRunDPC {
             // Defect pixel correction operates on (possibly binned) Bayer data.
             guard let correctedBayerPass = getOrCreateCorrectedBayerTexture(width: bayerW, height: bayerH, slot: slot),
                   let encDPC = commandBuffer.makeComputeCommandEncoder() else { completion(nil, nil); return }

@@ -56,6 +56,30 @@ enum VideoCodecOption: String, CaseIterable, Identifiable {
         case .proRes422HQ: return .proRes422HQ
         }
     }
+
+    /// Dynamically detects if the iOS device hardware encoder supports Apple ProRes.
+    /// ProRes hardware encoding is available on A15 Bionic and later (iPhone 13 Pro+, iPhone 14 Pro+, iPhone 15/15 Pro+, iPhone 16/16 Pro+).
+    static let isProResSupported: Bool = {
+        if #available(iOS 15.0, *) {
+            let testInput = AVAssetWriterInput(mediaType: .video, outputSettings: [
+                AVVideoCodecKey: AVVideoCodecType.proRes422,
+                AVVideoWidthKey: 1920,
+                AVVideoHeightKey: 1080
+            ])
+            if let dummyWriter = try? AVAssetWriter(outputURL: URL(fileURLWithPath: "/dev/null"), fileType: .mov) {
+                return dummyWriter.canAdd(testInput)
+            }
+        }
+        return false
+    }()
+
+    static var availableCases: [VideoCodecOption] {
+        if isProResSupported {
+            return [.hevc, .proRes422, .proRes422HQ]
+        } else {
+            return [.hevc]
+        }
+    }
 }
 
 // MARK: - LSCCoefficients
