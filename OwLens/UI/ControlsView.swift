@@ -345,7 +345,35 @@ struct ControlsView: View {
             }
             .disabled(isTopLocked)
             .opacity(isTopLocked ? 0.4 : 1.0)
+
+            // Denoise Selector Button (Tap opens drawer)
+            denoisePill
         }
+    }
+
+    private var denoisePill: some View {
+        Button {
+            guard !isTopLocked else { return }
+            Haptics.selection()
+            viewModel.togglePanel(.denoise)
+        } label: {
+            HStack(spacing: 4) {
+                Image(systemName: "sparkles")
+                    .font(.system(size: 9, weight: .semibold))
+                Text(viewModel.denoiseStrength > 0.001 ? "DN \(String(format: "%.1f", viewModel.denoiseStrength))" : "DN OFF")
+                    .font(.appMono(.bold, size: 9))
+                    .lineLimit(1)
+                    .fixedSize()
+            }
+            .foregroundColor(isTopLocked ? OwLensTheme.textDisabled : (viewModel.denoiseStrength > 0.001 ? OwLensTheme.accent : OwLensTheme.textSecondary))
+            .padding(.horizontal, 7)
+            .frame(height: 30)
+            .glassPanel(cornerRadius: OwLensTheme.radiusCard)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .disabled(isTopLocked)
+        .opacity(isTopLocked ? 0.4 : 1.0)
     }
 
     private var lensSwitcherPill: some View {
@@ -381,14 +409,6 @@ struct ControlsView: View {
 
     private var rightStatusGroup: some View {
         HStack(spacing: 6) {
-            // Informational only — 24 fps is fixed for RAW capture and is not a control.
-            Text("24 FPS")
-                .font(.appMono(.bold, size: 9))
-                .foregroundColor(OwLensTheme.textSecondary)
-                .lineLimit(1)
-                .fixedSize()
-                .allowsHitTesting(false)
-
             timeIndicator
 
             batteryIndicator
@@ -702,6 +722,9 @@ struct ControlsView: View {
 
             case .logCurve:
                 logCurveDrawerContent
+
+            case .denoise:
+                denoiseDrawerContent
             }
         }
         .padding(12)
@@ -763,6 +786,37 @@ struct ControlsView: View {
                         .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
+                }
+            }
+        }
+    }
+
+    private var denoiseDrawerContent: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            drawerHeader(title: "NOISE REDUCTION")
+
+            VStack(alignment: .leading, spacing: 8) {
+                HStack {
+                    Text("DENOISE STRENGTH")
+                        .font(.appMono(.medium, size: 8))
+                        .foregroundColor(OwLensTheme.textMuted)
+                    Spacer()
+                    Text(viewModel.denoiseStrength <= 0.001 ? "OFF" : String(format: "%.2f", viewModel.denoiseStrength))
+                        .font(.appMono(.bold, size: 10))
+                        .foregroundColor(viewModel.denoiseStrength > 0.001 ? OwLensTheme.accent : OwLensTheme.textMuted)
+                }
+
+                HStack(spacing: 10) {
+                    Text("0.0")
+                        .font(.appMono(.regular, size: 9))
+                        .foregroundColor(OwLensTheme.textMuted)
+
+                    Slider(value: $viewModel.denoiseStrength, in: 0.0...1.0, step: 0.05)
+                        .tint(OwLensTheme.accent)
+
+                    Text("1.0")
+                        .font(.appMono(.regular, size: 9))
+                        .foregroundColor(OwLensTheme.textMuted)
                 }
             }
         }
@@ -1001,7 +1055,6 @@ struct ControlsView: View {
                     }
                 }
             }
-
         }
     }
 

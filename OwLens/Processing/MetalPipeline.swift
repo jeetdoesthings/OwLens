@@ -24,6 +24,7 @@ struct DebayerParams {
 struct DefectPixelParams {
     var shotCoeff: Float
     var readCoeff: Float
+    var denoiseStrength: Float
 }
 
 struct WhiteBalanceParams {
@@ -108,6 +109,7 @@ final class MetalPipeline: @unchecked Sendable {
     private let convertFormatPipeline: MTLComputePipelineState
     private let convertYpCbCr10Pipeline: MTLComputePipelineState
     private let cropAndResamplePipeline: MTLComputePipelineState
+    private let cropAndResampleBicubicPipeline: MTLComputePipelineState
     private let unsharpPipeline: MTLComputePipelineState
     private let defectPixelPipeline: MTLComputePipelineState
     private let binThreads: MTLSize
@@ -115,6 +117,7 @@ final class MetalPipeline: @unchecked Sendable {
     private let convertFormatThreads: MTLSize
     private let convertYpCbCr10Threads: MTLSize
     private let cropAndResampleThreads: MTLSize
+    private let cropAndResampleBicubicThreads: MTLSize
     private let unsharpThreads: MTLSize
     private let defectPixelThreads: MTLSize
     private var textureCache: CVMetalTextureCache?
@@ -239,6 +242,9 @@ final class MetalPipeline: @unchecked Sendable {
     /// Device thermal state for dynamic workload shedding (.serious / .critical).
     var thermalState: ProcessInfo.ThermalState = .nominal
 
+    /// Sensor noise reduction strength (0.0 = raw grain, 1.0 = clean calibrated denoising).
+    var denoiseStrength: Float = 1.0
+
     /// Adaptive edge sharpness strength (0.0 = off, 0.5 = natural cinema sharpness, 1.0 = sharp).
     var sharpnessStrength: Float = 0.5
 
@@ -255,7 +261,8 @@ final class MetalPipeline: @unchecked Sendable {
               let convertYpCbCr10Func = library.makeFunction(name: "convertRgbTo420YpCbCr10"),
               let defectPixelFunc = library.makeFunction(name: "correctDefectPixelsBayer"),
               let unsharpFunc = library.makeFunction(name: "unsharpMaskAdaptive"),
-              let cropAndResampleFunc = library.makeFunction(name: "cropAndResampleBilinear") else {
+              let cropAndResampleFunc = library.makeFunction(name: "cropAndResampleBilinear"),
+              let cropAndResampleBicubicFunc = library.makeFunction(name: "cropAndResampleBicubic") else {
             return nil
         }
         guard let scopeQueue = device.makeCommandQueue() else { return nil }
@@ -269,6 +276,7 @@ final class MetalPipeline: @unchecked Sendable {
             let convertFormat = try device.makeComputePipelineState(function: convertFormatFunc)
             let convertYp = try device.makeComputePipelineState(function: convertYpCbCr10Func)
             let crop = try device.makeComputePipelineState(function: cropAndResampleFunc)
+            let cropBicubic = try device.makeComputePipelineState(function: cropAndResampleBicubicFunc)
             let defect = try device.makeComputePipelineState(function: defectPixelFunc)
 
             self.binPipeline = bin
@@ -277,6 +285,7 @@ final class MetalPipeline: @unchecked Sendable {
             self.convertFormatPipeline = convertFormat
             self.convertYpCbCr10Pipeline = convertYp
             self.cropAndResamplePipeline = crop
+            self.cropAndResampleBicubicPipeline = cropBicubic
             self.defectPixelPipeline = defect
 
             self.binThreads = Self.computeThreadsPerGroup(for: bin)
@@ -285,6 +294,7 @@ final class MetalPipeline: @unchecked Sendable {
             self.convertFormatThreads = Self.computeThreadsPerGroup(for: convertFormat)
             self.convertYpCbCr10Threads = Self.computeThreadsPerGroup(for: convertYp)
             self.cropAndResampleThreads = Self.computeThreadsPerGroup(for: crop)
+            self.cropAndResampleBicubicThreads = Self.computeThreadsPerGroup(for: cropBicubic)
             self.defectPixelThreads = Self.computeThreadsPerGroup(for: defect)
         } catch {
             print("[MetalPipeline] Failed to create compute pipelines: \(error)")
@@ -455,8 +465,8 @@ final class MetalPipeline: @unchecked Sendable {
             ? kCVPixelFormatType_32BGRA
             : kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
         _ = getOrCreatePixelBuffer(width: width, height: height, format: format)
-        let bW = pooledBinW[0] > 0 ? pooledBinW[0] : 2016
-        let bH = pooledBinH[0] > 0 ? pooledBinH[0] : 1512
+        let bW = pooledBinW[0] > 0 ? pooledBinW[0] : 4032
+        let bH = pooledBinH[0] > 0 ? pooledBinH[0] : 3024
         for s in 0..<poolSlotCount {
             _ = getOrCreateBinTexture(width: bW, height: bH, slot: s)
             _ = getOrCreateCorrectedBayerTexture(width: bW, height: bH, slot: s)
@@ -645,18 +655,19 @@ final class MetalPipeline: @unchecked Sendable {
 
         guard let commandBuffer = commandQueue.makeCommandBuffer() else { completion(nil, nil); return }
 
-        // Phase-preserving 2x2 CFA sensor binning (averages 4 identical-color photosites in each 4x4 block).
-        // For Open Gate (2016x1512) and 1080p (1920x1080), half-resolution (2016x1512) matches or exceeds the
-        // container resolution (3.05 MP >= 2.76 MP), so binning provides pristine 1:1 optical sampling,
-        // boosts SNR by +6 dB (halving noise variance in Log shadows), eliminates Bayer moiré,
-        // and maintains smooth real-time 30 fps playback.
+        // Sensor Sampling & Demosaic Pipeline:
+        // Full 12MP optical demosaicing + Catmull-Rom downscaling delivers pristine 2x super-sampled
+        // oversampling with maximum MTF, natural micro-contrast, zero Bayer moiré, and razor-sharp edges.
+        // Pre-binning (binBayerCFA) is strictly reserved as an automatic thermal fail-safe if device thermal state
+        // elevates to .serious or .critical.
         var bayerIn: MTLTexture
         let bayerW: Int
         let bayerH: Int
         let halfW = (fullW / 2) & ~1
         let halfH = (fullH / 2) & ~1
-        let canReduceRaw = (halfW >= encodeWidth && halfH >= encodeHeight)
-        if canReduceRaw {
+        let isThermalCritical = (thermalState == .critical || thermalState == .serious)
+        let shouldBinRaw = isThermalCritical && (halfW >= encodeWidth && halfH >= encodeHeight)
+        if shouldBinRaw {
             guard let halfTex = getOrCreateBinTexture(width: halfW, height: halfH, slot: slot),
                   let enc = commandBuffer.makeComputeCommandEncoder() else { completion(nil, nil); return }
             enc.setComputePipelineState(binPipeline)
@@ -674,9 +685,8 @@ final class MetalPipeline: @unchecked Sendable {
         }
 
         // Defect pixel correction: eliminates hot/stuck sensor photosites using an adaptive
-        // 4-element sorting network median filter. Runs for recording to ensure pristine masters,
-        // and whenever unbinned Bayer is processed.
-        let shouldRunDPC = (processingQuality == .recordQuality || !canReduceRaw) && bayerW <= 4096
+        // 4-element sorting network median filter. Runs when denoiseStrength > 0 and not in critical thermal state.
+        let shouldRunDPC = (processingQuality == .recordQuality || !isThermalCritical) && bayerW <= 4096 && denoiseStrength > 0.001
         if shouldRunDPC {
             // Defect pixel correction operates on (possibly binned) Bayer data.
             guard let correctedBayerPass = getOrCreateCorrectedBayerTexture(width: bayerW, height: bayerH, slot: slot),
@@ -690,7 +700,7 @@ final class MetalPipeline: @unchecked Sendable {
                 whiteLevel: max(whiteLevel, blackLevel + 1e-6),
                 lscCoefficients: lscCoefficients
             )
-            var defectNoiseParams = DefectPixelParams(shotCoeff: noiseShotCoeff, readCoeff: noiseReadCoeff)
+            var defectNoiseParams = DefectPixelParams(shotCoeff: noiseShotCoeff, readCoeff: noiseReadCoeff, denoiseStrength: denoiseStrength)
             encDPC.setBytes(&debayerParams, length: MemoryLayout<DebayerParams>.stride, index: 0)
             encDPC.setBytes(&defectNoiseParams, length: MemoryLayout<DefectPixelParams>.stride, index: 1)
             dispatch(encDPC, width: bayerW, height: bayerH, threadsPerGroup: defectPixelThreads)
@@ -739,10 +749,11 @@ final class MetalPipeline: @unchecked Sendable {
         ) ?? fusedOut
 
         // Adaptive unsharp masking executed on target resolution post-crop/scale.
-        // Runs for recording to deliver cinema-grade detail, and safely bypassed in previewFast
-        // (and during elevated thermal states) to save ~2ms of GPU time and ~100MB/s memory traffic.
+        // Runs for recording and preview (when not thermally throttled) to deliver true WYSIWYG
+        // cinema-grade acutance and edge sharpness.
+        let canSharpen = sharpnessStrength > 0.001 && (processingQuality == .recordQuality || !isThermalCritical)
         let finalTex: MTLTexture
-        if processingQuality == .recordQuality && sharpnessStrength > 0.001,
+        if canSharpen,
            let sTex = getOrCreateSharpenTexture(width: scaledTex.width, height: scaledTex.height, slot: slot),
            let enc = commandBuffer.makeComputeCommandEncoder() {
             enc.setComputePipelineState(unsharpPipeline)
@@ -865,12 +876,17 @@ final class MetalPipeline: @unchecked Sendable {
         let startX = originX + 0.5 * scaleX
         let startY = originY + 0.5 * scaleY
 
-        enc.setComputePipelineState(cropAndResamplePipeline)
+        let isThermalCritical = (thermalState == .critical || thermalState == .serious)
+        let useBicubic = !isThermalCritical && (srcW > targetWidth || srcH > targetHeight)
+        let pipeline = useBicubic ? cropAndResampleBicubicPipeline : cropAndResamplePipeline
+        let threads = useBicubic ? cropAndResampleBicubicThreads : cropAndResampleThreads
+
+        enc.setComputePipelineState(pipeline)
         enc.setTexture(texture, index: 0)
         enc.setTexture(dst, index: 1)
         var params = CropParams(scaleX: scaleX, scaleY: scaleY, startX: startX, startY: startY, flip180: flip180 ? 1 : 0)
         enc.setBytes(&params, length: MemoryLayout<CropParams>.stride, index: 0)
-        dispatch(enc, width: targetWidth, height: targetHeight, threadsPerGroup: cropAndResampleThreads)
+        dispatch(enc, width: targetWidth, height: targetHeight, threadsPerGroup: threads)
         enc.endEncoding()
 
         return dst

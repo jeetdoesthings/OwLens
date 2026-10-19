@@ -18,6 +18,7 @@ struct DebayerParams {
 struct DefectPixelParams {
     float shotCoeff;
     float readCoeff;
+    float denoiseStrength;
 };
 
 struct WhiteBalanceParams {
@@ -50,6 +51,10 @@ kernel void correctDefectPixelsBayer(
     if (gid.x >= dst.get_width() || gid.y >= dst.get_height()) return;
 
     float center = src.read(gid).r;
+    if (noise.denoiseStrength <= 0.001f) {
+        dst.write(float4(center, 0.0f, 0.0f, 1.0f), gid);
+        return;
+    }
 
     // Direct O(1) unrolled sampling of true same-color Bayer neighbors (distance 2 cross)
     // with boundary reflection preserving exact Bayer CFA phase parity.
@@ -74,7 +79,7 @@ kernel void correctDefectPixelsBayer(
 
     float signalNorm = saturate(center / params.whiteLevel);
     float sigmaRaw = sqrt(noise.shotCoeff * signalNorm + noise.readCoeff) * params.whiteLevel;
-    float threshold = 5.0f * max(sigmaRaw, 1e-3f);
+    float threshold = (5.0f / max(noise.denoiseStrength, 0.2f)) * max(sigmaRaw, 1e-3f);
 
     float out = (abs(center - median) > threshold) ? median : center;
     dst.write(float4(out, 0.0f, 0.0f, 1.0f), gid);
@@ -109,24 +114,17 @@ kernel void binBayerCFA(
 }
 
 
-// Smooth filmic highlight shoulder mapping sensor linear [0, 1] to scene reflectance [0, rMax].
-// Preserves 100% linear calibration for midtones & shadows (r <= rKnee),
-// with C1 continuity at rKnee.
+// Smooth filmic rational highlight shoulder mapping sensor linear to scene reflectance.
+// Preserves 100% linear calibration for midtones & diffuse whites (r <= rKnee = 0.90),
+// with exact C1 first-derivative continuity and asymptotic roll-off to rMax.
 static inline float applyHighlightShoulderMetal(float r, float rKnee, float rMax) {
     if (rMax <= rKnee + 1e-4f) return r;
     if (r <= rKnee) return r;
 
-    float delta = rMax - rKnee;
-    float dr = 1.0f - rKnee;
-    float s0 = dr / delta;
-    float s1 = 0.0f;
-    float a = s1 + s0 - 2.0f;
-    float b = 3.0f - 2.0f * s0 - s1;
-    float c = s0;
-
-    float t = clamp((r - rKnee) / max(dr, 1e-4f), 0.0f, 1.0f);
-    float g = ((a * t + b) * t + c) * t;
-    return rKnee + delta * g;
+    float x = r - rKnee;
+    float H = rMax - rKnee;
+    // Asymptotic rational shoulder: exact f'(rKnee) = 1.0, f(r) -> rMax as r -> inf
+    return rKnee + H * (x / (x + H));
 }
 
 static inline float3 applyHighlightShoulder3(float3 rgb, float rKnee, float rMax) {
@@ -144,7 +142,7 @@ static inline float3 encodeLogCurve(float3 rgb, int curveType, float headroomSca
     }
 
     if (headroomScale > 1.0f) {
-        rgb = applyHighlightShoulder3(rgb, 0.36f, headroomScale);
+        rgb = applyHighlightShoulder3(rgb, 0.90f, headroomScale);
     }
 
     if (curveType == 3) {
@@ -350,15 +348,15 @@ kernel void debayerFusedLog(
     rgb = colorMatrix * rgb;
     rgb = max(rgb, float3(0.0));
 
-    // Clipping flag and smooth highlight desaturation on raw demosaiced photosites (sensor saturation)
-    // Evaluated on native sensor DNs before LSC/WB so that lens vignetting gains never bleach corner colors.
+    // Clipping flag and subtle organic highlight desaturation only on extreme physical sensor saturation.
+    // Preserves rich color (skies, sunsets, lamps, skin tones) while preventing channel blowout artifacts.
     float rawPeak = max(r, max(g, b));
-    bool isClipped = (rawPeak >= 0.98f);
+    bool isClipped = (rawPeak >= 0.985f);
     float alpha = isClipped ? 0.0f : 1.0f;
 
-    if (rawPeak >= 0.92f) {
-        float u = clamp((rawPeak - 0.92f) * 12.5f, 0.0f, 1.0f);
-        float desat = u * u * (3.0f - 2.0f * u);
+    if (rawPeak >= 0.98f) {
+        float u = clamp((rawPeak - 0.98f) * 50.0f, 0.0f, 1.0f);
+        float desat = u * u * 0.35f; // Gentle 35% max desaturation at extreme edge
         float luma = dot(rgb, float3(0.2627f, 0.6780f, 0.0593f));
         rgb = mix(rgb, float3(luma), desat);
     }
@@ -520,14 +518,14 @@ kernel void unsharpMaskAdaptive(
     float3 highPass = center.rgb - blur;
     float detailLuma = abs(dot(highPass, float3(0.2627f, 0.6780f, 0.0593f)));
 
-    // Adaptive coring: only sharpen true edge detail, not low-amplitude shadow noise
-    float coringThreshold = 0.006f;
-    float coringFactor = smoothstep(0.001f, coringThreshold, detailLuma);
+    // Adaptive coring: only sharpen true edge detail & micro-texture, rejecting sub-visual sensor noise
+    float coringThreshold = 0.0025f;
+    float coringFactor = smoothstep(0.0004f, coringThreshold, detailLuma);
 
-    // Suppress sharpening in deep shadows where the log transfer function has high derivative
-    // to prevent noise floor amplification, while delivering crisp cinema sharpness to midtones and highlights.
+    // Suppress sharpening in deep noise floor below log pedestal (< 0.08)
+    // while delivering crisp cinema sharpness to shadows, midtones, and highlights (>= 0.20).
     float centerLuma = dot(center.rgb, float3(0.2627f, 0.6780f, 0.0593f));
-    float shadowMask = smoothstep(0.18f, 0.38f, centerLuma);
+    float shadowMask = smoothstep(0.08f, 0.20f, centerLuma);
 
     float3 sharpened = center.rgb + highPass * (strength * coringFactor * shadowMask);
     sharpened = max(sharpened, float3(0.0f));
@@ -745,4 +743,63 @@ kernel void cropAndResampleBilinear(
     float srcY = metal::fma(effectiveY, crop.scaleY, crop.startY);
 
     dst.write(src.sample(s, float2(srcX, srcY)), gid);
+}
+
+
+// ──────────────────────────────────────────────────────────────────────
+// FAST 5-TAP CATMULL-ROM BICUBIC RESAMPLE
+// Hardware-accelerated bicubic filter using 5 bilinear texture fetches.
+// Preserves edge acutance, fine micro-textures, and eliminates bilinear softening.
+// ──────────────────────────────────────────────────────────────────────
+static inline float4 sampleCatmullRomNorm(texture2d<float, access::sample> tex, sampler s, float2 uv) {
+    float2 texSize = float2(tex.get_width(), tex.get_height());
+    float2 samplePos = uv * texSize - 0.5f;
+    float2 tc = floor(samplePos);
+    float2 f = samplePos - tc;
+
+    float2 w0 = f * (-0.5f + f * (1.0f - 0.5f * f));
+    float2 w1 = 1.0f + f * f * (-2.5f + 1.5f * f);
+    float2 w2 = f * (0.5f + f * (2.0f - 1.5f * f));
+    float2 w3 = f * f * (-0.5f + 0.5f * f);
+
+    float2 w12 = w1 + w2;
+    float2 tc12 = tc + 1.0f + w2 / max(w12, 1e-5f);
+    float2 tc0 = tc - 0.5f;
+    float2 tc3 = tc + 2.5f;
+
+    float2 invSize = 1.0f / texSize;
+    float4 c0 = tex.sample(s, (float2(tc12.x, tc0.y) + 0.5f) * invSize);
+    float4 c1 = tex.sample(s, (float2(tc0.x, tc12.y) + 0.5f) * invSize);
+    float4 c2 = tex.sample(s, (float2(tc12.x, tc12.y) + 0.5f) * invSize);
+    float4 c3 = tex.sample(s, (float2(tc3.x, tc12.y) + 0.5f) * invSize);
+    float4 c4 = tex.sample(s, (float2(tc12.x, tc3.y) + 0.5f) * invSize);
+
+    float4 res = c2 * (w12.x * w12.y) +
+                 c0 * (w12.x * w0.y) +
+                 c1 * (w0.x * w12.y) +
+                 c3 * (w3.x * w12.y) +
+                 c4 * (w12.x * w3.y);
+    float totalW = (w12.x * w12.y) + (w12.x * w0.y) + (w0.x * w12.y) + (w3.x * w12.y) + (w12.x * w3.y);
+    float4 finalCol = res / max(totalW, 1e-4f);
+    return max(finalCol, float4(0.0f));
+}
+
+kernel void cropAndResampleBicubic(
+    texture2d<float, access::sample> src [[texture(0)]],
+    texture2d<float, access::write>  dst [[texture(1)]],
+    constant CropParams &crop            [[buffer(0)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    if (gid.x >= dst.get_width() || gid.y >= dst.get_height()) return;
+
+    constexpr sampler s(coord::normalized, address::clamp_to_edge, filter::linear);
+
+    float effectiveX = crop.flip180 ? float(dst.get_width() - 1 - gid.x) : float(gid.x);
+    float effectiveY = crop.flip180 ? float(dst.get_height() - 1 - gid.y) : float(gid.y);
+
+    float srcX = metal::fma(effectiveX, crop.scaleX, crop.startX);
+    float srcY = metal::fma(effectiveY, crop.scaleY, crop.startY);
+    float2 normUV = float2(srcX / float(src.get_width()), srcY / float(src.get_height()));
+
+    dst.write(sampleCatmullRomNorm(src, s, normUV), gid);
 }

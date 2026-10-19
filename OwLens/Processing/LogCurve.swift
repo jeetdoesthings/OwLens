@@ -100,40 +100,32 @@ enum LogCurve {
         }
     }
 
-    /// Target maximum scene reflectance Rmax mapped to sensor clipping (1.0).
-    /// - Apple Log 2: R = 12.0 maps to exactly 1.0 (code 1023 / 100% IRE).
-    /// - Sony S-Log3: R = 10.0 represents 1000% reflectance (standard Sony ceiling ~85% IRE).
+    /// Target maximum scene reflectance Rmax mapped to sensor highlight ceiling.
+    /// - Apple Log 2: R = 4.5 maps to filmic ~88% IRE ceiling (leaving cushion below hard clip).
+    /// - Sony S-Log3: R = 9.0 maps to standard Sony ~85% IRE ceiling (code ~870).
     /// - Linear: R = 1.0.
     static func defaultRMax(for type: LogCurveType) -> Float {
         switch type {
         case .linear: return 1.0
-        case .appleLog2: return 12.0
-        case .sLog3Approx: return 10.0
+        case .appleLog2: return 4.5
+        case .sLog3Approx: return 9.0
         }
     }
 
-    /// Smooth filmic highlight shoulder mapping sensor linear [0, 1] to scene reflectance [0, rMax].
-    /// Perfectly preserves 100% linear calibration for midtones & shadows (r <= rKnee),
-    /// while smoothly rolling off highlights up to the container ceiling with C1 continuity.
-    static func applyHighlightShoulder(_ r: Float, rKnee: Float = 0.36, rMax: Float = 12.0) -> Float {
+    /// Smooth filmic rational highlight shoulder mapping sensor linear to scene reflectance.
+    /// Perfectly preserves 100% linear calibration for midtones & diffuse whites (r <= rKnee = 0.90),
+    /// while smoothly rolling off specular highlights up to the container ceiling with C1 continuity.
+    static func applyHighlightShoulder(_ r: Float, rKnee: Float = 0.90, rMax: Float = 4.5) -> Float {
         guard rMax > rKnee + 1e-4 else { return r }
         if r <= rKnee {
             return r
         }
-        let delta = rMax - rKnee
-        let dr = 1.0 - rKnee
-        let s0 = dr / delta
-        let s1: Float = 0.0
-        let a = s1 + s0 - 2.0
-        let b = 3.0 - 2.0 * s0 - s1
-        let c = s0
-
-        let t = simd_clamp((r - rKnee) / max(dr, 1e-4), 0.0, 1.0)
-        let g = ((a * t + b) * t + c) * t
-        return rKnee + delta * g
+        let x = r - rKnee
+        let h = rMax - rKnee
+        return rKnee + h * (x / (x + h))
     }
 
-    static func applyHighlightShoulder3(_ rgb: SIMD3<Float>, rKnee: Float = 0.36, rMax: Float = 12.0) -> SIMD3<Float> {
+    static func applyHighlightShoulder3(_ rgb: SIMD3<Float>, rKnee: Float = 0.90, rMax: Float = 4.5) -> SIMD3<Float> {
         let peak = max(rgb.x, max(rgb.y, rgb.z))
         guard rMax > rKnee + 1e-4, peak > rKnee else { return rgb }
         let peakShoulder = applyHighlightShoulder(peak, rKnee: rKnee, rMax: rMax)
@@ -144,7 +136,7 @@ enum LogCurve {
     static func apply(_ rgb: SIMD3<Float>, type: LogCurveType, headroomScale: Float = 1.0) -> SIMD3<Float> {
         var input = rgb
         if headroomScale > 1.0 {
-            input = applyHighlightShoulder3(input, rKnee: 0.36, rMax: headroomScale)
+            input = applyHighlightShoulder3(input, rKnee: 0.90, rMax: headroomScale)
         }
         switch type {
         case .linear:

@@ -111,6 +111,14 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
             refreshStatusLine()
         }
     }
+    /// User-adjustable denoise strength (0.0–1.0). Default = 1.0.
+    @Published var denoiseStrength: Float = 1.0 {
+        didSet {
+            metalPipeline?.denoiseStrength = denoiseStrength
+            UserDefaults.standard.set(denoiseStrength, forKey: "OwLens.DenoiseStrength")
+            print("[CameraViewModel] Denoise strength: \(denoiseStrength)")
+        }
+    }
     @Published private(set) var selectedSaveDestination: VideoSaveDestination = .photos
     @Published var audioSources: [AudioSourceOption] = [.none]
     @Published var selectedAudioSource: AudioSourceOption = .none {
@@ -452,7 +460,7 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
     nonisolated(unsafe) private var latestSGamutMatrix: simd_float3x3?
 
     enum ControlPanel: String, Identifiable {
-        case exposure, iso, shutter, wb, focus, format, bitrate, mic, lens, save, logCurve
+        case exposure, iso, shutter, wb, focus, format, bitrate, denoise, mic, lens, save, logCurve
         var id: String { rawValue }
     }
 
@@ -468,6 +476,12 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
         // Automated unit tests and benchmarks are invoked via test suites rather than on camera startup.
 #endif
         loadFilesFolderBookmark()
+        if let savedDenoise = UserDefaults.standard.object(forKey: "OwLens.DenoiseStrength") as? Float {
+            denoiseStrength = savedDenoise
+        } else {
+            denoiseStrength = 1.0
+        }
+        metalPipeline?.denoiseStrength = denoiseStrength
         metalPipeline?.curveType = selectedCurve
         metalPipeline?.thermalState = ProcessInfo.processInfo.thermalState
         activeEncodeWidth = selectedFormat.width
@@ -1482,6 +1496,7 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
         activeFPS = selectedFPS.rawValue
         lockAutoModesForRecording()
         metalPipeline?.curveType = selectedCurve
+        metalPipeline?.denoiseStrength = denoiseStrength
         metalPipeline?.prewarm(width: selectedFormat.width, height: selectedFormat.height, curveType: selectedCurve)
         frameBuffer.flush()
         captureController.setRecordingMode(true)

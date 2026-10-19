@@ -387,16 +387,16 @@ extension MetalPipeline {
         return passed
     }
 
-    /// Validates cubic Hermite highlight shoulder linearity, continuity, monotonicity, and ceiling reach.
+    /// Validates rational highlight shoulder linearity, continuity, monotonicity, and asymptotic ceiling.
     static func runHighlightShoulderTest() -> Bool {
         var allPassed = true
         let eps: Float = 1e-4
 
-        // 1. Linearity: r <= 0.36 must remain 100% untouched
-        let linearTestPoints: [Float] = [0.0, 0.01, 0.05, 0.18, 0.25, 0.36]
+        // 1. Linearity: r <= 0.90 (diffuse white) must remain 100% untouched
+        let linearTestPoints: [Float] = [0.0, 0.01, 0.05, 0.18, 0.25, 0.36, 0.50, 0.75, 0.90]
         for r in linearTestPoints {
-            let outApple = LogCurve.applyHighlightShoulder(r, rKnee: 0.36, rMax: 12.0)
-            let outSony = LogCurve.applyHighlightShoulder(r, rKnee: 0.36, rMax: 10.0)
+            let outApple = LogCurve.applyHighlightShoulder(r, rKnee: 0.90, rMax: 4.5)
+            let outSony = LogCurve.applyHighlightShoulder(r, rKnee: 0.90, rMax: 9.0)
             if abs(outApple - r) > eps {
                 print("[HighlightShoulderTest] FAIL Apple Log shoulder altered midtone r=\(r): got \(outApple)")
                 allPassed = false
@@ -407,23 +407,23 @@ extension MetalPipeline {
             }
         }
 
-        // 2. Ceiling reach: r = 1.0 maps to exact rMax
-        let clipApple = LogCurve.applyHighlightShoulder(1.0, rKnee: 0.36, rMax: 12.0)
-        if abs(clipApple - 12.0) > 0.01 {
-            print("[HighlightShoulderTest] FAIL Apple Log shoulder clipping: expected 12.0, got \(clipApple)")
+        // 2. Asymptotic roll-off: extreme highlight approaches rMax smoothly without overshooting
+        let clipApple = LogCurve.applyHighlightShoulder(100.0, rKnee: 0.90, rMax: 4.5)
+        if abs(clipApple - 4.5) > 0.1 {
+            print("[HighlightShoulderTest] FAIL Apple Log shoulder asymptotic limit: expected ~4.5, got \(clipApple)")
             allPassed = false
         }
-        let clipSony = LogCurve.applyHighlightShoulder(1.0, rKnee: 0.36, rMax: 10.0)
-        if abs(clipSony - 10.0) > 0.01 {
-            print("[HighlightShoulderTest] FAIL S-Log3 shoulder clipping: expected 10.0, got \(clipSony)")
+        let clipSony = LogCurve.applyHighlightShoulder(100.0, rKnee: 0.90, rMax: 9.0)
+        if abs(clipSony - 9.0) > 0.1 {
+            print("[HighlightShoulderTest] FAIL S-Log3 shoulder asymptotic limit: expected ~9.0, got \(clipSony)")
             allPassed = false
         }
 
-        // 3. Monotonicity: strictly increasing from r = 0 to 1.0
+        // 3. Monotonicity: strictly increasing from r = 0 to 5.0
         var prevVal: Float = -1.0
-        for i in 0...100 {
+        for i in 0...500 {
             let r = Float(i) / 100.0
-            let val = LogCurve.applyHighlightShoulder(r, rKnee: 0.36, rMax: 12.0)
+            let val = LogCurve.applyHighlightShoulder(r, rKnee: 0.90, rMax: 4.5)
             if val <= prevVal && i > 0 {
                 print("[HighlightShoulderTest] FAIL Monotonicity broken at r=\(r): val=\(val), prev=\(prevVal)")
                 allPassed = false
@@ -433,8 +433,8 @@ extension MetalPipeline {
 
         // 4. C1 continuity at knee (numerical derivative before and after knee)
         let h: Float = 0.0001
-        let dBelow = (LogCurve.applyHighlightShoulder(0.36, rKnee: 0.36, rMax: 12.0) - LogCurve.applyHighlightShoulder(0.36 - h, rKnee: 0.36, rMax: 12.0)) / h
-        let dAbove = (LogCurve.applyHighlightShoulder(0.36 + h, rKnee: 0.36, rMax: 12.0) - LogCurve.applyHighlightShoulder(0.36, rKnee: 0.36, rMax: 12.0)) / h
+        let dBelow = (LogCurve.applyHighlightShoulder(0.90, rKnee: 0.90, rMax: 4.5) - LogCurve.applyHighlightShoulder(0.90 - h, rKnee: 0.90, rMax: 4.5)) / h
+        let dAbove = (LogCurve.applyHighlightShoulder(0.90 + h, rKnee: 0.90, rMax: 4.5) - LogCurve.applyHighlightShoulder(0.90, rKnee: 0.90, rMax: 4.5)) / h
         if abs(dBelow - 1.0) > 0.01 || abs(dAbove - 1.0) > 0.01 {
             print("[HighlightShoulderTest] FAIL C1 continuity at knee: dBelow=\(dBelow), dAbove=\(dAbove)")
             allPassed = false
@@ -485,7 +485,7 @@ extension MetalPipeline {
 
             // Test norm-preserving highlight shoulder with neutral white input
             let neutralIn = SIMD3<Float>(v, v, v)
-            let shoulderOut = LogCurve.applyHighlightShoulder3(neutralIn, rKnee: 0.36, rMax: 12.0)
+            let shoulderOut = LogCurve.applyHighlightShoulder3(neutralIn, rKnee: 0.90, rMax: 4.5)
             if abs(shoulderOut.x - shoulderOut.y) > eps || abs(shoulderOut.y - shoulderOut.z) > eps {
                 print("[MalvarTest] FAIL: Highlight shoulder skewed neutral white \(neutralIn) -> \(shoulderOut)")
                 allPassed = false
