@@ -45,6 +45,93 @@ final class AudioMonitor: ObservableObject {
     }
 }
 
+/// High-frequency isolated state for lossless sensor-crop zoom.
+/// Decoupled from `CameraViewModel` to eliminate full HUD and ContentView invalidations
+/// during 60/120 Hz gesture tracking.
+@MainActor
+final class ZoomMonitor: ObservableObject {
+    @Published private(set) var zoomFactor: CGFloat = 1.0
+    @Published var isWheelActive: Bool = false
+
+    weak var metalPipeline: MetalPipeline?
+    var onZoomChanged: (@Sendable (Float) -> Void)?
+    private var zoomDismissTask: Task<Void, Never>?
+
+    init(metalPipeline: MetalPipeline? = nil) {
+        self.metalPipeline = metalPipeline
+    }
+
+    /// Sets the zoom factor.
+    /// Updates the GPU Metal pipeline at zero latency on every call,
+    /// and deadband-filters SwiftUI view updates to eliminate main runloop congestion.
+    func setZoom(_ factor: CGFloat) {
+        let clamped = max(1.0, min(2.0, factor))
+        // 1. Direct zero-latency hardware update
+        metalPipeline?.zoomFactor = Float(clamped)
+        onZoomChanged?(Float(clamped))
+
+        // 2. Deadband check: publish only on measurable change
+        guard abs(zoomFactor - clamped) >= 0.002 else { return }
+        zoomFactor = clamped
+    }
+
+    func resetZoom() {
+        setZoom(1.0)
+    }
+
+    func showWheel() {
+        if !isWheelActive {
+            isWheelActive = true
+        }
+        cancelDismiss()
+    }
+
+    func hideWheel() {
+        cancelDismiss()
+        if isWheelActive {
+            isWheelActive = false
+        }
+    }
+
+    func cancelDismiss() {
+        zoomDismissTask?.cancel()
+        zoomDismissTask = nil
+    }
+
+    func scheduleDismiss(delaySeconds: Double = 2.5) {
+        zoomDismissTask?.cancel()
+        zoomDismissTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: UInt64(delaySeconds * 1_000_000_000))
+            guard !Task.isCancelled else { return }
+            withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
+                self.isWheelActive = false
+            }
+        }
+    }
+
+    func effectiveZoomString(baseMultiplier: Float) -> String {
+        let effective = Float(zoomFactor) * baseMultiplier
+        if effective >= 10.0 {
+            return String(format: "%.0f×", effective)
+        } else if abs(effective.rounded() - effective) < 0.05 {
+            return String(format: "%.0f×", effective)
+        } else {
+            return String(format: "%.1f×", effective)
+        }
+    }
+
+    func equivalentFocalLengthString(deviceType: AVCaptureDevice.DeviceType?) -> String {
+        let baseFocal: Float
+        switch deviceType {
+        case .builtInUltraWideCamera: baseFocal = 13.0
+        case .builtInTelephotoCamera: baseFocal = 77.0
+        default: baseFocal = 24.0
+        }
+        let focal = Int((baseFocal * Float(zoomFactor)).rounded())
+        return "\(focal)mm"
+    }
+}
+
 /// Central view model — CaptureController → RawFrameBuffer → MetalPipeline → preview + VideoWriter.
 @MainActor
 final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegate {
@@ -120,13 +207,14 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
         }
     }
     @Published private(set) var selectedSaveDestination: VideoSaveDestination = .photos
-    @Published var audioSources: [AudioSourceOption] = [.none]
+    @Published var audioSources: [AudioSourceOption] = []
     @Published var selectedAudioSource: AudioSourceOption = .none {
         didSet {
             isAudioMutedUnsafe = (selectedAudioSource.portUID == nil)
             guard !controlsLocked, !isRecording else { return }
-            // Skip no-op reassign (same port) — avoids hang loops
-            guard oldValue.portUID != selectedAudioSource.portUID else { return }
+            // Skip no-op reassign (same port and matches hardware) — avoids hang loops
+            guard oldValue.portUID != selectedAudioSource.portUID ||
+                  captureController.currentAudioPortUID != selectedAudioSource.portUID else { return }
             applyAudioSource()
             updateStorageEstimate()
         }
@@ -143,6 +231,71 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
             guard oldValue?.uniqueID != lens.uniqueID else { return }
             applyLens()
         }
+    }
+
+    // MARK: - Lossless Sensor-Crop Zoom (1.0x ... 2.0x)
+
+    /// Isolated high-frequency zoom monitor. Eliminates full HUD and ContentView invalidations during dragging.
+    let zoomMonitor = ZoomMonitor()
+
+    /// Current sensor-crop zoom factor (1.0 ... 2.0 lossless range).
+    var zoomFactor: CGFloat {
+        zoomMonitor.zoomFactor
+    }
+
+    /// Whether the circular zoom wheel UI is actively expanded.
+    var isZoomWheelActive: Bool {
+        get { zoomMonitor.isWheelActive }
+        set { zoomMonitor.isWheelActive = newValue }
+    }
+
+    private var pinchStartZoom: CGFloat = 1.0
+
+    /// Formatted effective zoom label (e.g. "1.0×", "1.4×", "2.0×").
+    var effectiveZoomString: String {
+        zoomMonitor.effectiveZoomString(baseMultiplier: selectedLens?.baseMultiplier ?? 1.0)
+    }
+
+    /// Approximate 35mm equivalent focal length string (e.g. "24mm", "35mm", "48mm").
+    var equivalentFocalLengthString: String {
+        zoomMonitor.equivalentFocalLengthString(deviceType: selectedLens?.deviceType)
+    }
+
+    /// Sets the zoom factor smoothly with clamping to 1.0...2.0.
+    func setZoomFactor(_ factor: CGFloat) {
+        zoomMonitor.setZoom(factor)
+    }
+
+    /// Resets zoom back to 1.0 (un-cropped full sensor).
+    func resetZoom() {
+        zoomMonitor.resetZoom()
+    }
+
+    /// Opens or touches the zoom wheel with auto-dismiss timeout.
+    func touchZoomWheel() {
+        zoomMonitor.showWheel()
+        zoomMonitor.scheduleDismiss()
+    }
+
+    func scheduleZoomWheelDismiss(delaySeconds: Double = 2.5) {
+        zoomMonitor.scheduleDismiss(delaySeconds: delaySeconds)
+    }
+
+    func handlePinchChanged(scale: CGFloat) {
+        zoomMonitor.cancelDismiss()
+        if !zoomMonitor.isWheelActive {
+            pinchStartZoom = zoomFactor
+            withAnimation(.spring(response: 0.25, dampingFraction: 0.8)) {
+                zoomMonitor.showWheel()
+            }
+        }
+        let target = pinchStartZoom * scale
+        zoomMonitor.setZoom(target)
+    }
+
+    func handlePinchEnded() {
+        pinchStartZoom = zoomFactor
+        zoomMonitor.scheduleDismiss()
     }
 
     @Published var showGrid = false
@@ -438,6 +591,7 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
     nonisolated(unsafe) private var activeEncodeWidth = 2016
     nonisolated(unsafe) private var activeEncodeHeight = 1512
     nonisolated(unsafe) private var activeFPS: Double = 30
+    nonisolated(unsafe) private var activeZoomFactorUnsafe: Float = 1.0
     nonisolated(unsafe) private var isRecordingUnsafe = false
     nonisolated(unsafe) private var isAudioRecordingActive = false
     nonisolated(unsafe) private var currentOrientationUnsafe: UIInterfaceOrientation = .landscapeRight
@@ -469,7 +623,11 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
     override init() {
         let pipeline = MetalPipeline()
         metalPipeline = pipeline
+        zoomMonitor.metalPipeline = pipeline
         super.init()
+        zoomMonitor.onZoomChanged = { [weak self] z in
+            self?.activeZoomFactorUnsafe = z
+        }
         captureController.sharedCommandQueue = pipeline?.commandQueue
         startClockAndBatteryMonitoring()
 #if DEBUG
@@ -482,6 +640,7 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
             denoiseStrength = 1.0
         }
         metalPipeline?.denoiseStrength = denoiseStrength
+        metalPipeline?.zoomFactor = Float(zoomFactor)
         metalPipeline?.curveType = selectedCurve
         metalPipeline?.thermalState = ProcessInfo.processInfo.thermalState
         activeEncodeWidth = selectedFormat.width
@@ -502,18 +661,28 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
             }
             .store(in: &cancellables)
 
-        // Refresh mic list and handle disconnects when route changes
+        // Refresh mic list and handle disconnects / connects when route changes
         NotificationCenter.default.publisher(for: AVAudioSession.routeChangeNotification)
             .receive(on: DispatchQueue.main)
             .sink { [weak self] note in
                 guard let self else { return }
-                self.refreshAudioSources()
-                if let reasonValue = note.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt,
-                   let reason = AVAudioSession.RouteChangeReason(rawValue: reasonValue) {
-                    if reason == .oldDeviceUnavailable {
-                        print("[CameraViewModel] Audio route oldDeviceUnavailable, falling back to default mic")
-                    }
-                }
+                let reasonValue = note.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt
+                let reason = reasonValue.flatMap { AVAudioSession.RouteChangeReason(rawValue: $0) }
+                self.handleAudioRouteChange(reason: reason)
+            }
+            .store(in: &cancellables)
+
+        NotificationCenter.default.publisher(for: AVCaptureDevice.wasConnectedNotification)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                self?.handleAudioRouteChange(reason: .newDeviceAvailable)
+            }
+            .store(in: &cancellables)
+
+        NotificationCenter.default.publisher(for: AVCaptureDevice.wasDisconnectedNotification)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                self?.handleAudioRouteChange(reason: .oldDeviceUnavailable)
             }
             .store(in: &cancellables)
 
@@ -1029,22 +1198,71 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
         showToast(showDisplayLUT ? "Rec.709 Preview: ON" : "Log (Flat) Preview: ON")
     }
 
-    func refreshAudioSources() {
+    private func handleAudioRouteChange(reason: AVAudioSession.RouteChangeReason?) {
+        refreshAudioSources(reason: reason)
+        // Delayed secondary check to account for hardware USB descriptor enumeration latency
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
+            self?.refreshAudioSources(reason: reason)
+        }
+    }
+
+    func refreshAudioSources(reason: AVAudioSession.RouteChangeReason? = nil) {
+        let previousIDs = Set(audioSources.map(\.id))
         let sources = captureController.availableAudioSources()
         audioSources = sources
 
-        // Keep current port if still present (name-only update won't re-apply)
-        if let match = sources.first(where: { $0.portUID == selectedAudioSource.portUID
-                                              && $0.portUID != nil })
-            ?? sources.first(where: { $0.id == selectedAudioSource.id }) {
+        // Case 1: A new device was connected (or detected)
+        if reason == .newDeviceAvailable {
+            // Find newly attached device (not previously seen, and not built-in)
+            if let newlyConnected = sources.first(where: { !previousIDs.contains($0.id) && $0.portUID != nil && $0.name != "Built-in Mic" })
+                ?? sources.first(where: { $0.portUID != nil && $0.name != "Built-in Mic" && $0.id != "Built-In Microphone" }) {
+                if selectedAudioSource.id != newlyConnected.id {
+                    print("[CameraViewModel] New external mic attached: \(newlyConnected.name)")
+                    selectedAudioSource = newlyConnected
+                    showToast("Connected: \(newlyConnected.name)")
+                    return
+                }
+            }
+        }
+
+        // Case 2: A device was disconnected
+        if reason == .oldDeviceUnavailable || !sources.contains(where: { $0.portUID == selectedAudioSource.portUID }) {
+            // Previously selected device is gone → fallback to built-in mic
+            if let builtIn = sources.first(where: { $0.name == "Built-in Mic" || $0.id == "Built-In Microphone" || $0.portUID?.contains("Built-In") == true }) ?? sources.first {
+                if selectedAudioSource.id != builtIn.id {
+                    print("[CameraViewModel] External mic disconnected → fallback to: \(builtIn.name)")
+                    selectedAudioSource = builtIn
+                    showToast("Mic: \(builtIn.name)")
+                    return
+                }
+            }
+        }
+
+        // Case 3: Check if active hardware route changed to an external device
+        let currentUID = captureController.currentAudioPortUID
+        if let currentUID, let active = sources.first(where: { $0.portUID == currentUID }) {
+            if active.name != "Built-in Mic" && active.id != "Built-In Microphone" && selectedAudioSource.portUID != active.portUID {
+                print("[CameraViewModel] Active route is external mic → \(active.name)")
+                selectedAudioSource = active
+                showToast("Connected: \(active.name)")
+                return
+            }
+            if selectedAudioSource.id != active.id || selectedAudioSource.name != active.name {
+                selectedAudioSource = active
+            }
+            return
+        }
+
+        // Case 4: Keep existing selection if still valid
+        if let match = sources.first(where: { $0.portUID == selectedAudioSource.portUID && $0.portUID != nil }) {
             if match.id != selectedAudioSource.id || match.name != selectedAudioSource.name {
                 selectedAudioSource = match
             }
             return
         }
 
-        // Port gone (unplugged) → prefer built-in mic, else first available
-        if let builtIn = sources.first(where: { $0.id == "Built-In Microphone" || $0.name == "Built-in Mic" }) {
+        // Case 5: Initial startup fallback
+        if let builtIn = sources.first(where: { $0.name == "Built-in Mic" || $0.id == "Built-In Microphone" || $0.portUID?.contains("Built-In") == true }) {
             selectedAudioSource = builtIn
         } else if let firstMic = sources.first {
             selectedAudioSource = firstMic
@@ -1072,6 +1290,7 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
     private func applyLens() {
         guard !isSwitchingLens, let lens = selectedLens else { return }
         isSwitchingLens = true
+        resetZoom()
         captureController.selectLens(uniqueID: lens.uniqueID) { [weak self] error in
             Task { @MainActor in
                 guard let self else { return }
@@ -1497,6 +1716,7 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
         lockAutoModesForRecording()
         metalPipeline?.curveType = selectedCurve
         metalPipeline?.denoiseStrength = denoiseStrength
+        metalPipeline?.zoomFactor = Float(zoomFactor)
         metalPipeline?.prewarm(width: selectedFormat.width, height: selectedFormat.height, curveType: selectedCurve)
         frameBuffer.flush()
         captureController.setRecordingMode(true)
@@ -2044,6 +2264,7 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
         pipeline.bayerPattern = frameData.cfaPattern
         pipeline.blackLevel = frameData.blackLevel
         pipeline.whiteLevel = frameData.whiteLevel
+        pipeline.zoomFactor = activeZoomFactorUnsafe
 
         // LSC: calibrated override > frame default > neutral
         if let override = lscOverride {

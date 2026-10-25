@@ -583,10 +583,12 @@ fragment float4 displayFragment(
 
         if (uniforms.curveType == 2) {
             // Inverse Sony S-Log3 decode (code value -> scene-linear reflectance)
+            // fast exp2: 10^x = 2^(x * log2(10)), log2(10) ~ 3.32192809489f
+            constexpr float log2_10 = 3.32192809489f;
             for (int i = 0; i < 3; i++) {
                 float p = finalColor[i];
                 if (p >= 171.2102946929f / 1023.0f) {
-                    float a = metal::pow(10.0f, (p * 1023.0f - 420.0f) / 261.5f);
+                    float a = metal::exp2(((p * 1023.0f - 420.0f) / 261.5f) * log2_10);
                     lin[i] = a * (0.18f + 0.01f) - 0.01f;
                 } else {
                     lin[i] = (p * 1023.0f - 95.0f) * 0.01125000f / (171.2102946929f - 95.0f);
@@ -607,9 +609,9 @@ fragment float4 displayFragment(
             constexpr float rt = 0.01f;
             constexpr float c_al = 47.28711236f;
             constexpr float beta = 0.00964052f;
-            constexpr float gam = 0.08550479f;
+            constexpr float inv_gam = 1.0f / 0.08550479f;
             constexpr float del = 0.69336945f;
-            float pt = c_al * (rt - r0) * (rt - r0);
+            constexpr float pt = c_al * (rt - r0) * (rt - r0);
 
             for (int i = 0; i < 3; i++) {
                 float p = finalColor[i];
@@ -618,7 +620,7 @@ fragment float4 displayFragment(
                 } else if (p < pt) {
                     lin[i] = sqrt(p / c_al) + r0;
                 } else {
-                    lin[i] = metal::pow(2.0f, (p - del) / gam) - beta;
+                    lin[i] = metal::exp2((p - del) * inv_gam) - beta;
                 }
             }
             lin = max(lin, float3(0.0));
@@ -639,7 +641,8 @@ fragment float4 displayFragment(
         float3 a = rgb709 * (rgb709 + 0.0245786f) - 0.000090537f;
         float3 b = rgb709 * (0.983729f * rgb709 + 0.4329510f) + 0.238081f;
         float3 mapped = saturate(a / max(b, 1e-4f));
-        finalColor = metal::pow(mapped, float3(1.0f / 2.2f));
+        constexpr float inv_gamma = 1.0f / 2.2f;
+        finalColor = metal::pow(mapped, float3(inv_gamma));
     }
 
     // ── Cinema Diagonal Zebra Stripes for Highlight Clipping ──

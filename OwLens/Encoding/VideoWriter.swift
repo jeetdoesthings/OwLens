@@ -66,8 +66,8 @@ final class VideoWriter: @unchecked Sendable {
         defer { lock.unlock() }
         try? FileManager.default.removeItem(at: outputURL)
 
-        // RAW recording is deliberately locked to cinema 24 fps.
-        let fps = 24.0
+        // Target frame rate (defaults to cinema 24 fps)
+        let fps = targetFPS > 0 ? targetFPS : 24.0
 
         let writer = try AVAssetWriter(outputURL: outputURL, fileType: .mov)
         self.width = width
@@ -379,7 +379,14 @@ final class VideoWriter: @unchecked Sendable {
         // Calculate wall-clock elapsed time since optical session start
         let elapsed: Double
         if let captureTime = captureTime, captureTime.isValid, sessionStartTime.isValid {
-            elapsed = max(0, CMTimeGetSeconds(CMTimeSubtract(captureTime, sessionStartTime)))
+            let optical = CMTimeGetSeconds(CMTimeSubtract(captureTime, sessionStartTime))
+            let wallClock = now - startHostTime
+            // Protect against clock-domain jumps or un-anchored capture timestamps
+            if optical >= 0 && abs(optical - wallClock) < 1.0 {
+                elapsed = optical
+            } else {
+                elapsed = max(0, wallClock)
+            }
         } else {
             elapsed = max(0, now - startHostTime)
         }
@@ -408,12 +415,20 @@ final class VideoWriter: @unchecked Sendable {
             spinAttempts += 1
         }
 
-        // Fill any missing CFR slots by repeating last frame (up to 4 frames max).
+        // Fill any missing CFR slots by repeating last frame (up to 12 frames max / 0.5s).
         // This ensures the video container maintains strict CFR 24.0000 FPS without VFR warnings,
         // while guaranteeing that audio and video remain in microsecond sync over long recordings!
         if let hold = lastPixelBuffer {
-            let maxHoldToFill = min(targetSlot, frameCount + 4)
+            let maxHoldToFill = min(targetSlot, frameCount + 12)
             while frameCount < maxHoldToFill {
+                var holdSpin = 0
+                while !input.isReadyForMoreMediaData && holdSpin < 3 {
+                    lock.unlock()
+                    usleep(1500)
+                    lock.lock()
+                    guard isRecording, videoInput != nil, pixelBufferAdaptor != nil else { break }
+                    holdSpin += 1
+                }
                 guard input.isReadyForMoreMediaData else {
                     droppedFrames += 1
                     break
@@ -431,7 +446,7 @@ final class VideoWriter: @unchecked Sendable {
             }
         }
 
-        // If the gap exceeded 4 frames or hold buffer wasn't ready, advance frameCount to targetSlot
+        // If the gap exceeded hold limit or hold buffer wasn't ready, advance frameCount to targetSlot
         // so this real frame is stamped at its true wall-clock CFR position, NEVER falling behind audio!
         if frameCount < targetSlot {
             frameCount = targetSlot
@@ -839,7 +854,7 @@ final class VideoWriter: @unchecked Sendable {
         let software = AVMutableMetadataItem()
         software.keySpace = .quickTimeUserData
         software.key = AVMetadataKey.quickTimeUserDataKeySoftware as (NSCopying & NSObjectProtocol)
-        software.value = "OwLens Cinema Camera v2.0" as (NSCopying & NSObjectProtocol)
+        software.value = "OwLens Cinema Camera v2.1" as (NSCopying & NSObjectProtocol)
         items.append(software)
 
         // 4. QuickTime Make

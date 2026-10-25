@@ -112,6 +112,7 @@ struct LensOption: Identifiable, Hashable {
     let shortLabel: String
     let deviceType: AVCaptureDevice.DeviceType
     let uniqueID: String
+    var baseMultiplier: Float = 1.0
 }
 
 enum PreviewDisplayMode: Int, CaseIterable, Identifiable {

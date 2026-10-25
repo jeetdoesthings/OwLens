@@ -125,13 +125,15 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
             )
             try audioSession.setPreferredSampleRate(48_000)
             try audioSession.setPreferredIOBufferDuration(0.02)
-            DispatchQueue.global(qos: .userInitiated).async {
-                try? audioSession.setActive(true)
-            }
+            try audioSession.setActive(true)
             AudioServicesDisposeSystemSoundID(1108)
         } catch {
             print("[CaptureController] Audio session configure failed (non-fatal): \(error)")
         }
+
+        // Disable automatic audio session reconfiguration so AVCaptureSession does NOT
+        // override our manual microphone routing (built-in vs. external) back to system default.
+        session.automaticallyConfiguresApplicationAudioSession = false
 
         // Build graph under begin/commit, then resolve Bayer *after* commit.
         // availableRawPhotoPixelFormatTypes is often empty *inside* beginConfiguration.
@@ -204,11 +206,13 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
         enableBurstHelpersIfSafe()
         prepareRAWPhotoResources()
 
-        if let builtIn = AVAudioSession.sharedInstance().availableInputs?.first(where: {
-            $0.portType == .builtInMic
-        }) {
+        let audioSession = AVAudioSession.sharedInstance()
+        if let current = audioSession.currentRoute.inputs.first {
+            selectedAudioPortUID = current.uid
+            print("[CaptureController] Initial active audio input: \(current.portName) (\(current.portType.rawValue)) uid=\(current.uid)")
+        } else if let builtIn = audioSession.availableInputs?.first(where: { $0.portType == .builtInMic }) {
             selectedAudioPortUID = builtIn.uid
-            try? AVAudioSession.sharedInstance().setPreferredInput(builtIn)
+            try? audioSession.setPreferredInput(builtIn)
         }
 
         print("[CaptureController] Ready. singleLensTypes=\(lenses.map { Self.deviceTypeLabel($0.deviceType) }.joined(separator: ", ")) Bayer=\(fourCC(rawPixelFormat)) inFlight=\(maxInFlight)")
@@ -597,17 +601,17 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
             guard !seen.contains(device.uniqueID) else { continue }
             seen.insert(device.uniqueID)
 
-            let (name, short): (String, String)
+            let (name, short, baseMult): (String, String, Float)
             switch device.deviceType {
-            case .builtInUltraWideCamera: name = "Ultra Wide"; short = "0.5×"
-            case .builtInWideAngleCamera: name = "Wide"; short = "1×"
+            case .builtInUltraWideCamera: name = "Ultra Wide"; short = "0.5×"; baseMult = 0.5
+            case .builtInWideAngleCamera: name = "Wide"; short = "1×"; baseMult = 1.0
             case .builtInTelephotoCamera:
                 let multiplier = Self.relativeZoomLabel(
                     wideFOV: wideFOV,
                     lensFOV: device.activeFormat.videoFieldOfView,
                     fallback: 2
                 )
-                name = "Telephoto"; short = "\(multiplier)×"
+                name = "Telephoto"; short = "\(multiplier)×"; baseMult = Float(multiplier)
             default:
                 print("[CaptureController] discover: unexpected type \(deviceTypeLabel(device.deviceType)) — skipped")
                 continue
@@ -618,7 +622,8 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
                 name: name,
                 shortLabel: short,
                 deviceType: device.deviceType,
-                uniqueID: device.uniqueID
+                uniqueID: device.uniqueID,
+                baseMultiplier: baseMult
             ))
             print("[CaptureController] discover: + \(short) \(deviceTypeLabel(device.deviceType)) id=\(device.uniqueID)")
         }
@@ -631,9 +636,10 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
                       !device.isVirtualDevice else { continue }
                 let name: String
                 let short: String
+                let baseMult: Float
                 switch type {
-                case .builtInUltraWideCamera: name = "Ultra Wide"; short = "0.5×"
-                case .builtInWideAngleCamera: name = "Wide"; short = "1×"
+                case .builtInUltraWideCamera: name = "Ultra Wide"; short = "0.5×"; baseMult = 0.5
+                case .builtInWideAngleCamera: name = "Wide"; short = "1×"; baseMult = 1.0
                 case .builtInTelephotoCamera:
                     name = "Telephoto"
                     let multiplier = Self.relativeZoomLabel(
@@ -642,6 +648,7 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
                         fallback: 2
                     )
                     short = "\(multiplier)×"
+                    baseMult = Float(multiplier)
                 default: continue
                 }
                 options.append(LensOption(
@@ -649,7 +656,8 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
                     name: name,
                     shortLabel: short,
                     deviceType: type,
-                    uniqueID: device.uniqueID
+                    uniqueID: device.uniqueID,
+                    baseMultiplier: baseMult
                 ))
                 print("[CaptureController] discover fallback: + \(short) \(deviceTypeLabel(type))")
             }
@@ -817,22 +825,29 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
             guard !seen.contains(port.uid) else { continue }
             seen.insert(port.uid)
             let name: String
-            switch port.portType {
-            case .builtInMic: name = "Built-in Mic"
-            case .headsetMic: name = port.portName.isEmpty ? "Headset" : port.portName
-            case .usbAudio: name = port.portName.isEmpty ? "USB Mic" : port.portName
-            case .bluetoothHFP, .bluetoothA2DP: name = port.portName.isEmpty ? "Bluetooth" : port.portName
-            default: name = port.portName.isEmpty ? port.portType.rawValue : port.portName
+            if port.portType == .builtInMic {
+                name = "Built-in Mic"
+            } else if !port.portName.isEmpty {
+                name = port.portName
+            } else {
+                switch port.portType {
+                case .headsetMic: name = "Headset"
+                case .usbAudio: name = "USB Mic"
+                case .bluetoothHFP, .bluetoothA2DP: name = "Bluetooth"
+                default: name = "External Mic"
+                }
             }
             options.append(AudioSourceOption(id: port.uid, name: name, portUID: port.uid))
         }
         return options
     }
 
-    var currentAudioPortUID: String? { selectedAudioPortUID }
+    var currentAudioPortUID: String? {
+        AVAudioSession.sharedInstance().currentRoute.inputs.first?.uid ?? selectedAudioPortUID
+    }
 
     func selectAudioSource(portUID: String?, completion: (@Sendable (Error?) -> Void)? = nil) {
-        if portUID == selectedAudioPortUID {
+        if portUID == selectedAudioPortUID && portUID == currentAudioPortUID {
             completion?(nil)
             return
         }
@@ -855,13 +870,6 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
                 try audioSession.setActive(true, options: [])
 
                 if let portUID {
-                    if self.audioInput == nil {
-                        self.session.beginConfiguration()
-                        if let mic = AVCaptureDevice.default(for: .audio) {
-                            try self.attachAudioDevice(mic)
-                        }
-                        self.session.commitConfiguration()
-                    }
                     guard let port = audioSession.availableInputs?.first(where: { $0.uid == portUID }) else {
                         self.isReconfiguringAudio = false
                         if wasRunning { self.startFrameTimer(fps: self.targetFPS) }
@@ -869,10 +877,32 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
                         DispatchQueue.main.async { completion?(err) }
                         return
                     }
+
+                    // Force the audio session's preferred input to the selected hardware port
                     try audioSession.setPreferredInput(port)
+
+                    // If it's the built-in mic, configure back microphone data source (facing scene)
+                    if port.portType == .builtInMic, let dataSources = port.dataSources {
+                        if let backSource = dataSources.first(where: { $0.orientation == .back }) ?? dataSources.first {
+                            try? port.setPreferredDataSource(backSource)
+                        }
+                    }
+
+                    // Re-bind the capture session audio input so mediaserverd binds to the new route
+                    self.session.beginConfiguration()
+                    if let existing = self.audioInput {
+                        self.session.removeInput(existing)
+                        self.audioInput = nil
+                    }
+                    if let mic = AVCaptureDevice.default(for: .audio) {
+                        try self.attachAudioDevice(mic)
+                    }
+                    self.session.commitConfiguration()
+
                     self.selectedAudioPortUID = portUID
-                    print("[CaptureController] Audio port → \(port.portName)")
+                    print("[CaptureController] Audio port switched to: \(port.portName) (\(port.portType.rawValue)) uid=\(port.uid), activeRoute=\(audioSession.currentRoute.inputs.first?.portName ?? "none")")
                 } else {
+                    try? audioSession.setPreferredInput(nil)
                     if self.audioInput != nil {
                         self.session.beginConfiguration()
                         if let existing = self.audioInput {

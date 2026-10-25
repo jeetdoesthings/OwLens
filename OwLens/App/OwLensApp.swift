@@ -127,6 +127,15 @@ struct RootView: View {
                         focusReticleWorkItem = work
                         DispatchQueue.main.asyncAfter(deadline: .now() + 0.9, execute: work)
                     }
+                    .simultaneousGesture(
+                        MagnificationGesture()
+                            .onChanged { scale in
+                                viewModel.handlePinchChanged(scale: scale)
+                            }
+                            .onEnded { _ in
+                                viewModel.handlePinchEnded()
+                            }
+                    )
                 }
                 .ignoresSafeArea()
 

@@ -53,6 +53,15 @@ struct ControlsView: View {
             .frame(width: geo.size.width, height: geo.size.height)
         }
         .opacity(viewModel.isHUDHidden ? 0 : 1)
+        .simultaneousGesture(
+            MagnificationGesture()
+                .onChanged { scale in
+                    viewModel.handlePinchChanged(scale: scale)
+                }
+                .onEnded { _ in
+                    viewModel.handlePinchEnded()
+                }
+        )
         .animation(.easeInOut(duration: 0.22), value: viewModel.isHUDHidden)
         .animation(.spring(response: 0.28, dampingFraction: 0.82), value: viewModel.activePanel)
         .animation(.spring(response: 0.28, dampingFraction: 0.82), value: viewModel.isRecording)
@@ -283,72 +292,84 @@ struct ControlsView: View {
 
     private var centerStatusGroup: some View {
         HStack(spacing: 6) {
-            // Lens Switcher Pill
-            lensSwitcherPill
-
-            // Format Button (OG / 1080 - single tap cycles, long-press opens drawer)
-            HStack(spacing: 0) {
-                Text(viewModel.selectedFormat.shortLabel)
-                    .font(.appFont(.bold, size: 12))
-                    .foregroundColor(isTopLocked ? OwLensTheme.textDisabled : OwLensTheme.textPrimary)
-                    .lineLimit(1)
-                    .fixedSize()
-            }
-            .frame(width: 40, height: 30)
-            .glassPanel(cornerRadius: OwLensTheme.radiusCard)
-            .contentShape(Rectangle())
-            .onTapGesture {
-                guard !isTopLocked else { return }
-                Haptics.selection()
-                viewModel.cycleFormat()
-            }
-            .onLongPressGesture(minimumDuration: 0.45) {
-                guard !isTopLocked else { return }
-                Haptics.impact(.medium)
-                viewModel.togglePanel(.format)
-            }
-            .disabled(isTopLocked)
-            .opacity(isTopLocked ? 0.4 : 1.0)
+            // Resolution / Format Button (OG 4:3 / 1080 16:9)
+            formatPill
 
             // Log Profile Selector Button (Single tap cycles, long-press opens drawer)
-            HStack(spacing: 5) {
-                Text(viewModel.selectedCurve.shortLabel)
-                    .font(.appFont(.bold, size: 11))
-                    .foregroundColor(isTopLocked ? OwLensTheme.textDisabled : OwLensTheme.textPrimary)
-                    .lineLimit(1)
-                    .fixedSize(horizontal: true, vertical: false)
-                Text("10-BIT")
-                    .font(.appMono(.bold, size: 8))
-                    .foregroundColor(isTopLocked ? OwLensTheme.textDisabled : .white)
-                    .padding(.horizontal, 4)
-                    .padding(.vertical, 1.5)
-                    .background(
-                        RoundedRectangle(cornerRadius: 3, style: .continuous)
-                            .fill(Color.white.opacity(0.18))
-                    )
-                    .lineLimit(1)
-                    .fixedSize()
-            }
-            .padding(.horizontal, 8)
-            .frame(height: 30)
-            .glassPanel(cornerRadius: OwLensTheme.radiusCard)
-            .contentShape(Rectangle())
-            .onTapGesture {
-                guard !isTopLocked else { return }
-                Haptics.selection()
-                viewModel.toggleLogCurve()
-            }
-            .onLongPressGesture(minimumDuration: 0.45) {
-                guard !isTopLocked else { return }
-                Haptics.impact(.medium)
-                viewModel.togglePanel(.logCurve)
-            }
-            .disabled(isTopLocked)
-            .opacity(isTopLocked ? 0.4 : 1.0)
+            logCurvePill
 
             // Denoise Selector Button (Tap opens drawer)
             denoisePill
         }
+    }
+
+    private var formatPill: some View {
+        HStack(spacing: 3) {
+            Text(viewModel.selectedFormat.shortLabel)
+                .font(.appFont(.bold, size: 12))
+                .foregroundColor(isTopLocked ? OwLensTheme.textDisabled : OwLensTheme.textPrimary)
+                .lineLimit(1)
+                .fixedSize()
+
+            Text(viewModel.selectedFormat == .openGate ? "4:3" : "16:9")
+                .font(.appMono(.medium, size: 8))
+                .foregroundColor(isTopLocked ? OwLensTheme.textDisabled : OwLensTheme.textSecondary)
+                .lineLimit(1)
+                .fixedSize()
+        }
+        .padding(.horizontal, 7)
+        .frame(height: 30)
+        .glassPanel(cornerRadius: OwLensTheme.radiusCard)
+        .contentShape(Rectangle())
+        .onTapGesture {
+            guard !isTopLocked else { return }
+            Haptics.selection()
+            viewModel.cycleFormat()
+        }
+        .onLongPressGesture(minimumDuration: 0.45) {
+            guard !isTopLocked else { return }
+            Haptics.impact(.medium)
+            viewModel.togglePanel(.format)
+        }
+        .disabled(isTopLocked)
+        .opacity(isTopLocked ? 0.4 : 1.0)
+    }
+
+    private var logCurvePill: some View {
+        HStack(spacing: 5) {
+            Text(viewModel.selectedCurve.shortLabel)
+                .font(.appFont(.bold, size: 11))
+                .foregroundColor(isTopLocked ? OwLensTheme.textDisabled : OwLensTheme.textPrimary)
+                .lineLimit(1)
+                .fixedSize(horizontal: true, vertical: false)
+            Text("10-BIT")
+                .font(.appMono(.bold, size: 8))
+                .foregroundColor(isTopLocked ? OwLensTheme.textDisabled : .white)
+                .padding(.horizontal, 4)
+                .padding(.vertical, 1.5)
+                .background(
+                    RoundedRectangle(cornerRadius: 3, style: .continuous)
+                        .fill(Color.white.opacity(0.18))
+                )
+                .lineLimit(1)
+                .fixedSize()
+        }
+        .padding(.horizontal, 8)
+        .frame(height: 30)
+        .glassPanel(cornerRadius: OwLensTheme.radiusCard)
+        .contentShape(Rectangle())
+        .onTapGesture {
+            guard !isTopLocked else { return }
+            Haptics.selection()
+            viewModel.toggleLogCurve()
+        }
+        .onLongPressGesture(minimumDuration: 0.45) {
+            guard !isTopLocked else { return }
+            Haptics.impact(.medium)
+            viewModel.togglePanel(.logCurve)
+        }
+        .disabled(isTopLocked)
+        .opacity(isTopLocked ? 0.4 : 1.0)
     }
 
     private var denoisePill: some View {
@@ -374,37 +395,6 @@ struct ControlsView: View {
         .buttonStyle(.plain)
         .disabled(isTopLocked)
         .opacity(isTopLocked ? 0.4 : 1.0)
-    }
-
-    private var lensSwitcherPill: some View {
-        HStack(spacing: 2) {
-            ForEach(viewModel.availableLenses) { lens in
-                let isSelected = viewModel.selectedLens?.id == lens.id
-                Button {
-                    Haptics.selection()
-                    viewModel.selectedLens = lens
-                } label: {
-                    Text(lens.shortLabel)
-                        .font(.appFont(isSelected ? .semiBold : .regular, size: 11))
-                        .foregroundColor(isSelected ? (isTopLocked ? .white : .black) : (isTopLocked ? OwLensTheme.textDisabled : OwLensTheme.textSecondary))
-                        .frame(minWidth: 32)
-                        .frame(height: 24)
-                        .padding(.horizontal, 4)
-                        .background(
-                            RoundedRectangle(cornerRadius: 6, style: .continuous)
-                                .fill(isSelected ? (isTopLocked ? OwLensTheme.glassBaseHeavy : OwLensTheme.glassActive) : Color.clear)
-                        )
-                        .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-                .disabled(isTopLocked || viewModel.isSwitchingLens)
-            }
-        }
-        .padding(3)
-        .frame(height: 30)
-        .glassPanel(cornerRadius: OwLensTheme.radiusCard)
-        .opacity(isTopLocked ? 0.4 : (viewModel.isSwitchingLens ? 0.5 : 1.0))
-        .animation(.easeInOut(duration: 0.15), value: viewModel.isSwitchingLens)
     }
 
     private var rightStatusGroup: some View {
@@ -1172,7 +1162,7 @@ struct ControlsView: View {
                                 viewModel.selectedAudioSource = src
                             } label: {
                                 HStack(spacing: 5) {
-                                    Image(systemName: src.portUID == nil ? "mic.slash.fill" : "mic.fill")
+                                    Image(systemName: "mic.fill")
                                         .font(.system(size: 10))
                                     Text(src.name)
                                         .font(.appFont(isSelected ? .semiBold : .regular, size: 11))
@@ -1542,9 +1532,12 @@ struct ControlsView: View {
         let safeTrailing = ScreenGeometry.trailingPadding(in: geo)
 
         return ZStack(alignment: .trailing) {
-            // Shutter / Record Trigger - Locked in the exact physical vertical center
-            recordButton
-                .frame(maxHeight: .infinity, alignment: .center)
+            // Shutter / Record Trigger & Circular Zoom Wheel / Lens Switcher
+            HStack(spacing: 12) {
+                LensAndZoomWheelControl(viewModel: viewModel, zoomMonitor: viewModel.zoomMonitor)
+                recordButton
+            }
+            .frame(maxHeight: .infinity, alignment: .center)
 
             // Scopes / Histogram Monitor - Positioned directly ABOVE the centered record button
             if viewModel.showScopes {
@@ -1615,8 +1608,8 @@ struct ControlsView: View {
     }
 
     private var micShortName: String {
-        if viewModel.selectedAudioSource.portUID == nil { return "OFF" }
         let name = viewModel.selectedAudioSource.name
+        if name.isEmpty || viewModel.selectedAudioSource.portUID == nil { return "MIC" }
         if name == "Built-in Mic" || name == "iPhone" || name == "Built-In Microphone" { return "BUILT-IN" }
         if name.count <= 8 { return name.uppercased() }
         return String(name.prefix(7)).uppercased() + "…"
@@ -1637,6 +1630,391 @@ struct ControlsView: View {
         case .serious: return "Thermal Throttling Imminent"
         case .critical: return "Critical Temperature"
         default: return ""
+        }
+    }
+}
+
+// MARK: - iPhone Cinema Lens Switcher & Smooth Circular Zoom Wheel
+
+private struct LensAndZoomWheelControl: View {
+    @ObservedObject var viewModel: CameraViewModel
+    @ObservedObject var zoomMonitor: ZoomMonitor
+
+    @State private var isArcDragging: Bool = false
+    @State private var arcDragInitialY: CGFloat = 0.0
+    @State private var arcDragStartZoom: CGFloat = 1.0
+    @State private var arcLastHapticStep: Int = 0
+
+    /// Lenses sorted descending so Tele (2x) is on TOP, Wide (1x) in MIDDLE, Ultra-Wide (.5) on BOTTOM.
+    private var orderedLenses: [LensOption] {
+        viewModel.availableLenses.sorted(by: { $0.baseMultiplier > $1.baseMultiplier })
+    }
+
+    var body: some View {
+        HStack(alignment: .center, spacing: 6) {
+            if zoomMonitor.isWheelActive {
+                tinyZoomReadout
+                    .transition(.opacity)
+
+                circularArcWheel
+                    .transition(.opacity.combined(with: .scale(scale: 0.95)))
+            }
+
+            verticalLensButtons
+        }
+        .animation(.spring(response: 0.24, dampingFraction: 0.85), value: zoomMonitor.isWheelActive)
+    }
+
+    // MARK: - Vertical Lens Buttons
+
+    private var verticalLensButtons: some View {
+        VStack(spacing: 4) {
+            ForEach(orderedLenses) { lens in
+                LensButtonView(lens: lens, viewModel: viewModel, zoomMonitor: zoomMonitor)
+            }
+        }
+        .padding(.horizontal, 3)
+        .padding(.vertical, 4)
+        .background(
+            Capsule()
+                .fill(OwLensTheme.glassBaseHeavy)
+        )
+        .overlay(
+            Capsule()
+                .strokeBorder(OwLensTheme.glassBorder, lineWidth: 0.5)
+        )
+    }
+
+    // MARK: - Tiny Zoom Readout
+
+    private var tinyZoomReadout: some View {
+        Button {
+            Haptics.selection()
+            if zoomMonitor.zoomFactor > 1.02 {
+                withAnimation(.spring(response: 0.25, dampingFraction: 0.85)) {
+                    zoomMonitor.resetZoom()
+                }
+            } else {
+                withAnimation(.spring(response: 0.25, dampingFraction: 0.85)) {
+                    zoomMonitor.hideWheel()
+                }
+            }
+        } label: {
+            VStack(alignment: .trailing, spacing: 1) {
+                Text(zoomMonitor.effectiveZoomString(baseMultiplier: viewModel.selectedLens?.baseMultiplier ?? 1.0))
+                    .font(.appMono(.bold, size: 12))
+                    .foregroundColor(OwLensTheme.accent)
+                    .shadow(color: Color.black.opacity(0.8), radius: 2)
+
+                Text(zoomMonitor.equivalentFocalLengthString(deviceType: viewModel.selectedLens?.deviceType))
+                    .font(.appMono(.medium, size: 9))
+                    .foregroundColor(.white.opacity(0.70))
+                    .shadow(color: Color.black.opacity(0.8), radius: 2)
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+
+    // MARK: - Circular Arc Wheel (With ample margins - no left clipping)
+
+    private var circularArcWheel: some View {
+        ZStack {
+            Canvas { context, size in
+                let width = size.width
+                let height = size.height
+                let cy = height * 0.5
+                let radius: CGFloat = 110.0
+                // Center cx is at 140, so apex (cx - radius) is at X = 30.0 pt (comfortably inside width 96)
+                let cx: CGFloat = 140.0
+
+                // 1. Arc background track
+                var arcPath = Path()
+                let maxAngleDeg: CGFloat = 36.0
+                let startAngle = Angle.degrees(Double(180.0 - maxAngleDeg))
+                let endAngle = Angle.degrees(Double(180.0 + maxAngleDeg))
+                arcPath.addArc(
+                    center: CGPoint(x: cx, y: cy),
+                    radius: radius,
+                    startAngle: startAngle,
+                    endAngle: endAngle,
+                    clockwise: false
+                )
+                context.stroke(
+                    arcPath,
+                    with: .color(Color.white.opacity(0.15)),
+                    lineWidth: 1.0
+                )
+
+                // 2. Ticks from 1.0 to 2.0 at 0.05 step
+                let currentZoom = zoomMonitor.zoomFactor
+                let anglePerUnit: CGFloat = 65.0
+
+                for i in 0...20 {
+                    let tickVal = 1.0 + CGFloat(i) * 0.05
+                    let deltaThetaDeg = (tickVal - currentZoom) * anglePerUnit
+                    guard abs(deltaThetaDeg) <= maxAngleDeg else { continue }
+
+                    let rad = deltaThetaDeg * .pi / 180.0
+                    let cosR = cos(rad)
+                    let sinR = sin(rad)
+
+                    let isKeyStop = (i == 0 || i == 10 || i == 20)
+                    let isTenth = (i % 2 == 0)
+
+                    let tickLength: CGFloat = isKeyStop ? 12.0 : (isTenth ? 8.0 : 5.0)
+                    let strokeWidth: CGFloat = isKeyStop ? 2.0 : (isTenth ? 1.4 : 1.0)
+
+                    let pOuter = CGPoint(
+                        x: cx - radius * cosR,
+                        y: cy - radius * sinR
+                    )
+                    let pInner = CGPoint(
+                        x: cx - (radius - tickLength) * cosR,
+                        y: cy - (radius - tickLength) * sinR
+                    )
+
+                    let normDist = abs(deltaThetaDeg) / maxAngleDeg
+                    let edgeFade = max(0.0, 1.0 - pow(normDist, 2.5))
+
+                    var tickPath = Path()
+                    tickPath.move(to: pOuter)
+                    tickPath.addLine(to: pInner)
+
+                    let tickColor: Color
+                    if isKeyStop {
+                        tickColor = Color.white.opacity(edgeFade * 0.95)
+                    } else if isTenth {
+                        tickColor = Color.white.opacity(edgeFade * 0.65)
+                    } else {
+                        tickColor = Color.white.opacity(edgeFade * 0.35)
+                    }
+
+                    context.stroke(
+                        tickPath,
+                        with: .color(tickColor),
+                        style: StrokeStyle(lineWidth: strokeWidth, lineCap: .round)
+                    )
+                }
+            }
+            .frame(width: 96, height: 210)
+
+            // Fixed Center Needle Indicator (Apex at X = 30; needle runs from X = 12 to X = 28)
+            HStack(spacing: 0) {
+                Spacer().frame(width: 12)
+
+                Circle()
+                    .fill(OwLensTheme.accent)
+                    .frame(width: 4, height: 4)
+                    .shadow(color: OwLensTheme.accent.opacity(0.8), radius: 3)
+
+                Rectangle()
+                    .fill(OwLensTheme.accent)
+                    .frame(width: 14, height: 2.5)
+                    .cornerRadius(1.25)
+                    .shadow(color: OwLensTheme.accent.opacity(0.6), radius: 2)
+
+                Spacer(minLength: 0)
+            }
+            .frame(width: 96)
+        }
+        .frame(width: 96, height: 210)
+        .contentShape(Rectangle())
+        .gesture(arcWheelGesture)
+    }
+
+    // MARK: - Arc Wheel Drag Gesture
+
+    private var arcWheelGesture: some Gesture {
+        DragGesture(minimumDistance: 1, coordinateSpace: .global)
+            .onChanged { value in
+                if !isArcDragging {
+                    isArcDragging = true
+                    arcDragInitialY = value.location.y
+                    arcDragStartZoom = zoomMonitor.zoomFactor
+                    arcLastHapticStep = Int(round(arcDragStartZoom * 20))
+                    zoomMonitor.cancelDismiss()
+                }
+
+                // PULLING DOWN ZOOMS IN (linear, direct, smooth, progressive):
+                let deltaY = value.location.y - arcDragInitialY
+                let sensitivity: CGFloat = 1.0 / 220.0
+                let targetZoom = max(1.0, min(2.0, arcDragStartZoom + deltaY * sensitivity))
+                zoomMonitor.setZoom(targetZoom)
+
+                let step = Int(round(targetZoom * 20))
+                if step != arcLastHapticStep {
+                    Haptics.selection()
+                    arcLastHapticStep = step
+                }
+            }
+            .onEnded { _ in
+                isArcDragging = false
+                zoomMonitor.scheduleDismiss(delaySeconds: 2.5)
+            }
+    }
+}
+
+// MARK: - Isolated Lens Button (Seamless Tap & Drag Gesture Handling)
+
+private struct LensButtonView: View {
+    let lens: LensOption
+    @ObservedObject var viewModel: CameraViewModel
+    @ObservedObject var zoomMonitor: ZoomMonitor
+
+    @State private var touchStartTime: CFTimeInterval = 0.0
+    @State private var touchStartLocation: CGPoint = .zero
+    @State private var isDragEngaged: Bool = false
+    @State private var dragAnchorY: CGFloat = 0.0
+    @State private var dragStartZoom: CGFloat = 1.0
+    @State private var lastHapticStep: Int = 0
+
+    private var isSelected: Bool {
+        viewModel.selectedLens?.id == lens.id
+    }
+
+    private var isZoomed: Bool {
+        isSelected && zoomMonitor.zoomFactor > 1.02
+    }
+
+    private var labelText: String {
+        if isZoomed {
+            return zoomMonitor.effectiveZoomString(baseMultiplier: lens.baseMultiplier)
+        } else if lens.baseMultiplier == 0.5 {
+            return "0.5"
+        } else if lens.baseMultiplier == 1.0 {
+            return "1"
+        } else if lens.baseMultiplier == 2.0 {
+            return "2"
+        } else {
+            return lens.shortLabel.replacingOccurrences(of: "×", with: "")
+        }
+    }
+
+    var body: some View {
+        ZStack {
+            if isZoomed {
+                Circle()
+                    .fill(Color.black.opacity(0.85))
+                    .overlay(
+                        Circle()
+                            .strokeBorder(OwLensTheme.accent, lineWidth: 1.5)
+                    )
+                    .shadow(color: OwLensTheme.accent.opacity(0.4), radius: 3)
+
+                Text(labelText)
+                    .font(.appMono(.bold, size: 9))
+                    .foregroundColor(OwLensTheme.accent)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.75)
+            } else if isSelected {
+                Circle()
+                    .fill(Color.white.opacity(0.24))
+                    .overlay(
+                        Circle()
+                            .strokeBorder(Color.white.opacity(0.45), lineWidth: 0.8)
+                    )
+
+                Text(labelText)
+                    .font(.appFont(.bold, size: 11))
+                    .foregroundColor(.white)
+                    .lineLimit(1)
+            } else {
+                Circle()
+                    .fill(OwLensTheme.glassBase)
+                    .overlay(
+                        Circle()
+                            .strokeBorder(OwLensTheme.glassBorder, lineWidth: 0.5)
+                    )
+
+                Text(labelText)
+                    .font(.appFont(.medium, size: 11))
+                    .foregroundColor(OwLensTheme.textSecondary)
+                    .lineLimit(1)
+            }
+        }
+        .frame(width: 32, height: 32)
+        .contentShape(Circle())
+        .gesture(lensGesture)
+    }
+
+    private var lensGesture: some Gesture {
+        DragGesture(minimumDistance: 0, coordinateSpace: .global)
+            .onChanged { value in
+                let now = CACurrentMediaTime()
+                if touchStartTime == 0 {
+                    touchStartTime = now
+                    touchStartLocation = value.location
+                    dragStartZoom = zoomMonitor.zoomFactor
+                    dragAnchorY = value.location.y
+                    lastHapticStep = Int(round(dragStartZoom * 20))
+                }
+
+                let deltaY = value.location.y - touchStartLocation.y
+
+                // Drag engages immediately when finger moves by 3pt (~0.75 mm), or on hold (> 0.25s)
+                if !isDragEngaged {
+                    if abs(deltaY) >= 3.0 || (now - touchStartTime >= 0.25) {
+                        isDragEngaged = true
+                        dragAnchorY = value.location.y // ZERO jump: anchor precisely where drag begins!
+                        dragStartZoom = zoomMonitor.zoomFactor
+                        lastHapticStep = Int(round(dragStartZoom * 20))
+                        withAnimation(.spring(response: 0.22, dampingFraction: 0.88)) {
+                            zoomMonitor.showWheel()
+                        }
+                    }
+                }
+
+                if isDragEngaged {
+                    // PULLING DOWN ZOOMS IN (linear, direct, smooth, progressive):
+                    let pullDelta = value.location.y - dragAnchorY
+                    let sensitivity: CGFloat = 1.0 / 220.0
+                    let targetZoom = max(1.0, min(2.0, dragStartZoom + pullDelta * sensitivity))
+                    zoomMonitor.setZoom(targetZoom)
+
+                    let step = Int(round(targetZoom * 20))
+                    if step != lastHapticStep {
+                        Haptics.selection()
+                        lastHapticStep = step
+                    }
+                }
+            }
+            .onEnded { value in
+                let now = CACurrentMediaTime()
+                let totalDelta = hypot(value.location.x - touchStartLocation.x, value.location.y - touchStartLocation.y)
+                let duration = now - touchStartTime
+
+                if isDragEngaged {
+                    isDragEngaged = false
+                    zoomMonitor.scheduleDismiss(delaySeconds: 2.5)
+                } else if totalDelta < 8.0 && duration < 0.6 {
+                    handleTap()
+                }
+
+                touchStartTime = 0
+                touchStartLocation = .zero
+            }
+    }
+
+    private func handleTap() {
+        guard !viewModel.isSwitchingLens else { return }
+
+        if isSelected {
+            // Tapping the active lens re-opens the zoom wheel at current framing
+            Haptics.selection()
+            withAnimation(.spring(response: 0.25, dampingFraction: 0.85)) {
+                zoomMonitor.showWheel()
+                zoomMonitor.scheduleDismiss(delaySeconds: 2.5)
+            }
+        } else {
+            if viewModel.isRecording {
+                Haptics.notification(.warning)
+                viewModel.activeToast = "Lens locked during recording"
+            } else {
+                Haptics.selection()
+                viewModel.selectedLens = lens
+                zoomMonitor.resetZoom()
+            }
         }
     }
 }
