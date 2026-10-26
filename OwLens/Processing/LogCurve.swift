@@ -130,7 +130,13 @@ enum LogCurve {
         guard rMax > rKnee + 1e-4, peak > rKnee else { return rgb }
         let peakShoulder = applyHighlightShoulder(peak, rKnee: rKnee, rMax: rMax)
         let scale = peakShoulder / max(peak, 1e-6)
-        return rgb * scale
+        let scaled = rgb * scale
+
+        // Filmic highlight desaturation: smooth quadratic roll-off to pure neutral white
+        // as intensity enters specular highlight compression (rKnee=0.90 up to 2.0x linear).
+        let t = min(max((peak - rKnee) / max(min(rMax, 2.0) - rKnee, 1e-4), 0.0), 1.0)
+        let desat = t * t
+        return simd_mix(scaled, SIMD3<Float>(repeating: peakShoulder), SIMD3<Float>(repeating: desat))
     }
 
     static func apply(_ rgb: SIMD3<Float>, type: LogCurveType, headroomScale: Float = 1.0) -> SIMD3<Float> {

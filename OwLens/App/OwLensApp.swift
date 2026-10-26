@@ -92,6 +92,12 @@ struct RootView: View {
                             }
                             return
                         }
+                        if viewModel.zoomMonitor.isSwitcherExpanded || viewModel.zoomMonitor.isWheelActive {
+                            withAnimation(.spring(response: 0.28, dampingFraction: 0.84)) {
+                                viewModel.zoomMonitor.hideWheelAndSwitcher()
+                            }
+                            return
+                        }
                         guard videoRect.contains(loc) else { return }
                         let nx = (loc.x - videoRect.minX) / videoRect.width
                         let ny = (loc.y - videoRect.minY) / videoRect.height

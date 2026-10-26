@@ -9,13 +9,19 @@ struct ControlsView: View {
     var body: some View {
         GeometryReader { geo in
             ZStack {
-                // Top HUD Status Bar
-                topStatusBar(in: geo)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+                // Lens Switcher & Circular Zoom Wheel (Underneath all other UI controls)
+                lensAndZoomWheelLayer(in: geo)
+                    .zIndex(0)
 
                 // Left Monitoring Tools Rail
                 leftToolRail(in: geo)
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+                    .zIndex(1)
+
+                // Top HUD Status Bar
+                topStatusBar(in: geo)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+                    .zIndex(2)
 
                 // Bottom Exposure Deck & Transient Panels
                 VStack(spacing: 8) {
@@ -24,10 +30,12 @@ struct ControlsView: View {
                     bottomExposureDeck(in: geo)
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
+                .zIndex(3)
 
-                // Right Record Grip (Record button + Scopes below)
+                // Right Record Grip (Shutter Trigger & Scopes on top)
                 rightRecordGrip(in: geo)
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .trailing)
+                    .zIndex(4)
 
                 // Interactive Toast Pill
                 if let toast = viewModel.activeToast {
@@ -1532,12 +1540,9 @@ struct ControlsView: View {
         let safeTrailing = ScreenGeometry.trailingPadding(in: geo)
 
         return ZStack(alignment: .trailing) {
-            // Shutter / Record Trigger & Circular Zoom Wheel / Lens Switcher
-            HStack(spacing: 12) {
-                LensAndZoomWheelControl(viewModel: viewModel, zoomMonitor: viewModel.zoomMonitor)
-                recordButton
-            }
-            .frame(maxHeight: .infinity, alignment: .center)
+            // Shutter / Record Trigger
+            recordButton
+                .frame(maxHeight: .infinity, alignment: .center)
 
             // Scopes / Histogram Monitor - Positioned directly ABOVE the centered record button
             if viewModel.showScopes {
@@ -1552,6 +1557,19 @@ struct ControlsView: View {
             }
         }
         .padding(.trailing, safeTrailing)
+    }
+
+    // MARK: - Lens Switcher & Zoom Wheel Layer (Underneath all other UI)
+
+    private func lensAndZoomWheelLayer(in geo: GeometryProxy) -> some View {
+        let safeTrailing = ScreenGeometry.trailingPadding(in: geo)
+
+        return HStack(spacing: 0) {
+            Spacer()
+            LensAndZoomWheelControl(viewModel: viewModel, zoomMonitor: viewModel.zoomMonitor)
+                .padding(.trailing, safeTrailing + 104 + 12)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
     }
 
     private var recordButton: some View {
@@ -1650,9 +1668,13 @@ private struct LensAndZoomWheelControl: View {
         viewModel.availableLenses.sorted(by: { $0.baseMultiplier > $1.baseMultiplier })
     }
 
+    private var isExpanded: Bool {
+        zoomMonitor.isSwitcherExpanded
+    }
+
     var body: some View {
         HStack(alignment: .center, spacing: 6) {
-            if zoomMonitor.isWheelActive {
+            if isExpanded || zoomMonitor.isWheelActive {
                 tinyZoomReadout
                     .transition(.opacity)
 
@@ -1662,7 +1684,15 @@ private struct LensAndZoomWheelControl: View {
 
             verticalLensButtons
         }
-        .animation(.spring(response: 0.24, dampingFraction: 0.85), value: zoomMonitor.isWheelActive)
+        .animation(.spring(response: 0.28, dampingFraction: 0.84), value: isExpanded)
+        .animation(.spring(response: 0.28, dampingFraction: 0.84), value: zoomMonitor.isWheelActive)
+        .onChange(of: viewModel.activePanel) { panel in
+            if panel != nil && isExpanded {
+                withAnimation(.spring(response: 0.24, dampingFraction: 0.85)) {
+                    zoomMonitor.hideWheelAndSwitcher()
+                }
+            }
+        }
     }
 
     // MARK: - Vertical Lens Buttons
@@ -1670,7 +1700,39 @@ private struct LensAndZoomWheelControl: View {
     private var verticalLensButtons: some View {
         VStack(spacing: 4) {
             ForEach(orderedLenses) { lens in
-                LensButtonView(lens: lens, viewModel: viewModel, zoomMonitor: zoomMonitor)
+                let isSelected = (viewModel.selectedLens?.id == lens.id) || (viewModel.selectedLens == nil && lens.baseMultiplier == 1.0)
+                if isExpanded || isSelected {
+                    LensButtonView(
+                        lens: lens,
+                        isSelected: isSelected,
+                        viewModel: viewModel,
+                        zoomMonitor: zoomMonitor,
+                        onTap: {
+                            if isSelected {
+                                zoomMonitor.toggleSwitcher()
+                            } else {
+                                handleSelectOtherLens(lens)
+                            }
+                        },
+                        onDragStart: {
+                            zoomMonitor.cancelDismiss()
+                            if !zoomMonitor.isSwitcherExpanded {
+                                withAnimation(.spring(response: 0.28, dampingFraction: 0.84)) {
+                                    zoomMonitor.showWheelAndSwitcher()
+                                }
+                            }
+                        },
+                        onDragEnd: {
+                            zoomMonitor.scheduleDismiss(delaySeconds: 2.5)
+                        }
+                    )
+                    .transition(
+                        .asymmetric(
+                            insertion: .opacity.combined(with: .scale(scale: 0.5)),
+                            removal: .opacity.combined(with: .scale(scale: 0.5))
+                        )
+                    )
+                }
             }
         }
         .padding(.horizontal, 3)
@@ -1683,6 +1745,25 @@ private struct LensAndZoomWheelControl: View {
             Capsule()
                 .strokeBorder(OwLensTheme.glassBorder, lineWidth: 0.5)
         )
+        .animation(.spring(response: 0.28, dampingFraction: 0.84), value: isExpanded)
+        .animation(.spring(response: 0.28, dampingFraction: 0.84), value: viewModel.selectedLens?.id)
+    }
+
+    private func handleSelectOtherLens(_ lens: LensOption) {
+        guard !viewModel.isSwitchingLens else { return }
+
+        if viewModel.isRecording {
+            Haptics.notification(.warning)
+            viewModel.activeToast = "Lens locked during recording"
+            zoomMonitor.scheduleDismiss(delaySeconds: 3.5)
+        } else {
+            Haptics.selection()
+            withAnimation(.spring(response: 0.28, dampingFraction: 0.84)) {
+                viewModel.selectedLens = lens
+                zoomMonitor.resetZoom()
+            }
+            zoomMonitor.scheduleDismiss(delaySeconds: 3.5)
+        }
     }
 
     // MARK: - Tiny Zoom Readout
@@ -1694,9 +1775,10 @@ private struct LensAndZoomWheelControl: View {
                 withAnimation(.spring(response: 0.25, dampingFraction: 0.85)) {
                     zoomMonitor.resetZoom()
                 }
+                zoomMonitor.scheduleDismiss(delaySeconds: 3.5)
             } else {
                 withAnimation(.spring(response: 0.25, dampingFraction: 0.85)) {
-                    zoomMonitor.hideWheel()
+                    zoomMonitor.hideWheelAndSwitcher()
                 }
             }
         } label: {
@@ -1859,8 +1941,12 @@ private struct LensAndZoomWheelControl: View {
 
 private struct LensButtonView: View {
     let lens: LensOption
+    let isSelected: Bool
     @ObservedObject var viewModel: CameraViewModel
     @ObservedObject var zoomMonitor: ZoomMonitor
+    let onTap: () -> Void
+    let onDragStart: () -> Void
+    let onDragEnd: () -> Void
 
     @State private var touchStartTime: CFTimeInterval = 0.0
     @State private var touchStartLocation: CGPoint = .zero
@@ -1868,10 +1954,6 @@ private struct LensButtonView: View {
     @State private var dragAnchorY: CGFloat = 0.0
     @State private var dragStartZoom: CGFloat = 1.0
     @State private var lastHapticStep: Int = 0
-
-    private var isSelected: Bool {
-        viewModel.selectedLens?.id == lens.id
-    }
 
     private var isZoomed: Bool {
         isSelected && zoomMonitor.zoomFactor > 1.02
@@ -1959,9 +2041,7 @@ private struct LensButtonView: View {
                         dragAnchorY = value.location.y // ZERO jump: anchor precisely where drag begins!
                         dragStartZoom = zoomMonitor.zoomFactor
                         lastHapticStep = Int(round(dragStartZoom * 20))
-                        withAnimation(.spring(response: 0.22, dampingFraction: 0.88)) {
-                            zoomMonitor.showWheel()
-                        }
+                        onDragStart()
                     }
                 }
 
@@ -1986,36 +2066,14 @@ private struct LensButtonView: View {
 
                 if isDragEngaged {
                     isDragEngaged = false
-                    zoomMonitor.scheduleDismiss(delaySeconds: 2.5)
+                    onDragEnd()
                 } else if totalDelta < 8.0 && duration < 0.6 {
-                    handleTap()
+                    onTap()
                 }
 
                 touchStartTime = 0
                 touchStartLocation = .zero
             }
-    }
-
-    private func handleTap() {
-        guard !viewModel.isSwitchingLens else { return }
-
-        if isSelected {
-            // Tapping the active lens re-opens the zoom wheel at current framing
-            Haptics.selection()
-            withAnimation(.spring(response: 0.25, dampingFraction: 0.85)) {
-                zoomMonitor.showWheel()
-                zoomMonitor.scheduleDismiss(delaySeconds: 2.5)
-            }
-        } else {
-            if viewModel.isRecording {
-                Haptics.notification(.warning)
-                viewModel.activeToast = "Lens locked during recording"
-            } else {
-                Haptics.selection()
-                viewModel.selectedLens = lens
-                zoomMonitor.resetZoom()
-            }
-        }
     }
 }
 

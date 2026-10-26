@@ -125,7 +125,21 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
             )
             try audioSession.setPreferredSampleRate(48_000)
             try audioSession.setPreferredIOBufferDuration(0.02)
-            try audioSession.setActive(true)
+            if #available(iOS 27.0, *) {
+                audioSession.activate(options: []) { _, error in
+                    if let error {
+                        print("[CaptureController] Audio session async activate failed (non-fatal): \(error)")
+                    }
+                }
+            } else {
+                DispatchQueue.global(qos: .userInitiated).async {
+                    do {
+                        try audioSession.setActive(true)
+                    } catch {
+                        print("[CaptureController] Audio session configure failed (non-fatal): \(error)")
+                    }
+                }
+            }
             AudioServicesDisposeSystemSoundID(1108)
         } catch {
             print("[CaptureController] Audio session configure failed (non-fatal): \(error)")
@@ -1154,7 +1168,7 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
         // Unique settings object every shot (required). Type matches prepared array.
         let settings = makeRAWPhotoSettings()
         captureLock.withLock {
-            activeCaptureIDs.insert(settings.uniqueID)
+            _ = activeCaptureIDs.insert(settings.uniqueID)
         }
         photoOutput.capturePhoto(with: settings, delegate: self)
     }

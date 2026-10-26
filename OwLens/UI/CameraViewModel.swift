@@ -52,6 +52,7 @@ final class AudioMonitor: ObservableObject {
 final class ZoomMonitor: ObservableObject {
     @Published private(set) var zoomFactor: CGFloat = 1.0
     @Published var isWheelActive: Bool = false
+    @Published var isSwitcherExpanded: Bool = false
 
     weak var metalPipeline: MetalPipeline?
     var onZoomChanged: (@Sendable (Float) -> Void)?
@@ -79,18 +80,46 @@ final class ZoomMonitor: ObservableObject {
         setZoom(1.0)
     }
 
-    func showWheel() {
+    func showWheelAndSwitcher() {
+        cancelDismiss()
         if !isWheelActive {
             isWheelActive = true
         }
-        cancelDismiss()
+        if !isSwitcherExpanded {
+            isSwitcherExpanded = true
+        }
     }
 
-    func hideWheel() {
+    func hideWheelAndSwitcher() {
         cancelDismiss()
         if isWheelActive {
             isWheelActive = false
         }
+        if isSwitcherExpanded {
+            isSwitcherExpanded = false
+        }
+    }
+
+    func toggleSwitcher() {
+        Haptics.selection()
+        if isSwitcherExpanded {
+            withAnimation(.spring(response: 0.28, dampingFraction: 0.84)) {
+                hideWheelAndSwitcher()
+            }
+        } else {
+            withAnimation(.spring(response: 0.28, dampingFraction: 0.84)) {
+                showWheelAndSwitcher()
+            }
+            scheduleDismiss(delaySeconds: 3.5)
+        }
+    }
+
+    func showWheel() {
+        showWheelAndSwitcher()
+    }
+
+    func hideWheel() {
+        hideWheelAndSwitcher()
     }
 
     func cancelDismiss() {
@@ -98,13 +127,14 @@ final class ZoomMonitor: ObservableObject {
         zoomDismissTask = nil
     }
 
-    func scheduleDismiss(delaySeconds: Double = 2.5) {
+    func scheduleDismiss(delaySeconds: Double = 3.5) {
         zoomDismissTask?.cancel()
         zoomDismissTask = Task { @MainActor in
             try? await Task.sleep(nanoseconds: UInt64(delaySeconds * 1_000_000_000))
             guard !Task.isCancelled else { return }
-            withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
+            withAnimation(.spring(response: 0.28, dampingFraction: 0.84)) {
                 self.isWheelActive = false
+                self.isSwitcherExpanded = false
             }
         }
     }
@@ -980,6 +1010,7 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
             activePanel = nil
         } else {
             activePanel = panel
+            zoomMonitor.hideWheelAndSwitcher()
             // Fresh mic list when opening MIC (hot-plug refresh)
             if panel == .mic {
                 refreshAudioSources()

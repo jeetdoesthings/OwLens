@@ -51,7 +51,10 @@ kernel void correctDefectPixelsBayer(
     if (gid.x >= dst.get_width() || gid.y >= dst.get_height()) return;
 
     float center = src.read(gid).r;
-    if (noise.denoiseStrength <= 0.001f) {
+    // Defect pixels only exist in the noise floor and midtones. Saturated highlights and
+    // high-contrast optical specular peaks must bypass DPC to prevent false outlier clamping
+    // on distance-2 Red/Blue neighbors, which creates artificial greenish fringing.
+    if (noise.denoiseStrength <= 0.001f || center >= 0.85f * params.whiteLevel) {
         dst.write(float4(center, 0.0f, 0.0f, 1.0f), gid);
         return;
     }
@@ -133,7 +136,14 @@ static inline float3 applyHighlightShoulder3(float3 rgb, float rKnee, float rMax
 
     float peakShoulder = applyHighlightShoulderMetal(peak, rKnee, rMax);
     float scale = peakShoulder / max(peak, 1e-6f);
-    return rgb * scale;
+    float3 scaled = rgb * scale;
+
+    // Filmic highlight desaturation: smooth quadratic roll-off to pure neutral white
+    // as intensity enters specular highlight compression (rKnee=0.90 up to 2.0x linear).
+    // Eliminates sensor CFA clipping tint / demosaic green fringing on bright practicals and sky.
+    float t = clamp((peak - rKnee) / max(min(rMax, 2.0f) - rKnee, 1e-4f), 0.0f, 1.0f);
+    float desat = t * t;
+    return mix(scaled, float3(peakShoulder), desat);
 }
 
 static inline float3 encodeLogCurve(float3 rgb, int curveType, float headroomScale = 1.0f) {
@@ -348,17 +358,17 @@ kernel void debayerFusedLog(
     rgb = colorMatrix * rgb;
     rgb = max(rgb, float3(0.0));
 
-    // Clipping flag and subtle organic highlight desaturation only on extreme physical sensor saturation.
-    // Preserves rich color (skies, sunsets, lamps, skin tones) while preventing channel blowout artifacts.
+    // Clipping flag and organic highlight desaturation on physical sensor saturation.
+    // Preserves rich color (skies, sunsets, lamps, skin tones) while smoothly rolling clipped channels to neutral white.
     float rawPeak = max(r, max(g, b));
     bool isClipped = (rawPeak >= 0.985f);
     float alpha = isClipped ? 0.0f : 1.0f;
 
-    if (rawPeak >= 0.98f) {
-        float u = clamp((rawPeak - 0.98f) * 50.0f, 0.0f, 1.0f);
-        float desat = u * u * 0.35f; // Gentle 35% max desaturation at extreme edge
-        float luma = dot(rgb, float3(0.2627f, 0.6780f, 0.0593f));
-        rgb = mix(rgb, float3(luma), desat);
+    if (rawPeak >= 0.94f) {
+        float u = clamp((rawPeak - 0.94f) * 20.0f, 0.0f, 1.0f);
+        float desat = u * u; // Smooth quadratic roll-off to 100% white at sensor saturation
+        float peakVal = max(rgb.r, max(rgb.g, rgb.b));
+        rgb = mix(rgb, float3(peakVal), desat);
     }
 
     // ── Direct Log OETF Encoding ──
