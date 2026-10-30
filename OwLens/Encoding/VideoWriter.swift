@@ -28,6 +28,7 @@ final class VideoWriter: @unchecked Sendable {
     private var sessionStartTime: CMTime = .invalid
     private var lastVideoPTS: CMTime = .invalid
     private var lastAudioPTS: CMTime = .invalid
+    private var lastAudioEndPTS: CMTime = .invalid
     private var lastFrameCaptureTime: CMTime = .invalid
     private var lastFrameHostTime: CFTimeInterval = 0
     private var hasStartedSession = false
@@ -210,6 +211,7 @@ final class VideoWriter: @unchecked Sendable {
         self.sessionStartTime = .invalid
         self.lastVideoPTS = .invalid
         self.lastAudioPTS = .invalid
+        self.lastAudioEndPTS = .invalid
         self.hasStartedSession = false
         self.lastPixelBuffer = nil
         self.audioReferenceTime = .invalid
@@ -269,19 +271,31 @@ final class VideoWriter: @unchecked Sendable {
                 if CMTimeCompare(bufferEnd, refTime) <= 0 {
                     continue
                 }
-            } else if CMTimeCompare(timings[0].presentationTimeStamp, refTime) < 0 {
+            }
+            if CMTimeCompare(timings[0].presentationTimeStamp, refTime) < 0 {
                 continue
             }
 
             for i in 0..<timings.count {
-                var pts = CMTimeSubtract(timings[i].presentationTimeStamp, refTime)
-                if CMTimeCompare(pts, .zero) < 0 { pts = .zero }
-                if lastAudioPTS.isValid && CMTimeCompare(pts, lastAudioPTS) <= 0 {
-                    let bufferDur = timings[i].duration.isValid ? timings[i].duration : CMTime(value: 1024, timescale: 48000)
-                    pts = CMTimeAdd(lastAudioPTS, bufferDur)
+                let rawPTS = CMTimeSubtract(timings[i].presentationTimeStamp, refTime)
+                let bufferDur = timings[i].duration.isValid ? timings[i].duration : CMTime(value: 1024, timescale: 48000)
+                let pts: CMTime
+                if self.lastAudioEndPTS.isValid {
+                    let delta = CMTimeGetSeconds(CMTimeSubtract(rawPTS, self.lastAudioEndPTS))
+                    if abs(delta) < 0.050 {
+                        pts = self.lastAudioEndPTS
+                    } else if CMTimeCompare(rawPTS, self.lastAudioEndPTS) < 0 {
+                        pts = self.lastAudioEndPTS
+                    } else {
+                        pts = rawPTS
+                    }
+                } else {
+                    pts = max(rawPTS, .zero)
                 }
+
                 timings[i].presentationTimeStamp = pts
-                lastAudioPTS = pts
+                self.lastAudioPTS = pts
+                self.lastAudioEndPTS = CMTimeAdd(pts, bufferDur)
                 if timings[i].decodeTimeStamp.isValid {
                     timings[i].decodeTimeStamp = pts
                 }
@@ -394,8 +408,10 @@ final class VideoWriter: @unchecked Sendable {
         // Strict Constant Frame Rate (CFR):
         // Each frame s is mathematically presented at t = s / targetFPS.
         // targetSlot is the nearest 24.000 FPS grid slot corresponding to elapsed optical time.
-        // targetSlot is guaranteed >= frameCount (strictly monotonic timeline).
-        let targetSlot = max(frameCount, Int64(round(elapsed * targetFPS)))
+        // We use floor() instead of round() so normal timing jitter (< 1 frame period) NEVER
+        // triggers false duplicate hold-frame insertions. Hold frames are ONLY inserted when a full
+        // frame period has actually been missed by the sensor or pipeline.
+        let targetSlot = max(frameCount, Int64(floor(elapsed * targetFPS)))
 
         // Drain any pending audio buffers now that video input might have made room
         drainPendingAudioBuffersLocked()
@@ -573,21 +589,36 @@ final class VideoWriter: @unchecked Sendable {
             }
             let refTime = sessionStartTime.isValid ? sessionStartTime : audioReferenceTime
 
-            if sessionStartTime.isValid, singleTiming.duration.isValid {
-                let bufferEnd = CMTimeAdd(singleTiming.presentationTimeStamp, singleTiming.duration)
-                if CMTimeCompare(bufferEnd, refTime) <= 0 {
+            if sessionStartTime.isValid {
+                if singleTiming.duration.isValid {
+                    let bufferEnd = CMTimeAdd(singleTiming.presentationTimeStamp, singleTiming.duration)
+                    if CMTimeCompare(bufferEnd, refTime) <= 0 {
+                        return true
+                    }
+                }
+                if CMTimeCompare(singleTiming.presentationTimeStamp, refTime) < 0 {
                     return true
                 }
             }
 
-            var pts = CMTimeSubtract(singleTiming.presentationTimeStamp, refTime)
-            if CMTimeCompare(pts, .zero) < 0 { pts = .zero }
-            if lastAudioPTS.isValid && CMTimeCompare(pts, lastAudioPTS) <= 0 {
-                let bufferDur = singleTiming.duration.isValid ? singleTiming.duration : CMTime(value: 1024, timescale: 48000)
-                pts = CMTimeAdd(lastAudioPTS, bufferDur)
+            let rawPTS = CMTimeSubtract(singleTiming.presentationTimeStamp, refTime)
+            let bufferDur = singleTiming.duration.isValid ? singleTiming.duration : CMTime(value: 1024, timescale: 48000)
+            let pts: CMTime
+            if lastAudioEndPTS.isValid {
+                let delta = CMTimeGetSeconds(CMTimeSubtract(rawPTS, lastAudioEndPTS))
+                if abs(delta) < 0.050 {
+                    pts = lastAudioEndPTS
+                } else if CMTimeCompare(rawPTS, lastAudioEndPTS) < 0 {
+                    pts = lastAudioEndPTS
+                } else {
+                    pts = rawPTS
+                }
+            } else {
+                pts = max(rawPTS, .zero)
             }
             singleTiming.presentationTimeStamp = pts
             lastAudioPTS = pts
+            lastAudioEndPTS = CMTimeAdd(pts, bufferDur)
             if singleTiming.decodeTimeStamp.isValid {
                 singleTiming.decodeTimeStamp = pts
             }
@@ -631,25 +662,38 @@ final class VideoWriter: @unchecked Sendable {
         }
         let refTime = sessionStartTime.isValid ? sessionStartTime : audioReferenceTime
 
-        // If this audio buffer finished completely before session start, skip pre-roll
-        if sessionStartTime.isValid, timings[0].duration.isValid {
-            let bufferEnd = CMTimeAdd(timings[0].presentationTimeStamp, timings[0].duration)
-            if CMTimeCompare(bufferEnd, refTime) <= 0 {
+        // If this audio buffer finished or started before session start, skip pre-roll
+        if sessionStartTime.isValid {
+            if timings[0].duration.isValid {
+                let bufferEnd = CMTimeAdd(timings[0].presentationTimeStamp, timings[0].duration)
+                if CMTimeCompare(bufferEnd, refTime) <= 0 {
+                    return true
+                }
+            }
+            if CMTimeCompare(timings[0].presentationTimeStamp, refTime) < 0 {
                 return true
             }
         }
 
         for i in 0..<timings.count {
-            var pts = CMTimeSubtract(timings[i].presentationTimeStamp, refTime)
-            if CMTimeCompare(pts, .zero) < 0 {
-                pts = .zero
-            }
-            if lastAudioPTS.isValid && CMTimeCompare(pts, lastAudioPTS) <= 0 {
-                let bufferDur = timings[i].duration.isValid ? timings[i].duration : CMTime(value: 1024, timescale: 48000)
-                pts = CMTimeAdd(lastAudioPTS, bufferDur)
+            let rawPTS = CMTimeSubtract(timings[i].presentationTimeStamp, refTime)
+            let bufferDur = timings[i].duration.isValid ? timings[i].duration : CMTime(value: 1024, timescale: 48000)
+            let pts: CMTime
+            if lastAudioEndPTS.isValid {
+                let delta = CMTimeGetSeconds(CMTimeSubtract(rawPTS, lastAudioEndPTS))
+                if abs(delta) < 0.050 {
+                    pts = lastAudioEndPTS
+                } else if CMTimeCompare(rawPTS, lastAudioEndPTS) < 0 {
+                    pts = lastAudioEndPTS
+                } else {
+                    pts = rawPTS
+                }
+            } else {
+                pts = max(rawPTS, .zero)
             }
             timings[i].presentationTimeStamp = pts
             lastAudioPTS = pts
+            lastAudioEndPTS = CMTimeAdd(pts, bufferDur)
             if timings[i].decodeTimeStamp.isValid {
                 timings[i].decodeTimeStamp = pts
             }
@@ -718,6 +762,7 @@ final class VideoWriter: @unchecked Sendable {
         sessionStartTime = .invalid
         lastVideoPTS = .invalid
         lastAudioPTS = .invalid
+        lastAudioEndPTS = .invalid
         hasStartedSession = false
         lastPixelBuffer = nil
         let writer = assetWriter

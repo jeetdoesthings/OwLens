@@ -623,6 +623,7 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
     nonisolated(unsafe) private var activeFPS: Double = 30
     nonisolated(unsafe) private var activeZoomFactorUnsafe: Float = 1.0
     nonisolated(unsafe) private var isRecordingUnsafe = false
+    nonisolated(unsafe) private var activeRecordingSessionID: UInt64 = 0
     nonisolated(unsafe) private var isAudioRecordingActive = false
     nonisolated(unsafe) private var currentOrientationUnsafe: UIInterfaceOrientation = .landscapeRight
     nonisolated(unsafe) private var recordingOrientationUnsafe: UIInterfaceOrientation = .landscapeRight
@@ -1751,6 +1752,7 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
         metalPipeline?.prewarm(width: selectedFormat.width, height: selectedFormat.height, curveType: selectedCurve)
         frameBuffer.flush()
         captureController.setRecordingMode(true)
+        activeRecordingSessionID = captureController.activeRecordingSessionID
         let effectiveBitrate = min(selectedBitrate.bitsPerSecond, selectedFormat.maxBitratePreset.bitsPerSecond)
         if effectiveBitrate < selectedBitrate.bitsPerSecond {
             print("[CameraViewModel] Bitrate clamped: \(selectedBitrate.label)Mbps → \(selectedFormat.maxBitratePreset.label)Mbps (max for \(selectedFormat.shortLabel))")
@@ -1910,6 +1912,7 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
         recordingQueue.async { [weak self] in
             guard let self else { return }
             self.isRecordingUnsafe = false
+            self.activeRecordingSessionID = 0
             self.videoWriter.finish { [weak self] url, error in
                 self?.processQueue.async {
                     self?.metalPipeline?.trimMemory()
@@ -2249,12 +2252,13 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
         if isRecordingUnsafe {
             // FIFO during recording: process every single captured frame in order without skipping
             frame = frameBuffer.dequeue()
-            if var f = frame {
+            if let f = frame, f.recordingSessionID == activeRecordingSessionID && f.recordingSessionID > 0 {
+                var sequencedFrame = f
                 processLock.withLock {
-                    f.sequenceID = nextDispatchSequenceID
+                    sequencedFrame.sequenceID = nextDispatchSequenceID
                     nextDispatchSequenceID &+= 1
                 }
-                frame = f
+                frame = sequencedFrame
             }
         } else {
             // Preview only: drop older backlog frames to keep viewfinder latency minimal
@@ -2353,9 +2357,11 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
         let w = activeEncodeWidth
         let h = activeEncodeHeight
 
-        pipeline.orientation = isRecordingUnsafe ? recordingOrientationUnsafe : currentOrientationUnsafe
+        let isRecordingFrame = isRecordingUnsafe && frameData.recordingSessionID == activeRecordingSessionID && frameData.recordingSessionID > 0
 
-        if isRecordingUnsafe {
+        pipeline.orientation = isRecordingFrame ? recordingOrientationUnsafe : currentOrientationUnsafe
+
+        if isRecordingFrame {
             // ── Recording ──
             let isThermalElevated = (metalPipeline?.thermalState.rawValue ?? 0) >= ProcessInfo.ThermalState.serious.rawValue
             pipeline.processingQuality = isThermalElevated ? .previewFast : .recordQuality
@@ -2440,7 +2446,8 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
         frameData: RawFrameData,
         completion: @escaping () -> Void
     ) {
-        guard isRecordingUnsafe else {
+        let isRecordingFrame = isRecordingUnsafe && frameData.recordingSessionID == activeRecordingSessionID && frameData.recordingSessionID > 0
+        guard isRecordingFrame else {
             // Preview path: release GPU slot immediately, no reordering needed
             completion()
             if let framed {
@@ -2529,7 +2536,8 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
 
         updateScopesIfNeeded(from: framed, pipeline: metalPipeline)
 
-        if let bgraPB, (isRecordingUnsafe || isTailFlush) {
+        let isRecordingFrame = (isRecordingUnsafe || isTailFlush) && frameData.recordingSessionID == activeRecordingSessionID && frameData.recordingSessionID > 0
+        if let bgraPB, isRecordingFrame {
             let timestamp = frameData.timestamp
             recordingQueue.async { [weak self] in
                 guard let self else { return }

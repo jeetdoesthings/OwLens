@@ -31,6 +31,7 @@ struct RawFrameData {
     let sgamutMatrix: simd_float3x3?
     let timestamp: CMTime
     var sequenceID: UInt64 = 0
+    let recordingSessionID: UInt64
     let kelvin: Float?
     let tint: Float?
 }
@@ -58,6 +59,12 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
     private var maxInFlight = 4
     private var isCapturePending = false
     private var activeCaptureIDs: Set<Int64> = []
+    private var currentRecordingSessionID: UInt64 = 0
+    private var captureSessionIDs: [Int64: UInt64] = [:]
+
+    var activeRecordingSessionID: UInt64 {
+        captureLock.withLock { currentRecordingSessionID }
+    }
 
     var onRawFrameData: ((RawFrameData) -> Void)?
     var onAudioSample: ((CMSampleBuffer) -> Void)?
@@ -291,7 +298,12 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
         if #available(iOS 16.0, *) {
             if let dev = device {
                 let supported = dev.activeFormat.supportedMaxPhotoDimensions
-                if let maximum = supported.max(by: { ($0.width * $0.height) < ($1.width * $1.height) }) {
+                // Cap to 12MP (4032x3024) for sustained continuous cinema burst capture.
+                // 48MP Bayer RAW takes ~50ms sensor readout and ISP transfer (~97MB/frame),
+                // physically limiting throughput to ~18 fps and causing frame drops/stutter.
+                // 12MP binned sensor readout sustains true 24.000 fps without drops or RAM stalls.
+                let eligible = supported.filter { $0.width <= 4032 && $0.height <= 3024 }
+                if let maximum = (eligible.isEmpty ? supported : eligible).max(by: { ($0.width * $0.height) < ($1.width * $1.height) }) {
                     cachedMaxPhotoDimensions = maximum
                 }
             } else {
@@ -429,9 +441,15 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
             var targetW = 0
             var targetH = 0
             if #available(iOS 16.0, *) {
-                if let best = cam.activeFormat.supportedMaxPhotoDimensions.max(by: { ($0.width * $0.height) < ($1.width * $1.height) }) {
+                if let best = cachedMaxPhotoDimensions {
                     targetW = Int(best.width)
                     targetH = Int(best.height)
+                } else {
+                    let eligible = cam.activeFormat.supportedMaxPhotoDimensions.filter { $0.width <= 4032 && $0.height <= 3024 }
+                    if let best = (eligible.isEmpty ? cam.activeFormat.supportedMaxPhotoDimensions : eligible).max(by: { ($0.width * $0.height) < ($1.width * $1.height) }) {
+                        targetW = Int(best.width)
+                        targetH = Int(best.height)
+                    }
                 }
             }
             if targetW == 0 || targetH == 0 {
@@ -475,12 +493,11 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
                 settings.maxPhotoDimensions = maxDims
             } else if let dev = device {
                 let supported = dev.activeFormat.supportedMaxPhotoDimensions
-                if let best = supported.max(by: { ($0.width * $0.height) < ($1.width * $1.height) }) {
+                let eligible = supported.filter { $0.width <= 4032 && $0.height <= 3024 }
+                if let best = (eligible.isEmpty ? supported : eligible).max(by: { ($0.width * $0.height) < ($1.width * $1.height) }) {
                     cachedMaxPhotoDimensions = best
                     settings.maxPhotoDimensions = best
                 }
-            } else if let maxDims = cachedMaxPhotoDimensions {
-                settings.maxPhotoDimensions = maxDims
             }
         }
         if #available(iOS 18.0, *) {
@@ -1103,7 +1120,15 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
     /// Maintains a deep pipeline so sensor exposure and RAW delivery overlap.
     /// Must be called from the main thread.
     func setRecordingMode(_ recording: Bool) {
-        isRecordingMode = recording
+        captureLock.withLock {
+            isRecordingMode = recording
+            if recording {
+                currentRecordingSessionID &+= 1
+            } else {
+                currentRecordingSessionID = 0
+                captureSessionIDs.removeAll()
+            }
+        }
         if recording {
             enableBurstHelpersIfSafe()
         }
@@ -1169,6 +1194,9 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
         let settings = makeRAWPhotoSettings()
         captureLock.withLock {
             _ = activeCaptureIDs.insert(settings.uniqueID)
+            if isRecordingMode && currentRecordingSessionID > 0 {
+                captureSessionIDs[settings.uniqueID] = currentRecordingSessionID
+            }
         }
         photoOutput.capturePhoto(with: settings, delegate: self)
     }
@@ -1177,6 +1205,7 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
         captureLock.withLock {
             if let uid = uniqueID {
                 activeCaptureIDs.remove(uid)
+                captureSessionIDs.removeValue(forKey: uid)
             }
             inFlightCaptures = max(0, inFlightCaptures - 1)
         }
@@ -1474,6 +1503,10 @@ extension CaptureController: AVCapturePhotoCaptureDelegate {
             cachedColorMatrices = colorMatrices
         }
 
+        let shotSessionID: UInt64 = captureLock.withLock {
+            captureSessionIDs.removeValue(forKey: photo.resolvedSettings.uniqueID) ?? 0
+        }
+
         let frameData = RawFrameData(
             pixelBuffer: owned,
             whiteBalanceGains: activeGains,
@@ -1487,6 +1520,7 @@ extension CaptureController: AVCapturePhotoCaptureDelegate {
             colorMatrix: colorMatrices.bt2020 ?? cachedColorMatrices?.bt2020,
             sgamutMatrix: colorMatrices.sgamut ?? cachedColorMatrices?.sgamut,
             timestamp: photo.timestamp,
+            recordingSessionID: shotSessionID,
             kelvin: smoothedKelvin,
             tint: smoothedTint
         )
