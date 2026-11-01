@@ -104,15 +104,11 @@ struct RootView: View {
 
                         let interfaceOrientation = viewModel.currentOrientation
 
-                        let sensorX: CGFloat
-                        let sensorY: CGFloat
-                        if interfaceOrientation == .landscapeLeft {
-                            sensorX = ny
-                            sensorY = 1.0 - nx
-                        } else {
-                            sensorX = 1.0 - ny
-                            sensorY = nx
-                        }
+                        let rawX = interfaceOrientation == .landscapeLeft ? (1.0 - nx) : nx
+                        let rawY = interfaceOrientation == .landscapeLeft ? (1.0 - ny) : ny
+                        let z = max(1.0, viewModel.zoomFactor)
+                        let sensorX = 0.5 + (rawX - 0.5) / z
+                        let sensorY = 0.5 + (rawY - 0.5) / z
                         let clampedPoint = CGPoint(
                             x: max(0.0, min(1.0, sensorX)),
                             y: max(0.0, min(1.0, sensorY))

@@ -125,22 +125,22 @@ enum LogCurve {
         return rKnee + h * (x / (x + h))
     }
 
+    /// Calibrated sensor-to-scene exposure multiplier before highlight shoulder and log encoding.
+    static let kSensorToSceneGain: Float = 1.85
+
     static func applyHighlightShoulder3(_ rgb: SIMD3<Float>, rKnee: Float = 0.90, rMax: Float = 4.5) -> SIMD3<Float> {
         let peak = max(rgb.x, max(rgb.y, rgb.z))
         guard rMax > rKnee + 1e-4, peak > rKnee else { return rgb }
         let peakShoulder = applyHighlightShoulder(peak, rKnee: rKnee, rMax: rMax)
         let scale = peakShoulder / max(peak, 1e-6)
-        let scaled = rgb * scale
-
-        // Filmic highlight desaturation: smooth quadratic roll-off to pure neutral white
-        // as intensity enters specular highlight compression (rKnee=0.90 up to 2.0x linear).
-        let t = min(max((peak - rKnee) / max(min(rMax, 2.0) - rKnee, 1e-4), 0.0), 1.0)
-        let desat = t * t
-        return simd_mix(scaled, SIMD3<Float>(repeating: peakShoulder), SIMD3<Float>(repeating: desat))
+        return rgb * scale
     }
 
     static func apply(_ rgb: SIMD3<Float>, type: LogCurveType, headroomScale: Float = 1.0) -> SIMD3<Float> {
-        var input = rgb
+        if type == .linear {
+            return simd_clamp(rgb, SIMD3(0,0,0), SIMD3(1,1,1))
+        }
+        var input = rgb * kSensorToSceneGain
         if headroomScale > 1.0 {
             input = applyHighlightShoulder3(input, rKnee: 0.90, rMax: headroomScale)
         }
@@ -155,13 +155,15 @@ enum LogCurve {
     }
 
     static func inverse(_ rgb: SIMD3<Float>, type: LogCurveType) -> SIMD3<Float> {
+        let decoded: SIMD3<Float>
         switch type {
         case .linear:
             return simd_clamp(rgb, SIMD3(0,0,0), SIMD3(1,1,1))
         case .sLog3Approx:
-            return SIMD3(inverseSLog3Approx(rgb.x), inverseSLog3Approx(rgb.y), inverseSLog3Approx(rgb.z))
+            decoded = SIMD3(inverseSLog3Approx(rgb.x), inverseSLog3Approx(rgb.y), inverseSLog3Approx(rgb.z))
         case .appleLog2:
-            return SIMD3(appleLog2Decode(rgb.x), appleLog2Decode(rgb.y), appleLog2Decode(rgb.z))
+            decoded = SIMD3(appleLog2Decode(rgb.x), appleLog2Decode(rgb.y), appleLog2Decode(rgb.z))
         }
+        return decoded / kSensorToSceneGain
     }
 }

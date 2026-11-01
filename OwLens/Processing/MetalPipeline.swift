@@ -109,7 +109,6 @@ final class MetalPipeline: @unchecked Sendable {
     private let convertFormatPipeline: MTLComputePipelineState
     private let convertYpCbCr10Pipeline: MTLComputePipelineState
     private let cropAndResamplePipeline: MTLComputePipelineState
-    private let cropAndResampleBicubicPipeline: MTLComputePipelineState
     private let unsharpPipeline: MTLComputePipelineState
     private let defectPixelPipeline: MTLComputePipelineState
     private let binThreads: MTLSize
@@ -117,7 +116,6 @@ final class MetalPipeline: @unchecked Sendable {
     private let convertFormatThreads: MTLSize
     private let convertYpCbCr10Threads: MTLSize
     private let cropAndResampleThreads: MTLSize
-    private let cropAndResampleBicubicThreads: MTLSize
     private let unsharpThreads: MTLSize
     private let defectPixelThreads: MTLSize
     private var textureCache: CVMetalTextureCache?
@@ -264,8 +262,7 @@ final class MetalPipeline: @unchecked Sendable {
               let convertYpCbCr10Func = library.makeFunction(name: "convertRgbTo420YpCbCr10"),
               let defectPixelFunc = library.makeFunction(name: "correctDefectPixelsBayer"),
               let unsharpFunc = library.makeFunction(name: "unsharpMaskAdaptive"),
-              let cropAndResampleFunc = library.makeFunction(name: "cropAndResampleBilinear"),
-              let cropAndResampleBicubicFunc = library.makeFunction(name: "cropAndResampleBicubic") else {
+              let cropAndResampleFunc = library.makeFunction(name: "cropAndResampleBilinear") else {
             return nil
         }
         guard let scopeQueue = device.makeCommandQueue() else { return nil }
@@ -279,7 +276,6 @@ final class MetalPipeline: @unchecked Sendable {
             let convertFormat = try device.makeComputePipelineState(function: convertFormatFunc)
             let convertYp = try device.makeComputePipelineState(function: convertYpCbCr10Func)
             let crop = try device.makeComputePipelineState(function: cropAndResampleFunc)
-            let cropBicubic = try device.makeComputePipelineState(function: cropAndResampleBicubicFunc)
             let defect = try device.makeComputePipelineState(function: defectPixelFunc)
 
             self.binPipeline = bin
@@ -288,7 +284,6 @@ final class MetalPipeline: @unchecked Sendable {
             self.convertFormatPipeline = convertFormat
             self.convertYpCbCr10Pipeline = convertYp
             self.cropAndResamplePipeline = crop
-            self.cropAndResampleBicubicPipeline = cropBicubic
             self.defectPixelPipeline = defect
 
             self.binThreads = Self.computeThreadsPerGroup(for: bin)
@@ -297,7 +292,6 @@ final class MetalPipeline: @unchecked Sendable {
             self.convertFormatThreads = Self.computeThreadsPerGroup(for: convertFormat)
             self.convertYpCbCr10Threads = Self.computeThreadsPerGroup(for: convertYp)
             self.cropAndResampleThreads = Self.computeThreadsPerGroup(for: crop)
-            self.cropAndResampleBicubicThreads = Self.computeThreadsPerGroup(for: cropBicubic)
             self.defectPixelThreads = Self.computeThreadsPerGroup(for: defect)
         } catch {
             print("[MetalPipeline] Failed to create compute pipelines: \(error)")

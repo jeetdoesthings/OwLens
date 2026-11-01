@@ -104,17 +104,17 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
     private var cachedFM2: [Float]?
     private var cachedColorMatrices: (bt2020: simd_float3x3?, sgamut: simd_float3x3?)?
     private var lastComputedMatrixKelvin: Float?
-    private var cachedLSC: SIMD4<Float> = SIMD4<Float>(0.85, 0.0, 0.0, 0.0)
+    private var cachedLSC: SIMD4<Float> = SIMD4<Float>(0.38, 0.0, 0.0, 0.0)
     private var lastWBGains: AVCaptureDevice.WhiteBalanceGains?
 
     private func updateCachedLSC(for camera: AVCaptureDevice) {
         switch camera.deviceType {
         case .builtInUltraWideCamera:
-            cachedLSC = SIMD4<Float>(1.15, 0.0, 0.0, 0.0)
+            cachedLSC = SIMD4<Float>(0.48, 0.0, 0.0, 0.0)
         case .builtInTelephotoCamera:
-            cachedLSC = SIMD4<Float>(0.30, 0.0, 0.0, 0.0)
+            cachedLSC = SIMD4<Float>(0.20, 0.0, 0.0, 0.0)
         default:
-            cachedLSC = SIMD4<Float>(0.85, 0.0, 0.0, 0.0)
+            cachedLSC = SIMD4<Float>(0.38, 0.0, 0.0, 0.0)
         }
     }
 
@@ -1032,6 +1032,21 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
         }
     }
 
+    func restoreContinuousAutoFocus() {
+        captureQueue.async { [weak self] in
+            guard let self, let camera = self.activeDevice else { return }
+            do {
+                try camera.lockForConfiguration()
+                if camera.isFocusModeSupported(.continuousAutoFocus) {
+                    camera.focusMode = .continuousAutoFocus
+                }
+                camera.unlockForConfiguration()
+            } catch {
+                print("[CaptureController] Error restoring continuous autofocus: \(error)")
+            }
+        }
+    }
+
     func setFocusPointOfInterest(_ point: CGPoint) {
         captureQueue.async { [weak self] in
             guard let self, let device = self.activeDevice ?? AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back) else { return }
@@ -1390,10 +1405,6 @@ extension CaptureController: AVCapturePhotoCaptureDelegate {
 
     func photoOutput(_ output: AVCapturePhotoOutput, didCapturePhotoFor resolvedSettings: AVCaptureResolvedPhotoSettings) {
         AudioServicesDisposeSystemSoundID(1108)
-        // Release capture slot IMMEDIATELY when the sensor exposure completes.
-        // This allows AVFoundation to expose the next frame on the sensor while
-        // the ISP processes/unpacks the current frame in parallel, unlocking full sensor framerate!
-        releaseCaptureSlot(for: resolvedSettings.uniqueID)
     }
 
     func photoOutput(_ output: AVCapturePhotoOutput, didFinishCaptureFor resolvedSettings: AVCaptureResolvedPhotoSettings, error: Error?) {

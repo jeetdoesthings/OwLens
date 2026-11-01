@@ -1140,17 +1140,46 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
         guard CMBlockBufferGetDataPointer(blockBuffer, atOffset: 0, lengthAtOffsetOut: nil, totalLengthOut: &totalLength, dataPointerOut: &dataPointer) == noErr,
               let dataPtr = dataPointer, totalLength > 0 else { return }
 
-        let sampleCount = totalLength / MemoryLayout<Int16>.size
-        guard sampleCount > 0 else { return }
-
         var maxAmp: Float = 0
-        let step = max(1, sampleCount / 48)
-        dataPtr.withMemoryRebound(to: Int16.self, capacity: sampleCount) { ptr in
-            var i = 0
-            while i < sampleCount {
-                let val = abs(Float(ptr[i])) / 32768.0
-                if val > maxAmp { maxAmp = val }
-                i += step
+        if let formatDesc = CMSampleBufferGetFormatDescription(sample),
+           let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(formatDesc)?.pointee {
+            let isFloat = (asbd.mFormatFlags & kAudioFormatFlagIsFloat) != 0
+            if isFloat {
+                let sampleCount = totalLength / MemoryLayout<Float32>.size
+                guard sampleCount > 0 else { return }
+                let step = max(1, sampleCount / 48)
+                dataPtr.withMemoryRebound(to: Float32.self, capacity: sampleCount) { ptr in
+                    var i = 0
+                    while i < sampleCount {
+                        let val = abs(ptr[i])
+                        if val > maxAmp { maxAmp = val }
+                        i += step
+                    }
+                }
+            } else {
+                let sampleCount = totalLength / MemoryLayout<Int16>.size
+                guard sampleCount > 0 else { return }
+                let step = max(1, sampleCount / 48)
+                dataPtr.withMemoryRebound(to: Int16.self, capacity: sampleCount) { ptr in
+                    var i = 0
+                    while i < sampleCount {
+                        let val = abs(Float(ptr[i])) / 32768.0
+                        if val > maxAmp { maxAmp = val }
+                        i += step
+                    }
+                }
+            }
+        } else {
+            let sampleCount = totalLength / MemoryLayout<Int16>.size
+            guard sampleCount > 0 else { return }
+            let step = max(1, sampleCount / 48)
+            dataPtr.withMemoryRebound(to: Int16.self, capacity: sampleCount) { ptr in
+                var i = 0
+                while i < sampleCount {
+                    let val = abs(Float(ptr[i])) / 32768.0
+                    if val > maxAmp { maxAmp = val }
+                    i += step
+                }
             }
         }
 
@@ -1578,6 +1607,11 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
         if wasAutoWBBeforeRecording {
             isAutoWhiteBalanceEnabled = true
         }
+        if wasAutoFocusBeforeRecording {
+            isAutoFocus = true
+            isFocusLocked = false
+            captureController.restoreContinuousAutoFocus()
+        }
     }
 
     func setFocusPoint(_ point: CGPoint, lock: Bool = true) {
@@ -1737,6 +1771,7 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
 
         wasControlsLockedBeforeRecording = controlsLocked
         wasAutoWBBeforeRecording = isAutoWhiteBalanceEnabled
+        wasAutoFocusBeforeRecording = isAutoFocus
 
         if !controlsLocked {
             lockControls()
@@ -2476,9 +2511,15 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
                 }
             }
 
-            // Prune any stray keys older than nextOutputSequenceID
-            if reorderBuffer.keys.contains(where: { $0 < nextOutputSequenceID }) {
-                reorderBuffer = reorderBuffer.filter { $0.key >= nextOutputSequenceID }
+            // Fast in-place pruning of any stray keys older than nextOutputSequenceID (avoids dictionary reallocation)
+            if !reorderBuffer.isEmpty {
+                var staleKeys: [UInt64] = []
+                for k in reorderBuffer.keys where k < nextOutputSequenceID {
+                    staleKeys.append(k)
+                }
+                for k in staleKeys {
+                    reorderBuffer.removeValue(forKey: k)
+                }
             }
 
             // Gap watchdog: Only advance nextOutputSequenceID if a missing frame has genuinely timed out (>= 250ms).

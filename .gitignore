@@ -32,3 +32,4 @@ Carthage/Build/
 .DS_Store
 .agents/
 *.ipa
+codebase_*.txt

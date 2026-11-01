@@ -66,7 +66,6 @@ final class RawFrameBuffer {
                 }
                 readIndex = (readIndex + dropped) % capacity
                 count -= dropped
-                _droppedCount += dropped
             }
 
             let frame = buffer[readIndex]
@@ -91,6 +90,7 @@ final class RawFrameBuffer {
             writeIndex = 0
             readIndex = 0
             count = 0
+            _droppedCount = 0
         }
     }
 }

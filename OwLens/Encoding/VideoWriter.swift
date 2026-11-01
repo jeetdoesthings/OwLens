@@ -386,7 +386,8 @@ final class VideoWriter: @unchecked Sendable {
             lastFrameHostTime = now
             assetWriter?.startSession(atSourceTime: .zero)
             hasStartedSession = true
-            gyroRecorder.anchorSession(startHostTime: now)
+            let anchorTime = (captureTime != nil && captureTime!.isValid) ? CMTimeGetSeconds(captureTime!) : now
+            gyroRecorder.anchorSession(startHostTime: anchorTime)
             drainPrerollAudioBuffersLocked()
         }
 
@@ -453,7 +454,7 @@ final class VideoWriter: @unchecked Sendable {
                 let holdElapsed = Double(frameCount) / targetFPS
                 if adaptor.append(hold, withPresentationTime: holdPTS) {
                     lastVideoPTS = holdPTS
-                    appendGyroMetadataLocked(pts: holdPTS, elapsedSeconds: holdElapsed)
+                    appendGyroMetadataLocked(elapsedSeconds: holdElapsed)
                     frameCount += 1
                 } else {
                     droppedFrames += 1
@@ -480,7 +481,7 @@ final class VideoWriter: @unchecked Sendable {
 
         if adaptor.append(pixelBuffer, withPresentationTime: currentPTS) {
             lastVideoPTS = currentPTS
-            appendGyroMetadataLocked(pts: currentPTS, elapsedSeconds: currentElapsed)
+            appendGyroMetadataLocked(elapsedSeconds: currentElapsed)
             frameCount += 1
             realFrameCount += 1
             lastPixelBuffer = pixelBuffer
@@ -496,55 +497,59 @@ final class VideoWriter: @unchecked Sendable {
         }
     }
 
-    private func appendGyroMetadataLocked(pts: CMTime, elapsedSeconds: Double) {
+    private func appendGyroMetadataLocked(elapsedSeconds: Double) {
         guard let mInput = metadataInput,
-              mInput.isReadyForMoreMediaData,
-              let formatDesc = metadataFormatDesc,
-              let sample = gyroRecorder.latestSample(at: elapsedSeconds) else { return }
+              let formatDesc = metadataFormatDesc else { return }
 
-        let cammData = sample.toCAMMData()
-        var blockBuffer: CMBlockBuffer?
-        let bbStatus = CMBlockBufferCreateWithMemoryBlock(
-            allocator: kCFAllocatorDefault,
-            memoryBlock: nil,
-            blockLength: cammData.count,
-            blockAllocator: kCFAllocatorDefault,
-            customBlockSource: nil,
-            offsetToData: 0,
-            dataLength: cammData.count,
-            flags: 0,
-            blockBufferOut: &blockBuffer
-        )
-        guard bbStatus == noErr, let bb = blockBuffer else { return }
+        let samples = gyroRecorder.drainSamples(upToElapsedSeconds: elapsedSeconds)
+        for sample in samples {
+            guard mInput.isReadyForMoreMediaData else { break }
 
-        cammData.withUnsafeBytes { rawBuffer in
-            if let ptr = rawBuffer.baseAddress {
-                CMBlockBufferReplaceDataBytes(
-                    with: ptr,
-                    blockBuffer: bb,
-                    offsetIntoDestination: 0,
-                    dataLength: cammData.count
-                )
+            let cammData = sample.toCAMMData()
+            var blockBuffer: CMBlockBuffer?
+            let bbStatus = CMBlockBufferCreateWithMemoryBlock(
+                allocator: kCFAllocatorDefault,
+                memoryBlock: nil,
+                blockLength: cammData.count,
+                blockAllocator: kCFAllocatorDefault,
+                customBlockSource: nil,
+                offsetToData: 0,
+                dataLength: cammData.count,
+                flags: 0,
+                blockBufferOut: &blockBuffer
+            )
+            guard bbStatus == noErr, let bb = blockBuffer else { continue }
+
+            cammData.withUnsafeBytes { rawBuffer in
+                if let ptr = rawBuffer.baseAddress {
+                    CMBlockBufferReplaceDataBytes(
+                        with: ptr,
+                        blockBuffer: bb,
+                        offsetIntoDestination: 0,
+                        dataLength: cammData.count
+                    )
+                }
             }
+
+            let samplePTS = CMTime(seconds: sample.timeMs / 1000.0, preferredTimescale: 24000)
+            let duration = CMTime(value: 10, timescale: 1000)
+            var timing = CMSampleTimingInfo(duration: duration, presentationTimeStamp: samplePTS, decodeTimeStamp: .invalid)
+
+            var sampleBuffer: CMSampleBuffer?
+            let sbStatus = CMSampleBufferCreateReady(
+                allocator: kCFAllocatorDefault,
+                dataBuffer: bb,
+                formatDescription: formatDesc,
+                sampleCount: 1,
+                sampleTimingEntryCount: 1,
+                sampleTimingArray: &timing,
+                sampleSizeEntryCount: 1,
+                sampleSizeArray: [cammData.count],
+                sampleBufferOut: &sampleBuffer
+            )
+            guard sbStatus == noErr, let sampleBuffer else { continue }
+            _ = mInput.append(sampleBuffer)
         }
-
-        let duration = CMTime(value: 1000, timescale: CMTimeScale(targetFPS * 1000.0))
-        var timing = CMSampleTimingInfo(duration: duration, presentationTimeStamp: pts, decodeTimeStamp: .invalid)
-
-        var sampleBuffer: CMSampleBuffer?
-        let sbStatus = CMSampleBufferCreateReady(
-            allocator: kCFAllocatorDefault,
-            dataBuffer: bb,
-            formatDescription: formatDesc,
-            sampleCount: 1,
-            sampleTimingEntryCount: 1,
-            sampleTimingArray: &timing,
-            sampleSizeEntryCount: 1,
-            sampleSizeArray: [cammData.count],
-            sampleBufferOut: &sampleBuffer
-        )
-        guard sbStatus == noErr, let sampleBuffer else { return }
-        _ = mInput.append(sampleBuffer)
     }
 
     @discardableResult
@@ -775,6 +780,8 @@ final class VideoWriter: @unchecked Sendable {
         let fps = targetFPS
         let videoDurationSeconds = (videoEndTime.isValid && videoEndTime.seconds > 0) ? videoEndTime.seconds : (Double(total) / fps)
 
+        appendGyroMetadataLocked(elapsedSeconds: videoDurationSeconds)
+
         if let writer = assetWriter, writer.status == .writing, videoEndTime.isValid {
             writer.endSession(atSourceTime: videoEndTime)
         }
@@ -842,34 +849,40 @@ final class VideoWriter: @unchecked Sendable {
         let fileSize = fileHandle.seekToEndOfFile()
         guard fileSize > 64 else { return }
 
-        let scanLength = min(fileSize, 5 * 1024 * 1024)
-        let scanOffset = fileSize - scanLength
-        fileHandle.seek(toFileOffset: scanOffset)
-        let buffer = fileHandle.readData(ofLength: Int(scanLength))
-
         let mebxBytes = Data("mebx".utf8)
         let cammBytes = Data("camm".utf8)
         let stsdBytes = Data("stsd".utf8)
 
-        if let stsdRange = buffer.range(of: stsdBytes) {
-            let searchWindow = Range(uncheckedBounds: (
-                lower: stsdRange.upperBound,
-                upper: min(buffer.count, stsdRange.upperBound + 64)
-            ))
-            if let mebxRange = buffer.range(of: mebxBytes, options: [], in: searchWindow) {
-                let filePatchOffset = scanOffset + UInt64(mebxRange.lowerBound)
-                fileHandle.seek(toFileOffset: filePatchOffset)
-                fileHandle.write(cammBytes)
-                print("[VideoWriter] Successfully patched stsd entry 'mebx' -> 'camm' at offset \(filePatchOffset)")
-                return
-            }
+        var regionsToScan: [(offset: UInt64, length: Int)] = []
+        let headLength = Int(min(fileSize, 2 * 1024 * 1024))
+        regionsToScan.append((offset: 0, length: headLength))
+
+        let tailLength = Int(min(fileSize, 8 * 1024 * 1024))
+        let tailOffset = fileSize - UInt64(tailLength)
+        if tailOffset > UInt64(headLength) {
+            regionsToScan.append((offset: tailOffset, length: tailLength))
         }
 
-        if let mebxRange = buffer.range(of: mebxBytes) {
-            let filePatchOffset = scanOffset + UInt64(mebxRange.lowerBound)
-            fileHandle.seek(toFileOffset: filePatchOffset)
-            fileHandle.write(cammBytes)
-            print("[VideoWriter] Fallback patched 'mebx' -> 'camm' at offset \(filePatchOffset)")
+        for region in regionsToScan {
+            fileHandle.seek(toFileOffset: region.offset)
+            let buffer = fileHandle.readData(ofLength: region.length)
+            var searchStart = 0
+
+            while searchStart < buffer.count {
+                guard let stsdRange = buffer.range(of: stsdBytes, options: [], in: searchStart..<buffer.count) else {
+                    break
+                }
+                let windowEnd = min(buffer.count, stsdRange.upperBound + 64)
+                let searchWindow = stsdRange.upperBound..<windowEnd
+                if let mebxRange = buffer.range(of: mebxBytes, options: [], in: searchWindow) {
+                    let filePatchOffset = region.offset + UInt64(mebxRange.lowerBound)
+                    fileHandle.seek(toFileOffset: filePatchOffset)
+                    fileHandle.write(cammBytes)
+                    print("[VideoWriter] Successfully patched stsd entry 'mebx' -> 'camm' at offset \(filePatchOffset)")
+                    return
+                }
+                searchStart = stsdRange.upperBound
+            }
         }
     }
 
@@ -881,46 +894,57 @@ final class VideoWriter: @unchecked Sendable {
     ) -> [AVMetadataItem] {
         var items: [AVMetadataItem] = []
 
+        let gamut: String
+        switch curveType {
+        case .appleLog2:
+            gamut = "ITU-R BT.2020"
+        case .sLog3Approx:
+            gamut = "Sony S-Gamut3.Cine"
+        case .linear:
+            gamut = "Rec.709"
+        }
+        let gamma = curveType.displayName
+
         // 1. Common Description
         let desc = AVMutableMetadataItem()
         desc.keySpace = .common
         desc.key = AVMetadataKey.commonKeyDescription as (NSCopying & NSObjectProtocol)
-        desc.value = "\(curveType.displayName) · S-Gamut3.Cine · 10-Bit" as (NSCopying & NSObjectProtocol)
+        desc.value = "\(gamma) · \(gamut) · 10-Bit" as (NSCopying & NSObjectProtocol)
         items.append(desc)
 
         // 2. QuickTime User Data Description
         let qtDesc = AVMutableMetadataItem()
         qtDesc.keySpace = .quickTimeUserData
         qtDesc.key = AVMetadataKey.quickTimeUserDataKeyDescription as (NSCopying & NSObjectProtocol)
-        qtDesc.value = "\(curveType.displayName) · S-Gamut3.Cine · 10-Bit" as (NSCopying & NSObjectProtocol)
+        qtDesc.value = "\(gamma) · \(gamut) · 10-Bit" as (NSCopying & NSObjectProtocol)
         items.append(qtDesc)
 
         // 3. QuickTime Software
         let software = AVMutableMetadataItem()
         software.keySpace = .quickTimeUserData
         software.key = AVMetadataKey.quickTimeUserDataKeySoftware as (NSCopying & NSObjectProtocol)
-        software.value = "OwLens Cinema Camera v2.1.1" as (NSCopying & NSObjectProtocol)
+        software.value = "OwLens Cinema Camera v2.1.2" as (NSCopying & NSObjectProtocol)
         items.append(software)
 
         // 4. QuickTime Make
         let make = AVMutableMetadataItem()
         make.keySpace = .quickTimeUserData
         make.key = AVMetadataKey.quickTimeUserDataKeyMake as (NSCopying & NSObjectProtocol)
-        make.value = "Apple / Sony S-Log3" as (NSCopying & NSObjectProtocol)
+        make.value = "Apple / \(gamma)" as (NSCopying & NSObjectProtocol)
         items.append(make)
 
         // 5. QuickTime Model / Profile
         let model = AVMutableMetadataItem()
         model.keySpace = .quickTimeUserData
         model.key = AVMetadataKey.quickTimeUserDataKeyModel as (NSCopying & NSObjectProtocol)
-        model.value = "S-Log3 / S-Gamut3.Cine 10-Bit" as (NSCopying & NSObjectProtocol)
+        model.value = "\(gamma) / \(gamut) 10-Bit" as (NSCopying & NSObjectProtocol)
         items.append(model)
 
         // 6. Detailed Comment for DaVinci Resolve / FCP NLEs
         let comment = AVMutableMetadataItem()
         comment.keySpace = .quickTimeUserData
         comment.key = AVMetadataKey.quickTimeUserDataKeyComment as (NSCopying & NSObjectProtocol)
-        comment.value = "Color Space: Sony S-Gamut3.Cine | Gamma: Sony S-Log3 | Frame Rate: \(Int(fps)) fps | Format: \(width)x\(height) 10-Bit HEVC" as (NSCopying & NSObjectProtocol)
+        comment.value = "Color Space: \(gamut) | Gamma: \(gamma) | Frame Rate: \(Int(fps)) fps | Format: \(width)x\(height) 10-Bit HEVC" as (NSCopying & NSObjectProtocol)
         items.append(comment)
 
         return items

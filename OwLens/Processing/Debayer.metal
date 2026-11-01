@@ -21,13 +21,6 @@ struct DefectPixelParams {
     float denoiseStrength;
 };
 
-struct WhiteBalanceParams {
-    float3 gains;
-    float3x3 colorMatrix;
-};
-
-// (Removed unused sampleBayerValid)
-
 
 
 static inline float sampleBayerRaw(texture2d<float, access::read> tex, int maxW, int maxH, int x, int y, int dx, int dy) {
@@ -136,20 +129,17 @@ static inline float3 applyHighlightShoulder3(float3 rgb, float rKnee, float rMax
 
     float peakShoulder = applyHighlightShoulderMetal(peak, rKnee, rMax);
     float scale = peakShoulder / max(peak, 1e-6f);
-    float3 scaled = rgb * scale;
-
-    // Filmic highlight desaturation: smooth quadratic roll-off to pure neutral white
-    // as intensity enters specular highlight compression (rKnee=0.90 up to 2.0x linear).
-    // Eliminates sensor CFA clipping tint / demosaic green fringing on bright practicals and sky.
-    float t = clamp((peak - rKnee) / max(min(rMax, 2.0f) - rKnee, 1e-4f), 0.0f, 1.0f);
-    float desat = t * t;
-    return mix(scaled, float3(peakShoulder), desat);
+    return rgb * scale;
 }
+
+constant float kSensorToSceneGain = 1.85f;
 
 static inline float3 encodeLogCurve(float3 rgb, int curveType, float headroomScale = 1.0f) {
     if (curveType == 0) {
         return saturate(rgb);
     }
+
+    rgb *= kSensorToSceneGain;
 
     if (headroomScale > 1.0f) {
         rgb = applyHighlightShoulder3(rgb, 0.90f, headroomScale);
@@ -299,9 +289,47 @@ kernel void debayerFusedLog(
     int maxW = int(rawTexture.get_width()) - 1;
     int maxH = int(rawTexture.get_height()) - 1;
 
-    // ── Directional Demosaic (Malvar-He-Cutler) on raw DNs ──
+    // ── Pre-WB Bayer Neighborhood Fetch ──
     BayerNeighborhood nb = fetchBayerNeighborhood(rawTexture, maxW, maxH, x, y);
 
+    // Measure true physical sensor saturation before WB and LSC
+    float rawMaxDN = max(nb.c00, max(max(nb.cN1, nb.cS1), max(nb.cE1, nb.cW1)));
+    float rawPeak = saturate((rawMaxDN - black) * invDenom);
+
+    // ── Pre-WB Malvar-He-Cutler Channel Scaling ──
+    // Determine CFA channel gains for the 4 neighborhood parity groups
+    float3 channelScale = float3(params.wbGains.r, params.greenBalance * params.wbGains.g, params.wbGains.b) * invDenom;
+    float cGain, hGain, vGain, dGain;
+    if (xEven == yEven) {
+        cGain = yEven ? channelScale.r : channelScale.b;
+        hGain = channelScale.g;
+        vGain = channelScale.g;
+        dGain = yEven ? channelScale.b : channelScale.r;
+    } else {
+        cGain = channelScale.g;
+        hGain = yEven ? channelScale.r : channelScale.b;
+        vGain = yEven ? channelScale.r : channelScale.b;
+        dGain = channelScale.g;
+    }
+
+    nb.c00 = max((nb.c00 - black) * cGain, 0.0f);
+    nb.cN2 = max((nb.cN2 - black) * cGain, 0.0f);
+    nb.cS2 = max((nb.cS2 - black) * cGain, 0.0f);
+    nb.cE2 = max((nb.cE2 - black) * cGain, 0.0f);
+    nb.cW2 = max((nb.cW2 - black) * cGain, 0.0f);
+
+    nb.cE1 = max((nb.cE1 - black) * hGain, 0.0f);
+    nb.cW1 = max((nb.cW1 - black) * hGain, 0.0f);
+
+    nb.cN1 = max((nb.cN1 - black) * vGain, 0.0f);
+    nb.cS1 = max((nb.cS1 - black) * vGain, 0.0f);
+
+    nb.cNE = max((nb.cNE - black) * dGain, 0.0f);
+    nb.cNW = max((nb.cNW - black) * dGain, 0.0f);
+    nb.cSE = max((nb.cSE - black) * dGain, 0.0f);
+    nb.cSW = max((nb.cSW - black) * dGain, 0.0f);
+
+    // ── Directional Demosaic (Malvar-He-Cutler) on WB-equalized gradients ──
     float r, g, b;
     if (xEven == yEven) {
         float G_at_RB = (2.0f * (nb.cN1 + nb.cS1 + nb.cE1 + nb.cW1) + 4.0f * nb.c00 - (nb.cN2 + nb.cS2 + nb.cE2 + nb.cW2)) * 0.125f;
@@ -321,13 +349,9 @@ kernel void debayerFusedLog(
         }
     }
 
-    // ── Single Post-Demosaic Linearization: (DN - black) * invDenom ──
-    r = max((r - black) * invDenom, 0.0f);
-    g = max((g - black) * invDenom, 0.0f);
-    b = max((b - black) * invDenom, 0.0f);
-
-    // Gr/Gb green balance before LSC/WB.
-    g *= params.greenBalance;
+    r = max(r, 0.0f);
+    g = max(g, 0.0f);
+    b = max(b, 0.0f);
 
     // Fast Lens Shading Correction (LSC): true cos⁴θ optical inverse model
     float outW = float(outTexture.get_width());
@@ -350,17 +374,12 @@ kernel void debayerFusedLog(
     }
     float3 rgb = min(float3(r, g, b) * gain, float3(8.0f));
 
-    // ── White Balance ──
-    rgb *= params.wbGains;
-    rgb = max(rgb, float3(0.0));
-
     // ── Color Correction Matrix (Sensor Native → Target Gamut e.g. BT.2020) ──
     rgb = colorMatrix * rgb;
     rgb = max(rgb, float3(0.0));
 
     // Clipping flag and organic highlight desaturation on physical sensor saturation.
     // Preserves rich color (skies, sunsets, lamps, skin tones) while smoothly rolling clipped channels to neutral white.
-    float rawPeak = max(r, max(g, b));
     bool isClipped = (rawPeak >= 0.985f);
     float alpha = isClipped ? 0.0f : 1.0f;
 
@@ -512,21 +531,24 @@ kernel void unsharpMaskAdaptive(
     int xm1 = max(0, x - 1);
     int xp1 = min(w - 1, x + 1);
 
-    // 3x3 Gaussian blur approximation
-    float3 blur = (
-        inTexture.read(uint2(xm1, ym1)).rgb * 1.0f +
-        inTexture.read(uint2(x,   ym1)).rgb * 2.0f +
-        inTexture.read(uint2(xp1, ym1)).rgb * 1.0f +
-        inTexture.read(uint2(xm1, y)).rgb   * 2.0f +
-        center.rgb                          * 4.0f +
-        inTexture.read(uint2(xp1, y)).rgb   * 2.0f +
-        inTexture.read(uint2(xm1, yp1)).rgb * 1.0f +
-        inTexture.read(uint2(x,   yp1)).rgb * 2.0f +
-        inTexture.read(uint2(xp1, yp1)).rgb * 1.0f
+    // 3x3 Gaussian blur approximation on Luma
+    constexpr float3 kLumaCoeffs = float3(0.2627f, 0.6780f, 0.0593f);
+    float centerLuma = dot(center.rgb, kLumaCoeffs);
+
+    float blurLuma = (
+        dot(inTexture.read(uint2(xm1, ym1)).rgb, kLumaCoeffs) * 1.0f +
+        dot(inTexture.read(uint2(x,   ym1)).rgb, kLumaCoeffs) * 2.0f +
+        dot(inTexture.read(uint2(xp1, ym1)).rgb, kLumaCoeffs) * 1.0f +
+        dot(inTexture.read(uint2(xm1, y)).rgb,   kLumaCoeffs) * 2.0f +
+        centerLuma                                            * 4.0f +
+        dot(inTexture.read(uint2(xp1, y)).rgb,   kLumaCoeffs) * 2.0f +
+        dot(inTexture.read(uint2(xm1, yp1)).rgb, kLumaCoeffs) * 1.0f +
+        dot(inTexture.read(uint2(x,   yp1)).rgb, kLumaCoeffs) * 2.0f +
+        dot(inTexture.read(uint2(xp1, yp1)).rgb, kLumaCoeffs) * 1.0f
     ) * (1.0f / 16.0f);
 
-    float3 highPass = center.rgb - blur;
-    float detailLuma = abs(dot(highPass, float3(0.2627f, 0.6780f, 0.0593f)));
+    float highPassLuma = centerLuma - blurLuma;
+    float detailLuma = abs(highPassLuma);
 
     // Adaptive coring: only sharpen true edge detail & micro-texture, rejecting sub-visual sensor noise
     float coringThreshold = 0.0025f;
@@ -534,10 +556,9 @@ kernel void unsharpMaskAdaptive(
 
     // Suppress sharpening in deep noise floor below log pedestal (< 0.08)
     // while delivering crisp cinema sharpness to shadows, midtones, and highlights (>= 0.20).
-    float centerLuma = dot(center.rgb, float3(0.2627f, 0.6780f, 0.0593f));
     float shadowMask = smoothstep(0.08f, 0.20f, centerLuma);
 
-    float3 sharpened = center.rgb + highPass * (strength * coringFactor * shadowMask);
+    float3 sharpened = center.rgb + float3(highPassLuma * (strength * coringFactor * shadowMask));
     sharpened = max(sharpened, float3(0.0f));
 
     outTexture.write(float4(sharpened, center.a), gid);
@@ -759,60 +780,4 @@ kernel void cropAndResampleBilinear(
 }
 
 
-// ──────────────────────────────────────────────────────────────────────
-// FAST 5-TAP CATMULL-ROM BICUBIC RESAMPLE
-// Hardware-accelerated bicubic filter using 5 bilinear texture fetches.
-// Preserves edge acutance, fine micro-textures, and eliminates bilinear softening.
-// ──────────────────────────────────────────────────────────────────────
-static inline float4 sampleCatmullRomNorm(texture2d<float, access::sample> tex, sampler s, float2 uv) {
-    float2 texSize = float2(tex.get_width(), tex.get_height());
-    float2 samplePos = uv * texSize - 0.5f;
-    float2 tc = floor(samplePos);
-    float2 f = samplePos - tc;
 
-    float2 w0 = f * (-0.5f + f * (1.0f - 0.5f * f));
-    float2 w1 = 1.0f + f * f * (-2.5f + 1.5f * f);
-    float2 w2 = f * (0.5f + f * (2.0f - 1.5f * f));
-    float2 w3 = f * f * (-0.5f + 0.5f * f);
-
-    float2 w12 = w1 + w2;
-    float2 tc12 = tc + 1.0f + w2 / max(w12, 1e-5f);
-    float2 tc0 = tc - 0.5f;
-    float2 tc3 = tc + 2.5f;
-
-    float2 invSize = 1.0f / texSize;
-    float4 c0 = tex.sample(s, (float2(tc12.x, tc0.y) + 0.5f) * invSize);
-    float4 c1 = tex.sample(s, (float2(tc0.x, tc12.y) + 0.5f) * invSize);
-    float4 c2 = tex.sample(s, (float2(tc12.x, tc12.y) + 0.5f) * invSize);
-    float4 c3 = tex.sample(s, (float2(tc3.x, tc12.y) + 0.5f) * invSize);
-    float4 c4 = tex.sample(s, (float2(tc12.x, tc3.y) + 0.5f) * invSize);
-
-    float4 res = c2 * (w12.x * w12.y) +
-                 c0 * (w12.x * w0.y) +
-                 c1 * (w0.x * w12.y) +
-                 c3 * (w3.x * w12.y) +
-                 c4 * (w12.x * w3.y);
-    float totalW = (w12.x * w12.y) + (w12.x * w0.y) + (w0.x * w12.y) + (w3.x * w12.y) + (w12.x * w3.y);
-    float4 finalCol = res / max(totalW, 1e-4f);
-    return max(finalCol, float4(0.0f));
-}
-
-kernel void cropAndResampleBicubic(
-    texture2d<float, access::sample> src [[texture(0)]],
-    texture2d<float, access::write>  dst [[texture(1)]],
-    constant CropParams &crop            [[buffer(0)]],
-    uint2 gid [[thread_position_in_grid]])
-{
-    if (gid.x >= dst.get_width() || gid.y >= dst.get_height()) return;
-
-    constexpr sampler s(coord::normalized, address::clamp_to_edge, filter::linear);
-
-    float effectiveX = crop.flip180 ? float(dst.get_width() - 1 - gid.x) : float(gid.x);
-    float effectiveY = crop.flip180 ? float(dst.get_height() - 1 - gid.y) : float(gid.y);
-
-    float srcX = metal::fma(effectiveX, crop.scaleX, crop.startX);
-    float srcY = metal::fma(effectiveY, crop.scaleY, crop.startY);
-    float2 normUV = float2(srcX / float(src.get_width()), srcY / float(src.get_height()));
-
-    dst.write(sampleCatmullRomNorm(src, s, normUV), gid);
-}

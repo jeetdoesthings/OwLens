@@ -44,6 +44,7 @@ public final class GyroMotionRecorder: @unchecked Sendable {
     private let lock = NSLock()
 
     private var samples: [MotionSample] = []
+    private var drainedIndex = 0
     private var isRecording = false
     private var startHostTime: TimeInterval = 0
     private var orientation: UIInterfaceOrientation = .landscapeRight
@@ -65,6 +66,7 @@ public final class GyroMotionRecorder: @unchecked Sendable {
         self.orientation = orientation
         self.targetFPS = fps
         self.samples.removeAll()
+        self.drainedIndex = 0
         self.samples.reserveCapacity(15000) // ~2.5 minutes at 100Hz
         self.startHostTime = CACurrentMediaTime()
         self.isRecording = true
@@ -86,7 +88,25 @@ public final class GyroMotionRecorder: @unchecked Sendable {
     public func anchorSession(startHostTime: TimeInterval) {
         lock.lock()
         defer { lock.unlock() }
+        let timeShiftMs = (startHostTime - self.startHostTime) * 1000.0
         self.startHostTime = startHostTime
+        var updated: [MotionSample] = []
+        for s in samples {
+            let shifted = s.timeMs - timeShiftMs
+            if shifted >= 0 {
+                updated.append(MotionSample(
+                    timeMs: shifted,
+                    gx: s.gx,
+                    gy: s.gy,
+                    gz: s.gz,
+                    ax: s.ax,
+                    ay: s.ay,
+                    az: s.az
+                ))
+            }
+        }
+        self.samples = updated
+        self.drainedIndex = 0
     }
 
     private func recordSample(motion: CMDeviceMotion) {
@@ -94,8 +114,7 @@ public final class GyroMotionRecorder: @unchecked Sendable {
         defer { lock.unlock() }
         guard isRecording else { return }
 
-        let now = CACurrentMediaTime()
-        let elapsedMs = max(0, (now - startHostTime) * 1000.0)
+        let elapsedMs = max(0, (motion.timestamp - startHostTime) * 1000.0)
 
         // Raw gyro rotation rate in rad/s from CMMotionManager
         let rx = motion.rotationRate.x
@@ -172,6 +191,24 @@ public final class GyroMotionRecorder: @unchecked Sendable {
             az: az
         )
         samples.append(sample)
+    }
+
+    /// Returns all motion samples up to elapsedSeconds that have not yet been drained for the timed metadata track.
+    public func drainSamples(upToElapsedSeconds: Double) -> [MotionSample] {
+        lock.lock()
+        defer { lock.unlock() }
+        let targetMs = upToElapsedSeconds * 1000.0
+        var ready: [MotionSample] = []
+        while drainedIndex < samples.count {
+            let s = samples[drainedIndex]
+            if s.timeMs <= targetMs {
+                ready.append(s)
+                drainedIndex += 1
+            } else {
+                break
+            }
+        }
+        return ready
     }
 
     /// Retrieve the closest motion sample for the current video frame.

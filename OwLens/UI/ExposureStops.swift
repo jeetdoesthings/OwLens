@@ -8,9 +8,15 @@ enum ExposureStops {
         5600, 6000, 6500, 7000, 7500, 8000, 9000, 10000
     ]
 
-    /// ISO in steps of 5 within device range (100, 105, 110…).
+    /// Standard cinematic 1/3-stop ISO stops
+    static let cinemaISOStops: [Float] = [
+        32, 40, 50, 64, 80, 100, 125, 160, 200, 250, 320, 400, 500, 640, 800, 1000, 1250, 1600, 2000, 2500, 3200
+    ]
+
+    /// Standard cinematic 1/3-stop ISO values within the device's supported range.
     static func isoStops(in range: ClosedRange<Float>) -> [Float] {
-        stepped(in: range, step: 5)
+        let filtered = cinemaISOStops.filter { range.contains($0) }
+        return filtered.isEmpty ? [range.lowerBound, range.upperBound] : filtered
     }
 
     /// Standard cinematic shutter angles
