@@ -54,11 +54,18 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
     private let audioQueue = DispatchQueue(label: "raw.audio.queue", qos: .userInitiated)
 
     private let captureLock = OSAllocatedUnfairLock()
-    /// Outstanding capturePhoto calls (RAW: 4 for pipelined 24 fps; 5 with responsive capture).
-    private var inFlightCaptures = 0
-    private var maxInFlight = 4
-    private var isCapturePending = false
+    /// Sensor-stage in-flight counter: tracks active physical exposure and sensor readout.
+    /// Released immediately when `didCapturePhotoFor` fires.
+    private var sensorInFlight = 0
+    private var maxSensorInFlight = 2
+    private var sensorActiveIDs: Set<Int64> = []
+
+    /// ISP-stage in-flight counter: tracks total active DNG processing jobs in mediaserverd.
+    /// Released when `didFinishProcessingPhoto` (or `didFinishCaptureFor` fallback) fires.
+    private var ispInFlight = 0
+    private var maxISPInFlight = 5
     private var activeCaptureIDs: Set<Int64> = []
+    private var isCapturePending = false
     private var currentRecordingSessionID: UInt64 = 0
     private var captureSessionIDs: [Int64: UInt64] = [:]
 
@@ -191,7 +198,8 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
         session.addOutput(photoOutput)
 
         photoOutput.maxPhotoQualityPrioritization = .speed
-        maxInFlight = 4
+        maxSensorInFlight = 2
+        maxISPInFlight = 5
  
         // Mic + audio output
         if let defaultMic = AVCaptureDevice.default(for: .audio) {
@@ -236,7 +244,7 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
             try? audioSession.setPreferredInput(builtIn)
         }
 
-        print("[CaptureController] Ready. singleLensTypes=\(lenses.map { Self.deviceTypeLabel($0.deviceType) }.joined(separator: ", ")) Bayer=\(fourCC(rawPixelFormat)) inFlight=\(maxInFlight)")
+        print("[CaptureController] Ready. singleLensTypes=\(lenses.map { Self.deviceTypeLabel($0.deviceType) }.joined(separator: ", ")) Bayer=\(fourCC(rawPixelFormat)) sensorInFlight=\(maxSensorInFlight) ispInFlight=\(maxISPInFlight)")
     }
 
     /// Lock sensor cadence without changing activeFormat (keeps photo/RAW path).
@@ -280,9 +288,9 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
             }
         }
         if photoOutput.isResponsiveCaptureEnabled {
-            maxInFlight = 5
+            maxISPInFlight = 6
         } else {
-            maxInFlight = 4
+            maxISPInFlight = 5
         }
 
         if photoOutput.isFastCapturePrioritizationSupported {
@@ -345,7 +353,8 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
             session.beginConfiguration()
             session.sessionPreset = .photo
             photoOutput.maxPhotoQualityPrioritization = .speed
-            maxInFlight = 4
+            maxSensorInFlight = 2
+            maxISPInFlight = 5
             session.commitConfiguration()
 
             for _ in 0..<8 {
@@ -423,7 +432,8 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
                 if photoOutput.isResponsiveCaptureSupported { photoOutput.isResponsiveCaptureEnabled = false }
                 if photoOutput.isFastCapturePrioritizationSupported { photoOutput.isFastCapturePrioritizationEnabled = false }
             }
-            maxInFlight = 4
+            maxSensorInFlight = 2
+            maxISPInFlight = 5
             session.commitConfiguration()
             try? applyDefaultCameraModes(on: camera)
             lockSensorToTargetFPS(on: camera, fps: targetFPS)
@@ -737,7 +747,9 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
             self.captureTimer = nil
             self.captureLock.withLock {
                 self.isCapturePending = false
-                self.inFlightCaptures = 0
+                self.sensorInFlight = 0
+                self.ispInFlight = 0
+                self.sensorActiveIDs.removeAll()
                 self.activeCaptureIDs.removeAll()
             }
             self.waitForInFlightClear(timeout: 0.5)
@@ -782,7 +794,8 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
 
                 self.session.sessionPreset = .photo
                 self.photoOutput.maxPhotoQualityPrioritization = .speed
-                self.maxInFlight = 4
+                self.maxSensorInFlight = 2
+                self.maxISPInFlight = 5
                 self.session.commitConfiguration()
 
                 // Resolve Bayer *after* commit (list is empty mid-configuration)
@@ -803,7 +816,8 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
                         }
                         self.session.sessionPreset = .photo
                         self.photoOutput.maxPhotoQualityPrioritization = .speed
-                        self.maxInFlight = 4
+                        self.maxSensorInFlight = 2
+                        self.maxISPInFlight = 5
                         self.session.commitConfiguration()
                         try? self.applyDefaultCameraModes(on: prev)
                         try? self.resolveBayerRAWOrThrow(allowFallbackToOtherLenses: false)
@@ -1099,7 +1113,9 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
         captureTimer = nil
         captureLock.withLock {
             isCapturePending = false
-            inFlightCaptures = 0
+            sensorInFlight = 0
+            ispInFlight = 0
+            sensorActiveIDs.removeAll()
             activeCaptureIDs.removeAll()
         }
         captureQueue.async { [weak self] in
@@ -1148,9 +1164,9 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
             enableBurstHelpersIfSafe()
         }
         if photoOutput.isResponsiveCaptureEnabled {
-            maxInFlight = 5
+            maxISPInFlight = 6
         } else {
-            maxInFlight = 4
+            maxISPInFlight = 5
         }
     }
 
@@ -1180,11 +1196,12 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
         guard session.isRunning, !isReconfiguringSession else { return }
 
         let canCapture: Bool = captureLock.withLock {
-            if inFlightCaptures >= maxInFlight {
+            if sensorInFlight >= maxSensorInFlight || ispInFlight >= maxISPInFlight {
                 isCapturePending = true
                 return false
             }
-            inFlightCaptures += 1
+            sensorInFlight += 1
+            ispInFlight += 1
             isCapturePending = false
             lastCaptureStart = CACurrentMediaTime()
             return true
@@ -1209,6 +1226,7 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
         let settings = makeRAWPhotoSettings()
         captureLock.withLock {
             _ = activeCaptureIDs.insert(settings.uniqueID)
+            _ = sensorActiveIDs.insert(settings.uniqueID)
             if isRecordingMode && currentRecordingSessionID > 0 {
                 captureSessionIDs[settings.uniqueID] = currentRecordingSessionID
             }
@@ -1220,17 +1238,37 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
         captureLock.withLock {
             if let uid = uniqueID {
                 activeCaptureIDs.remove(uid)
+                sensorActiveIDs.remove(uid)
                 captureSessionIDs.removeValue(forKey: uid)
             }
-            inFlightCaptures = max(0, inFlightCaptures - 1)
+            sensorInFlight = max(0, sensorInFlight - 1)
+            ispInFlight = max(0, ispInFlight - 1)
         }
     }
 
-    private func releaseCaptureSlot(for uniqueID: Int64) {
+    private func releaseSensorSlot(for uniqueID: Int64) {
+        let triggerPending: Bool = captureLock.withLock {
+            guard sensorActiveIDs.remove(uniqueID) != nil else { return false }
+            sensorInFlight = max(0, sensorInFlight - 1)
+            let trigger = isCapturePending && sensorInFlight < maxSensorInFlight && ispInFlight < maxISPInFlight
+            if trigger {
+                isCapturePending = false
+            }
+            return trigger
+        }
+
+        if triggerPending {
+            captureQueue.async { [weak self] in
+                self?.captureOneRawFrame()
+            }
+        }
+    }
+
+    private func releaseISPSlot(for uniqueID: Int64) {
         let triggerPending: Bool = captureLock.withLock {
             guard activeCaptureIDs.remove(uniqueID) != nil else { return false }
-            inFlightCaptures = max(0, inFlightCaptures - 1)
-            let trigger = isCapturePending && inFlightCaptures < maxInFlight
+            ispInFlight = max(0, ispInFlight - 1)
+            let trigger = isCapturePending && sensorInFlight < maxSensorInFlight && ispInFlight < maxISPInFlight
             if trigger {
                 isCapturePending = false
             }
@@ -1247,7 +1285,7 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
     private func waitForInFlightClear(timeout: TimeInterval) {
         let deadline = Date().addingTimeInterval(timeout)
         while true {
-            let n = captureLock.withLock { inFlightCaptures }
+            let n = captureLock.withLock { sensorInFlight + ispInFlight }
             if n == 0 || Date() >= deadline { break }
             Thread.sleep(forTimeInterval: 0.005)
         }
@@ -1405,19 +1443,24 @@ extension CaptureController: AVCapturePhotoCaptureDelegate {
 
     func photoOutput(_ output: AVCapturePhotoOutput, didCapturePhotoFor resolvedSettings: AVCaptureResolvedPhotoSettings) {
         AudioServicesDisposeSystemSoundID(1108)
+        // Release sensor slot IMMEDIATELY when sensor exposure and readout completes.
+        // This allows the next 24 FPS timer tick to expose on the sensor without waiting
+        // for mediaserverd to finish DNG packaging, maintaining true 24.000 CFR!
+        releaseSensorSlot(for: resolvedSettings.uniqueID)
     }
 
     func photoOutput(_ output: AVCapturePhotoOutput, didFinishCaptureFor resolvedSettings: AVCaptureResolvedPhotoSettings, error: Error?) {
         if let error {
             print("[CaptureController] didFinishCaptureFor error: \(error.localizedDescription)")
         }
-        // Fallback cleanup in case didCapturePhotoFor was not invoked
-        releaseCaptureSlot(for: resolvedSettings.uniqueID)
+        // Fallback cleanups in case didCapturePhotoFor or didFinishProcessingPhoto were skipped
+        releaseSensorSlot(for: resolvedSettings.uniqueID)
+        releaseISPSlot(for: resolvedSettings.uniqueID)
     }
 
     func photoOutput(_ output: AVCapturePhotoOutput, didFinishProcessingPhoto photo: AVCapturePhoto, error: Error?) {
         defer {
-            releaseCaptureSlot(for: photo.resolvedSettings.uniqueID)
+            releaseISPSlot(for: photo.resolvedSettings.uniqueID)
         }
 
         if let error {

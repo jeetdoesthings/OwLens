@@ -1803,7 +1803,6 @@ private struct LensAndZoomWheelControl: View {
     private var circularArcWheel: some View {
         ZStack {
             Canvas { context, size in
-                let width = size.width
                 let height = size.height
                 let cy = height * 0.5
                 let radius: CGFloat = 110.0

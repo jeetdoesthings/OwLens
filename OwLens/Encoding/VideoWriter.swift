@@ -36,7 +36,7 @@ final class VideoWriter: @unchecked Sendable {
     private var pendingAudioBuffers: [CMSampleBuffer] = []
     private let maxPendingAudioBuffers = 50
     private var prerollAudioBuffers: [CMSampleBuffer] = []
-    private let maxPrerollAudioBuffers = 20
+    private let maxPrerollAudioBuffers = 60
     private var curveType: LogCurveType = .sLog3Approx
     private let lock = NSLock()
 
@@ -246,8 +246,7 @@ final class VideoWriter: @unchecked Sendable {
     }
 
     private func drainPrerollAudioBuffersLocked() {
-        guard let input = audioInput, hasStartedSession, sessionStartTime.isValid else {
-            prerollAudioBuffers.removeAll()
+        guard let input = audioInput, hasStartedSession, sessionStartTime.isValid, realFrameCount > 0 else {
             return
         }
         let preroll = prerollAudioBuffers
@@ -290,7 +289,8 @@ final class VideoWriter: @unchecked Sendable {
                         pts = rawPTS
                     }
                 } else {
-                    pts = max(rawPTS, .zero)
+                    // For the initial audio buffer, anchor strictly to .zero to perfectly match Video Frame 0
+                    pts = .zero
                 }
 
                 timings[i].presentationTimeStamp = pts
@@ -375,6 +375,37 @@ final class VideoWriter: @unchecked Sendable {
         let now = CACurrentMediaTime()
 
         if !hasStartedSession {
+            // VideoToolbox initialization on Frame 0 can take 10-30ms.
+            // Patient spin-wait (up to 150ms) ensures Frame 0 is NEVER dropped.
+            var spinAttempts = 0
+            while !input.isReadyForMoreMediaData && spinAttempts < 50 {
+                lock.unlock()
+                usleep(3000) // 3ms sleep outside lock
+                lock.lock()
+                guard isRecording, videoInput != nil, pixelBufferAdaptor != nil else {
+                    droppedFrames += 1
+                    return false
+                }
+                spinAttempts += 1
+            }
+
+            guard input.isReadyForMoreMediaData else {
+                print("[VideoWriter] VideoToolbox not ready for Frame 0 after 150ms")
+                droppedFrames += 1
+                return false
+            }
+
+            // Start the asset writer session at source time .zero
+            assetWriter?.startSession(atSourceTime: .zero)
+            let firstPTS = CMTime(value: 0, timescale: CMTimeScale(round(targetFPS * 1000.0)))
+            guard adaptor.append(pixelBuffer, withPresentationTime: firstPTS) else {
+                print("[VideoWriter] Failed to append Frame 0 to pixelBufferAdaptor: \(String(describing: assetWriter?.error))")
+                droppedFrames += 1
+                return false
+            }
+
+            // Frame 0 successfully committed at PTS .zero!
+            hasStartedSession = true
             startHostTime = now
             if let captureTime = captureTime, captureTime.isValid {
                 sessionStartTime = captureTime
@@ -384,11 +415,19 @@ final class VideoWriter: @unchecked Sendable {
                 lastFrameCaptureTime = sessionStartTime
             }
             lastFrameHostTime = now
-            assetWriter?.startSession(atSourceTime: .zero)
-            hasStartedSession = true
+            lastVideoPTS = firstPTS
+            frameCount = 1
+            realFrameCount = 1
+            lastPixelBuffer = pixelBuffer
+
             let anchorTime = (captureTime != nil && captureTime!.isValid) ? CMTimeGetSeconds(captureTime!) : now
             gyroRecorder.anchorSession(startHostTime: anchorTime)
+            appendGyroMetadataLocked(elapsedSeconds: 0)
+
+            // DRAIN PREROLL AUDIO NOW: Video Frame 0 is committed at PTS .zero, so audio begins precisely at .zero
             drainPrerollAudioBuffersLocked()
+            drainPendingAudioBuffersLocked()
+            return true
         }
 
         // Calculate wall-clock elapsed time since optical session start
@@ -421,7 +460,7 @@ final class VideoWriter: @unchecked Sendable {
         // Hardware encoder occasionally takes 1-4ms to complete a GOP slice.
         // Spin-wait briefly outside lock before discarding to eliminate spurious frame drops.
         var spinAttempts = 0
-        while !input.isReadyForMoreMediaData && spinAttempts < 5 {
+        while !input.isReadyForMoreMediaData && spinAttempts < 15 {
             lock.unlock()
             usleep(2000) // 2ms sleep outside lock
             lock.lock()
@@ -439,7 +478,7 @@ final class VideoWriter: @unchecked Sendable {
             let maxHoldToFill = min(targetSlot, frameCount + 12)
             while frameCount < maxHoldToFill {
                 var holdSpin = 0
-                while !input.isReadyForMoreMediaData && holdSpin < 3 {
+                while !input.isReadyForMoreMediaData && holdSpin < 5 {
                     lock.unlock()
                     usleep(1500)
                     lock.lock()
@@ -619,7 +658,7 @@ final class VideoWriter: @unchecked Sendable {
                     pts = rawPTS
                 }
             } else {
-                pts = max(rawPTS, .zero)
+                pts = .zero
             }
             singleTiming.presentationTimeStamp = pts
             lastAudioPTS = pts
@@ -694,7 +733,7 @@ final class VideoWriter: @unchecked Sendable {
                     pts = rawPTS
                 }
             } else {
-                pts = max(rawPTS, .zero)
+                pts = .zero
             }
             timings[i].presentationTimeStamp = pts
             lastAudioPTS = pts
@@ -923,7 +962,7 @@ final class VideoWriter: @unchecked Sendable {
         let software = AVMutableMetadataItem()
         software.keySpace = .quickTimeUserData
         software.key = AVMetadataKey.quickTimeUserDataKeySoftware as (NSCopying & NSObjectProtocol)
-        software.value = "OwLens Cinema Camera v2.1.2" as (NSCopying & NSObjectProtocol)
+        software.value = "OwLens Cinema Camera v2.1.3" as (NSCopying & NSObjectProtocol)
         items.append(software)
 
         // 4. QuickTime Make

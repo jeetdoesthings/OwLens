@@ -2288,11 +2288,13 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
             // FIFO during recording: process every single captured frame in order without skipping
             frame = frameBuffer.dequeue()
             if let f = frame, f.recordingSessionID == activeRecordingSessionID && f.recordingSessionID > 0 {
-                var sequencedFrame = f
-                processLock.withLock {
-                    sequencedFrame.sequenceID = nextDispatchSequenceID
+                let seq: UInt64 = processLock.withLock {
+                    let s = nextDispatchSequenceID
                     nextDispatchSequenceID &+= 1
+                    return s
                 }
+                var sequencedFrame = f
+                sequencedFrame.sequenceID = seq
                 frame = sequencedFrame
             }
         } else {
@@ -2300,7 +2302,7 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
             frame = frameBuffer.dequeueLatest()
         }
         guard let frame else {
-            processLock.withLock {
+            _ = processLock.withLock {
                 freeSlots.insert(slot)
             }
             return
