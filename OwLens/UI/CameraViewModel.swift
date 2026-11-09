@@ -1786,6 +1786,13 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
         metalPipeline?.zoomFactor = Float(zoomFactor)
         metalPipeline?.prewarm(width: selectedFormat.width, height: selectedFormat.height, curveType: selectedCurve)
         frameBuffer.flush()
+        processLock.withLock {
+            nextDispatchSequenceID = 0
+            nextOutputSequenceID = 0
+            lastOutputSequenceTime = CACurrentMediaTime()
+            gapStartTime = 0
+            reorderBuffer.removeAll()
+        }
         captureController.setRecordingMode(true)
         activeRecordingSessionID = captureController.activeRecordingSessionID
         let effectiveBitrate = min(selectedBitrate.bitsPerSecond, selectedFormat.maxBitratePreset.bitsPerSecond)
@@ -1909,6 +1916,7 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
         isRecording = false
         isSaving = true
         isAudioRecordingActive = false
+        isRecordingUnsafe = false
         videoWriter.onLowDiskSpace = nil
         recordingTimer?.invalidate()
         recordingTimer = nil

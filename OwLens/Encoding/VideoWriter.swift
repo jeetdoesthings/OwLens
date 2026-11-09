@@ -20,6 +20,7 @@ final class VideoWriter: @unchecked Sendable {
     private var pixelBufferAdaptor: AVAssetWriterInputPixelBufferAdaptor?
     private var frameCount: Int64 = 0
     private var realFrameCount: Int64 = 0
+    private var lastWrittenSlot: Int64 = -1
     private var width: Int = 0
     private var height: Int = 0
     private var targetFPS: Double = 24
@@ -206,6 +207,7 @@ final class VideoWriter: @unchecked Sendable {
         self.pixelBufferAdaptor = adaptor
         self.frameCount = 0
         self.realFrameCount = 0
+        self.lastWrittenSlot = -1
         self.droppedFrames = 0
         self.startHostTime = 0
         self.sessionStartTime = .invalid
@@ -215,6 +217,7 @@ final class VideoWriter: @unchecked Sendable {
         self.hasStartedSession = false
         self.lastPixelBuffer = nil
         self.audioReferenceTime = .invalid
+        self.prerollAudioBuffers.removeAll()
         self.pendingAudioBuffers.removeAll()
         self.lastDiskCheckTime = 0
         self.cachedHasSpace = true
@@ -270,8 +273,7 @@ final class VideoWriter: @unchecked Sendable {
                 if CMTimeCompare(bufferEnd, refTime) <= 0 {
                     continue
                 }
-            }
-            if CMTimeCompare(timings[0].presentationTimeStamp, refTime) < 0 {
+            } else if CMTimeCompare(timings[0].presentationTimeStamp, refTime) < 0 {
                 continue
             }
 
@@ -289,8 +291,14 @@ final class VideoWriter: @unchecked Sendable {
                         pts = rawPTS
                     }
                 } else {
-                    // For the initial audio buffer, anchor strictly to .zero to perfectly match Video Frame 0
-                    pts = .zero
+                    // Initial audio buffer: anchor strictly to max(.zero, rawPTS)
+                    // If buffer starts within 25ms of Frame 0, snap precisely to .zero
+                    let rawSec = CMTimeGetSeconds(rawPTS)
+                    if rawSec <= 0.025 {
+                        pts = .zero
+                    } else {
+                        pts = rawPTS
+                    }
                 }
 
                 timings[i].presentationTimeStamp = pts
@@ -416,6 +424,7 @@ final class VideoWriter: @unchecked Sendable {
             }
             lastFrameHostTime = now
             lastVideoPTS = firstPTS
+            lastWrittenSlot = 0
             frameCount = 1
             realFrameCount = 1
             lastPixelBuffer = pixelBuffer
@@ -448,10 +457,15 @@ final class VideoWriter: @unchecked Sendable {
         // Strict Constant Frame Rate (CFR):
         // Each frame s is mathematically presented at t = s / targetFPS.
         // targetSlot is the nearest 24.000 FPS grid slot corresponding to elapsed optical time.
-        // We use floor() instead of round() so normal timing jitter (< 1 frame period) NEVER
-        // triggers false duplicate hold-frame insertions. Hold frames are ONLY inserted when a full
-        // frame period has actually been missed by the sensor or pipeline.
-        let targetSlot = max(frameCount, Int64(floor(elapsed * targetFPS)))
+        let targetSlot = Int64(round(elapsed * targetFPS))
+
+        // If targetSlot has already been written, this frame is an intra-slot burst/duplicate.
+        // Drop it so subsequent frames are NEVER shifted forward in time.
+        if targetSlot <= lastWrittenSlot {
+            lastPixelBuffer = pixelBuffer
+            droppedFrames += 1
+            return false
+        }
 
         // Drain any pending audio buffers now that video input might have made room
         drainPendingAudioBuffersLocked()
@@ -474,9 +488,10 @@ final class VideoWriter: @unchecked Sendable {
         // Fill any missing CFR slots by repeating last frame (up to 12 frames max / 0.5s).
         // This ensures the video container maintains strict CFR 24.0000 FPS without VFR warnings,
         // while guaranteeing that audio and video remain in microsecond sync over long recordings!
-        if let hold = lastPixelBuffer {
-            let maxHoldToFill = min(targetSlot, frameCount + 12)
-            while frameCount < maxHoldToFill {
+        if let hold = lastPixelBuffer, targetSlot > lastWrittenSlot + 1 {
+            let holdLimit = min(targetSlot, lastWrittenSlot + 13)
+            var slotToFill = lastWrittenSlot + 1
+            while slotToFill < holdLimit {
                 var holdSpin = 0
                 while !input.isReadyForMoreMediaData && holdSpin < 5 {
                     lock.unlock()
@@ -489,23 +504,19 @@ final class VideoWriter: @unchecked Sendable {
                     droppedFrames += 1
                     break
                 }
-                let holdPTS = CMTime(value: frameCount * 1000, timescale: CMTimeScale(round(targetFPS * 1000.0)))
-                let holdElapsed = Double(frameCount) / targetFPS
+                let holdPTS = CMTime(value: slotToFill * 1000, timescale: CMTimeScale(round(targetFPS * 1000.0)))
+                let holdElapsed = Double(slotToFill) / targetFPS
                 if adaptor.append(hold, withPresentationTime: holdPTS) {
                     lastVideoPTS = holdPTS
                     appendGyroMetadataLocked(elapsedSeconds: holdElapsed)
-                    frameCount += 1
+                    lastWrittenSlot = slotToFill
+                    frameCount = slotToFill + 1
+                    slotToFill += 1
                 } else {
                     droppedFrames += 1
                     break
                 }
             }
-        }
-
-        // If the gap exceeded hold limit or hold buffer wasn't ready, advance frameCount to targetSlot
-        // so this real frame is stamped at its true wall-clock CFR position, NEVER falling behind audio!
-        if frameCount < targetSlot {
-            frameCount = targetSlot
         }
 
         // Current real frame
@@ -515,13 +526,14 @@ final class VideoWriter: @unchecked Sendable {
             return false
         }
 
-        let currentPTS = CMTime(value: frameCount * 1000, timescale: CMTimeScale(round(targetFPS * 1000.0)))
-        let currentElapsed = Double(frameCount) / targetFPS
+        let currentPTS = CMTime(value: targetSlot * 1000, timescale: CMTimeScale(round(targetFPS * 1000.0)))
+        let currentElapsed = Double(targetSlot) / targetFPS
 
         if adaptor.append(pixelBuffer, withPresentationTime: currentPTS) {
             lastVideoPTS = currentPTS
             appendGyroMetadataLocked(elapsedSeconds: currentElapsed)
-            frameCount += 1
+            lastWrittenSlot = targetSlot
+            frameCount = targetSlot + 1
             realFrameCount += 1
             lastPixelBuffer = pixelBuffer
             lastFrameHostTime = now
@@ -639,8 +651,7 @@ final class VideoWriter: @unchecked Sendable {
                     if CMTimeCompare(bufferEnd, refTime) <= 0 {
                         return true
                     }
-                }
-                if CMTimeCompare(singleTiming.presentationTimeStamp, refTime) < 0 {
+                } else if CMTimeCompare(singleTiming.presentationTimeStamp, refTime) < 0 {
                     return true
                 }
             }
@@ -658,7 +669,12 @@ final class VideoWriter: @unchecked Sendable {
                     pts = rawPTS
                 }
             } else {
-                pts = .zero
+                let rawSec = CMTimeGetSeconds(rawPTS)
+                if rawSec <= 0.025 {
+                    pts = .zero
+                } else {
+                    pts = rawPTS
+                }
             }
             singleTiming.presentationTimeStamp = pts
             lastAudioPTS = pts
@@ -713,8 +729,7 @@ final class VideoWriter: @unchecked Sendable {
                 if CMTimeCompare(bufferEnd, refTime) <= 0 {
                     return true
                 }
-            }
-            if CMTimeCompare(timings[0].presentationTimeStamp, refTime) < 0 {
+            } else if CMTimeCompare(timings[0].presentationTimeStamp, refTime) < 0 {
                 return true
             }
         }
@@ -733,7 +748,12 @@ final class VideoWriter: @unchecked Sendable {
                     pts = rawPTS
                 }
             } else {
-                pts = .zero
+                let rawSec = CMTimeGetSeconds(rawPTS)
+                if rawSec <= 0.025 {
+                    pts = .zero
+                } else {
+                    pts = rawPTS
+                }
             }
             timings[i].presentationTimeStamp = pts
             lastAudioPTS = pts
@@ -809,6 +829,7 @@ final class VideoWriter: @unchecked Sendable {
         lastAudioEndPTS = .invalid
         hasStartedSession = false
         lastPixelBuffer = nil
+        lastWrittenSlot = -1
         let writer = assetWriter
         let vIn = videoInput
         let aIn = audioInput
@@ -962,7 +983,7 @@ final class VideoWriter: @unchecked Sendable {
         let software = AVMutableMetadataItem()
         software.keySpace = .quickTimeUserData
         software.key = AVMetadataKey.quickTimeUserDataKeySoftware as (NSCopying & NSObjectProtocol)
-        software.value = "OwLens Cinema Camera v2.1.3" as (NSCopying & NSObjectProtocol)
+        software.value = "OwLens Cinema Camera v2.1.4" as (NSCopying & NSObjectProtocol)
         items.append(software)
 
         // 4. QuickTime Make

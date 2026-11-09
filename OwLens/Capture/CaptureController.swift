@@ -66,6 +66,7 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
     private var maxISPInFlight = 5
     private var activeCaptureIDs: Set<Int64> = []
     private var isCapturePending = false
+    private var recordingSessionCounter: UInt64 = 0
     private var currentRecordingSessionID: UInt64 = 0
     private var captureSessionIDs: [Int64: UInt64] = [:]
 
@@ -1154,7 +1155,8 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
         captureLock.withLock {
             isRecordingMode = recording
             if recording {
-                currentRecordingSessionID &+= 1
+                recordingSessionCounter &+= 1
+                currentRecordingSessionID = recordingSessionCounter
             } else {
                 currentRecordingSessionID = 0
                 captureSessionIDs.removeAll()
@@ -1197,12 +1199,10 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
 
         let canCapture: Bool = captureLock.withLock {
             if sensorInFlight >= maxSensorInFlight || ispInFlight >= maxISPInFlight {
-                isCapturePending = true
                 return false
             }
             sensorInFlight += 1
             ispInFlight += 1
-            isCapturePending = false
             lastCaptureStart = CACurrentMediaTime()
             return true
         }
@@ -1247,38 +1247,16 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
     }
 
     private func releaseSensorSlot(for uniqueID: Int64) {
-        let triggerPending: Bool = captureLock.withLock {
-            guard sensorActiveIDs.remove(uniqueID) != nil else { return false }
+        captureLock.withLock {
+            _ = sensorActiveIDs.remove(uniqueID)
             sensorInFlight = max(0, sensorInFlight - 1)
-            let trigger = isCapturePending && sensorInFlight < maxSensorInFlight && ispInFlight < maxISPInFlight
-            if trigger {
-                isCapturePending = false
-            }
-            return trigger
-        }
-
-        if triggerPending {
-            captureQueue.async { [weak self] in
-                self?.captureOneRawFrame()
-            }
         }
     }
 
     private func releaseISPSlot(for uniqueID: Int64) {
-        let triggerPending: Bool = captureLock.withLock {
-            guard activeCaptureIDs.remove(uniqueID) != nil else { return false }
+        captureLock.withLock {
+            _ = activeCaptureIDs.remove(uniqueID)
             ispInFlight = max(0, ispInFlight - 1)
-            let trigger = isCapturePending && sensorInFlight < maxSensorInFlight && ispInFlight < maxISPInFlight
-            if trigger {
-                isCapturePending = false
-            }
-            return trigger
-        }
-
-        if triggerPending {
-            captureQueue.async { [weak self] in
-                self?.captureOneRawFrame()
-            }
         }
     }
 
