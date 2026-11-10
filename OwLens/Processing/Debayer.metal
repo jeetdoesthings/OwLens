@@ -390,6 +390,16 @@ kernel void debayerFusedLog(
         rgb = mix(rgb, float3(peakVal), desat);
     }
 
+    // Cinema shadow desaturation roll-off:
+    // Sensor read noise and high Blue WB multiplier create strong chromatic noise in deep blacks.
+    // Smoothly desaturate linear luminance below 2.5% reflectance (shadow noise floor) to pure monochrome black,
+    // completely eliminating chromatic noise in blacks while preserving 100% color gamut in lit areas.
+    float linLuma = dot(rgb, float3(0.2627f, 0.6780f, 0.0593f));
+    if (linLuma < 0.025f) {
+        float shadowSat = smoothstep(0.0015f, 0.025f, linLuma);
+        rgb = mix(float3(linLuma), rgb, shadowSat);
+    }
+
     // ── Direct Log OETF Encoding ──
     float3 logRGB = encodeLogCurve(rgb, params.curveType, params.headroomScale);
 
@@ -418,9 +428,10 @@ kernel void convertRgba16FloatToBgra8(
 //   1 thread per 2x2 block -> writes 4 luma pixels and 1 interleaved chroma pixel.
 // ──────────────────────────────────────────────────────────────────────
 kernel void convertRgbTo420YpCbCr10(
-    texture2d<float, access::read>  srcRGB  [[texture(0)]],
-    texture2d<float, access::write> dstY    [[texture(1)]],
-    texture2d<float, access::write> dstUV   [[texture(2)]],
+    texture2d<float, access::read>  srcRGB    [[texture(0)]],
+    texture2d<float, access::write> dstY      [[texture(1)]],
+    texture2d<float, access::write> dstUV     [[texture(2)]],
+    constant int                   &curveType [[buffer(0)]],
     uint2 gid [[thread_position_in_grid]])
 {
     uint uvW = dstUV.get_width();
@@ -498,6 +509,24 @@ kernel void convertRgbTo420YpCbCr10(
     float cb = (avgRGB.b - avgY) * kInvChromaB;
     float cr = (avgRGB.r - avgY) * kInvChromaR;
 
+    // Log shadow chroma noise gating:
+    // When log encoding is active, residual sensor read noise around the log black pedestal
+    // causes high-frequency temporal chroma fluctuations. In HEVC 4:2:0 inter-frame compression,
+    // this leads to coarse 16x16 / 32x32 quantized chroma macroblocks that flash/pulse between frames.
+    // Gating chroma near the log pedestal guarantees dead-neutral Cb=512, Cr=512 in blacks,
+    // completely eliminating blocky blue flashing while preserving clean encoder bit allocation.
+    float logPedestal = 0.0f;
+    if (curveType == 3) {
+        logPedestal = 0.1505f; // Apple Log
+    } else if (curveType == 2) {
+        logPedestal = 0.0929f; // S-Log3
+    }
+    if (logPedestal > 0.0f && avgY < (logPedestal + 0.035f)) {
+        float chromaGate = smoothstep(logPedestal + 0.002f, logPedestal + 0.035f, avgY);
+        cb *= chromaGate;
+        cr *= chromaGate;
+    }
+
     float normCb = metal::fma(clamp(cb, -0.5f, 0.5f), kScaleC, kOffsetC);
     float normCr = metal::fma(clamp(cr, -0.5f, 0.5f), kScaleC, kOffsetC);
 
@@ -508,9 +537,10 @@ kernel void convertRgbTo420YpCbCr10(
 // ADAPTIVE UNSHARP MASK: enhances fine edge details without boosting noise.
 // ──────────────────────────────────────────────────────────────────────
 kernel void unsharpMaskAdaptive(
-    texture2d<float, access::read>  inTexture [[texture(0)]],
+    texture2d<float, access::read>  inTexture  [[texture(0)]],
     texture2d<float, access::write> outTexture [[texture(1)]],
-    constant float &strength [[buffer(0)]],
+    constant float &strength                   [[buffer(0)]],
+    constant int   &curveType                  [[buffer(1)]],
     uint2 gid [[thread_position_in_grid]])
 {
     if (gid.x >= outTexture.get_width() || gid.y >= outTexture.get_height()) return;
@@ -554,9 +584,17 @@ kernel void unsharpMaskAdaptive(
     float coringThreshold = 0.0025f;
     float coringFactor = smoothstep(0.0004f, coringThreshold, detailLuma);
 
-    // Suppress sharpening in deep noise floor below log pedestal (< 0.08)
-    // while delivering crisp cinema sharpness to shadows, midtones, and highlights (>= 0.20).
-    float shadowMask = smoothstep(0.08f, 0.20f, centerLuma);
+    // Suppress sharpening in deep noise floor below and around log pedestal
+    // (Apple Log = 0.1505, S-Log3 = 0.0929, Linear = 0.0).
+    // Prevents boosting sensor read noise into high-contrast edge artifacts,
+    // while delivering crisp cinema sharpness to real details, midtones, and highlights.
+    float pedestal = 0.0f;
+    if (curveType == 3) {
+        pedestal = 0.1505f;
+    } else if (curveType == 2) {
+        pedestal = 0.0929f;
+    }
+    float shadowMask = smoothstep(pedestal + 0.03f, pedestal + 0.12f, centerLuma);
 
     float3 sharpened = center.rgb + float3(highPassLuma * (strength * coringFactor * shadowMask));
     sharpened = max(sharpened, float3(0.0f));

@@ -579,6 +579,8 @@ final class MetalPipeline: @unchecked Sendable {
                     enc.setTexture(sourceTexture, index: 0)
                     enc.setTexture(yTex, index: 1)
                     enc.setTexture(uvTex, index: 2)
+                    var cType = Int32(curveType.rawValue)
+                    enc.setBytes(&cType, length: MemoryLayout<Int32>.stride, index: 0)
                     dispatch(enc, width: uvW, height: uvH, threadsPerGroup: convertYpCbCr10Threads)
                     enc.endEncoding()
 
@@ -609,6 +611,8 @@ final class MetalPipeline: @unchecked Sendable {
             enc.setTexture(sourceTexture, index: 0)
             enc.setTexture(yTex, index: 1)
             enc.setTexture(uvTex, index: 2)
+            var cType = Int32(curveType.rawValue)
+            enc.setBytes(&cType, length: MemoryLayout<Int32>.stride, index: 0)
             dispatch(enc, width: uvW, height: uvH, threadsPerGroup: convertYpCbCr10Threads)
             enc.endEncoding()
 
@@ -758,6 +762,8 @@ final class MetalPipeline: @unchecked Sendable {
             enc.setTexture(sTex, index: 1)
             var s = sharpnessStrength
             enc.setBytes(&s, length: MemoryLayout<Float>.stride, index: 0)
+            var cType = Int32(curveType.rawValue)
+            enc.setBytes(&cType, length: MemoryLayout<Int32>.stride, index: 1)
             dispatch(enc, width: scaledTex.width, height: scaledTex.height, threadsPerGroup: unsharpThreads)
             enc.endEncoding()
             finalTex = sTex

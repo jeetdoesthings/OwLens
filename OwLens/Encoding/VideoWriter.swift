@@ -983,7 +983,7 @@ final class VideoWriter: @unchecked Sendable {
         let software = AVMutableMetadataItem()
         software.keySpace = .quickTimeUserData
         software.key = AVMetadataKey.quickTimeUserDataKeySoftware as (NSCopying & NSObjectProtocol)
-        software.value = "OwLens Cinema Camera v2.1.4" as (NSCopying & NSObjectProtocol)
+        software.value = "OwLens Cinema Camera v2.1.5" as (NSCopying & NSObjectProtocol)
         items.append(software)
 
         // 4. QuickTime Make
