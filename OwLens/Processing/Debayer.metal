@@ -392,11 +392,12 @@ kernel void debayerFusedLog(
 
     // Cinema shadow desaturation roll-off:
     // Sensor read noise and high Blue WB multiplier create strong chromatic noise in deep blacks.
-    // Smoothly desaturate linear luminance below 2.5% reflectance (shadow noise floor) to pure monochrome black,
-    // completely eliminating chromatic noise in blacks while preserving 100% color gamut in lit areas.
+    // Smoothly desaturate only in the extreme sub-visual noise floor (< -4.8 stops below middle gray),
+    // eliminating sensor thermal noise in pitch blacks while keeping 100% of true colors, navy blues,
+    // and shadows completely untouched and color-accurate.
     float linLuma = dot(rgb, float3(0.2627f, 0.6780f, 0.0593f));
-    if (linLuma < 0.025f) {
-        float shadowSat = smoothstep(0.0015f, 0.025f, linLuma);
+    if (linLuma < 0.0035f) {
+        float shadowSat = smoothstep(0.0006f, 0.0035f, linLuma);
         rgb = mix(float3(linLuma), rgb, shadowSat);
     }
 
@@ -521,8 +522,8 @@ kernel void convertRgbTo420YpCbCr10(
     } else if (curveType == 2) {
         logPedestal = 0.0929f; // S-Log3
     }
-    if (logPedestal > 0.0f && avgY < (logPedestal + 0.035f)) {
-        float chromaGate = smoothstep(logPedestal + 0.002f, logPedestal + 0.035f, avgY);
+    if (logPedestal > 0.0f && avgY < (logPedestal + 0.012f)) {
+        float chromaGate = smoothstep(logPedestal + 0.001f, logPedestal + 0.012f, avgY);
         cb *= chromaGate;
         cr *= chromaGate;
     }
