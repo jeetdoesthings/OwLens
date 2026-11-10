@@ -378,16 +378,25 @@ kernel void debayerFusedLog(
     rgb = colorMatrix * rgb;
     rgb = max(rgb, float3(0.0));
 
-    // Clipping flag and organic highlight desaturation on physical sensor saturation.
-    // Preserves rich color (skies, sunsets, lamps, skin tones) while smoothly rolling clipped channels to neutral white.
+    // Measure sensor saturation and clipping flag
     bool isClipped = (rawPeak >= 0.985f);
     float alpha = isClipped ? 0.0f : 1.0f;
 
-    if (rawPeak >= 0.94f) {
-        float u = clamp((rawPeak - 0.94f) * 20.0f, 0.0f, 1.0f);
-        float desat = u * u; // Smooth quadratic roll-off to 100% white at sensor saturation
-        float peakVal = max(rgb.r, max(rgb.g, rgb.b));
-        rgb = mix(rgb, float3(peakVal), desat);
+    // Organic cinema highlight desaturation:
+    // Under typical lighting, the Green sensor channel clips before Red or Blue, while the Blue WB
+    // multiplier (up to 4.5x) and LSC gains boost the unclipped Blue channel far above Green.
+    // Post-CCM this creates an intense electric blue/cyan color shift in specular highlights,
+    // which HEVC 4:2:0 quantizes into flashing blue macroblocks.
+    // We softly roll off saturation in specular highlights (above diffuse white maxCh > 0.85),
+    // smoothly neutralizing blown-out light sources, lamps, reflections, and windows to pure white glare.
+    float maxCh = max(rgb.r, max(rgb.g, rgb.b));
+    if (maxCh > 0.85f || rawPeak >= 0.90f) {
+        float uRaw = clamp((rawPeak - 0.90f) * 12.5f, 0.0f, 1.0f);
+        float uCh = smoothstep(0.85f, 2.2f, maxCh);
+        float desat = max(uRaw * uRaw, uCh);
+        float lum = dot(rgb, float3(0.2627f, 0.6780f, 0.0593f));
+        float targetVal = max(lum, maxCh * 0.92f);
+        rgb = mix(rgb, float3(targetVal), desat * 0.96f);
     }
 
     // Cinema shadow desaturation roll-off:
@@ -528,6 +537,15 @@ kernel void convertRgbTo420YpCbCr10(
         cr *= chromaGate;
     }
 
+    // Specular highlight chroma roll-off:
+    // Suppress residual chroma fluctuations in specular highlights (> 78% IRE in log space)
+    // to prevent HEVC 4:2:0 inter-frame quantization from generating flashing blue macroblocks.
+    if (avgY > 0.78f) {
+        float highChromaAtten = 1.0f - smoothstep(0.78f, 0.94f, avgY) * 0.92f;
+        cb *= highChromaAtten;
+        cr *= highChromaAtten;
+    }
+
     float normCb = metal::fma(clamp(cb, -0.5f, 0.5f), kScaleC, kOffsetC);
     float normCr = metal::fma(clamp(cr, -0.5f, 0.5f), kScaleC, kOffsetC);
 
@@ -597,7 +615,12 @@ kernel void unsharpMaskAdaptive(
     }
     float shadowMask = smoothstep(pedestal + 0.03f, pedestal + 0.12f, centerLuma);
 
-    float3 sharpened = center.rgb + float3(highPassLuma * (strength * coringFactor * shadowMask));
+    // Suppress sharpening on blown-out specular highlights:
+    // Prevents unsharp mask from creating harsh ringing halos or amplifying highlight chromatic fringes.
+    float highlightMask = 1.0f - smoothstep(0.80f, 0.94f, centerLuma);
+    float edgeMask = shadowMask * highlightMask;
+
+    float3 sharpened = center.rgb + float3(highPassLuma * (strength * coringFactor * edgeMask));
     sharpened = max(sharpened, float3(0.0f));
 
     outTexture.write(float4(sharpened, center.a), gid);
