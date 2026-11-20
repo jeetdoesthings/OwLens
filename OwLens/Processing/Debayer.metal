@@ -308,7 +308,7 @@ kernel void debayerFusedLog(
     } else {
         cGain = channelScale.g;
         hGain = yEven ? channelScale.r : channelScale.b;
-        vGain = yEven ? channelScale.r : channelScale.b;
+        vGain = yEven ? channelScale.b : channelScale.r;
         dGain = channelScale.g;
     }
 
@@ -395,8 +395,8 @@ kernel void debayerFusedLog(
         float uCh = smoothstep(0.85f, 2.2f, maxCh);
         float desat = max(uRaw * uRaw, uCh);
         float lum = dot(rgb, float3(0.2627f, 0.6780f, 0.0593f));
-        float targetVal = max(lum, maxCh * 0.92f);
-        rgb = mix(rgb, float3(targetVal), desat * 0.96f);
+        float targetVal = max(lum, maxCh);
+        rgb = mix(rgb, float3(targetVal), desat);
     }
 
     // Cinema shadow desaturation roll-off:

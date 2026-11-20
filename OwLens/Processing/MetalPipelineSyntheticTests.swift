@@ -492,6 +492,34 @@ extension MetalPipeline {
             }
         }
 
+        // Verify CFA neighborhood parity scaling neutrality across all 4 Bayer patterns
+        let channelScale = SIMD3<Float>(1.8, 1.0, 3.5)
+        for pattern in 0..<4 {
+            for y in 0..<4 {
+                for x in 0..<4 {
+                    let xEven = ((x ^ pattern) & 1) == 0
+                    let yEven = ((y ^ (pattern >> 1)) & 1) == 0
+                    let hGain: Float
+                    let vGain: Float
+                    if xEven == yEven {
+                        hGain = channelScale.y
+                        vGain = channelScale.y
+                    } else {
+                        hGain = yEven ? channelScale.x : channelScale.z
+                        vGain = yEven ? channelScale.z : channelScale.x
+                    }
+                    if xEven != yEven {
+                        let expectedH = yEven ? channelScale.x : channelScale.z
+                        let expectedV = yEven ? channelScale.z : channelScale.x
+                        if hGain != expectedH || vGain != expectedV {
+                            print("[MalvarTest] FAIL: Pattern \(pattern) at (\(x),\(y)) expected H=\(expectedH), V=\(expectedV), got H=\(hGain), V=\(vGain)")
+                            allPassed = false
+                        }
+                    }
+                }
+            }
+        }
+
         if allPassed {
             print("[MalvarTest] PASS: Malvar-He-Cutler demosaic neutrality & norm-preserving shoulder verified")
         }
