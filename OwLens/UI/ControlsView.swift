@@ -483,14 +483,6 @@ struct ControlsView: View {
                 viewModel.toggleScopes()
             }
 
-            // Lens calibration is a capture correction, not a buried preference.
-            // Keep it visible so users can reach the guided flat-field workflow.
-            monitoringToolButton(
-                text: "CAL",
-                isActive: viewModel.isLensCalibrating || viewModel.hasLensCalibration
-            ) {
-                viewModel.togglePanel(.lens)
-            }
         }
         .padding(4)
         .glassPanel(cornerRadius: OwLensTheme.radiusLg, background: OwLensTheme.glassBaseHeavy)
@@ -1243,36 +1235,6 @@ struct ControlsView: View {
                 }
             }
 
-            Divider().overlay(OwLensTheme.glassBorder)
-            lensCalibrationControls
-        }
-    }
-
-    private var lensCalibrationControls: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text("LENS SHADING CALIBRATION")
-                .font(.appMono(.medium, size: 8)).foregroundColor(OwLensTheme.textMuted)
-            Text(viewModel.isLensCalibrating
-                 ? "Keep a uniformly lit matte wall filling the frame · \(viewModel.lensCalibrationProgress)/24"
-                 : "Fix center-bright / edge-dark falloff using a measured flat field. Lock lens, focus, ISO, shutter, and WB first.")
-                .font(.appFont(.regular, size: 9.5)).foregroundColor(OwLensTheme.textSecondary)
-                .fixedSize(horizontal: false, vertical: true)
-            HStack(spacing: 6) {
-                Button { Haptics.selection(); viewModel.beginLensCalibration() } label: {
-                    Text(viewModel.isLensCalibrating ? "COLLECTING…" : "CALIBRATE THIS LENS")
-                        .font(.appMono(.semiBold, size: 9)).foregroundColor(.black)
-                        .frame(maxWidth: .infinity).padding(.vertical, 9)
-                        .background(RoundedRectangle(cornerRadius: OwLensTheme.radiusCard).fill(OwLensTheme.glassActive))
-                }
-                .buttonStyle(.plain).disabled(viewModel.isLensCalibrating)
-                if viewModel.hasLensCalibration {
-                    Button("RESET") { viewModel.resetLensCalibration() }
-                        .font(.appMono(.medium, size: 9)).foregroundColor(OwLensTheme.textSecondary)
-                        .padding(.horizontal, 10).padding(.vertical, 9)
-                        .background(RoundedRectangle(cornerRadius: OwLensTheme.radiusCard).stroke(OwLensTheme.glassBorder))
-                        .buttonStyle(.plain)
-                }
-            }
         }
     }
 

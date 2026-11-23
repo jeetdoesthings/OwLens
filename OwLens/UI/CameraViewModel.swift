@@ -642,13 +642,6 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
     nonisolated(unsafe) var isAppActive = true
     /// Measured LSC override from device calibration (set once at setup).
     nonisolated(unsafe) private var lscOverride: LSCCoefficients?
-    @Published private(set) var isLensCalibrating = false
-    nonisolated(unsafe) private var isLensCalibratingUnsafe = false
-    @Published private(set) var lensCalibrationProgress = 0
-    @Published private(set) var hasLensCalibration = false
-    private var lensCalibrationSamples: [(radiusSquared: Float, ratio: Float)] = []
-    private let lensCalibrationFrameTarget = 24
-    private let lensCalibrationDefaultsPrefix = "OwLens.LensCalibration."
 
     /// Measured noise coefficients from device calibration (set once at setup).
     nonisolated(unsafe) private var noiseCoeffs: (shot: Float, read: Float) = (0.012, 0.0004)
@@ -986,7 +979,6 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
             } else {
                 selectedLens = availableLenses.first
             }
-            loadLensCalibrationForCurrentLens()
             seedControlRanges()
             captureController.setCaptureFPS(selectedFPS.rawValue)
             refreshAudioSources()
@@ -1388,7 +1380,6 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
                 } else {
                     // ISO/shutter ranges can change per lens
                     self.seedControlRanges()
-                    self.loadLensCalibrationForCurrentLens()
 
                     self.applyManualExposureAndWB()
                     self.refreshStatusLine()
@@ -2314,16 +2305,6 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
         // Never enqueue GPU work while backgrounded (IOGPUMetalError 00000006)
         guard isAppActive else { return }
 
-        // Calibration samples the unprocessed Bayer buffer. The ratios are
-        // invariant to a global exposure change, but intentionally capture
-        // lens/sensor shading before WB, CCM, demosaic, and log encoding.
-        let flatField = isLensCalibratingUnsafe ? Self.sampleFlatField(from: frameData) : []
-        if !flatField.isEmpty {
-            Task { @MainActor [weak self] in
-                self?.consumeLensCalibration(flatField)
-            }
-        }
-
         frameBuffer.enqueue(frameData)
         scheduleProcess()
     }
@@ -2680,94 +2661,6 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
             radial4B: r4,
             azimuthR: 0, azimuthG: 0, azimuthB: 0
         )
-    }
-
-    // MARK: - Lens Flat-Field Calibration
-
-    func beginLensCalibration() {
-        guard !isRecording, isCameraReady, selectedLens != nil else { return }
-        lensCalibrationSamples.removeAll(keepingCapacity: true)
-        lensCalibrationProgress = 0
-        isLensCalibrating = true
-        isLensCalibratingUnsafe = true
-        showToast("Aim at an evenly lit matte wall · hold still · collecting 24 RAW frames")
-    }
-
-    func resetLensCalibration() {
-        guard let id = captureController.currentLensUniqueID ?? selectedLens?.uniqueID else { return }
-        UserDefaults.standard.removeObject(forKey: lensCalibrationDefaultsPrefix + id)
-        lscOverride = nil
-        hasLensCalibration = false
-        showToast("Lens shading calibration reset")
-    }
-
-    private func loadLensCalibrationForCurrentLens() {
-        guard let id = captureController.currentLensUniqueID ?? selectedLens?.uniqueID,
-              let data = UserDefaults.standard.data(forKey: lensCalibrationDefaultsPrefix + id),
-              let profile = try? JSONDecoder().decode(LSCCoefficients.self, from: data) else {
-            lscOverride = nil
-            hasLensCalibration = false
-            return
-        }
-        lscOverride = profile
-        hasLensCalibration = true
-    }
-
-    private func consumeLensCalibration(_ flatField: [(radiusSquared: Float, value: Float)]) {
-        guard isLensCalibrating else { return }
-        let center = flatField.filter { $0.radiusSquared < 0.025 }.map(\.value).sorted()
-        guard let reference = center.dropFirst(center.count / 2).first, reference > 0 else { return }
-        for sample in flatField where sample.radiusSquared > 0.08 && sample.value > 0.02 && sample.value < 0.90 {
-            let ratio = reference / sample.value
-            // The shader applies (1 + a*r²)². Reject non-vignette samples and
-            // implausible values caused by an uneven wall or a specular patch.
-            let a = (sqrt(ratio) - 1.0) / sample.radiusSquared
-            if a > -0.02 && a < 0.60 { lensCalibrationSamples.append((sample.radiusSquared, ratio)) }
-        }
-        lensCalibrationProgress += 1
-        guard lensCalibrationProgress >= lensCalibrationFrameTarget else { return }
-
-        isLensCalibrating = false
-        isLensCalibratingUnsafe = false
-        let estimates = lensCalibrationSamples.map { (sqrt($0.ratio) - 1.0) / $0.radiusSquared }.sorted()
-        guard estimates.count >= 80 else {
-            showToast("Calibration failed · use a brighter, evenly lit matte surface")
-            return
-        }
-        let alpha = min(0.45, max(0, estimates[estimates.count / 2]))
-        let profile = LSCCoefficients(radialR: alpha, radialG: alpha, radialB: alpha)
-        guard let id = captureController.currentLensUniqueID ?? selectedLens?.uniqueID,
-              let data = try? JSONEncoder().encode(profile) else { return }
-        UserDefaults.standard.set(data, forKey: lensCalibrationDefaultsPrefix + id)
-        lscOverride = profile
-        hasLensCalibration = true
-        showToast(String(format: "Lens shading calibrated · edge gain %.2f×", pow(1 + alpha, 2)))
-    }
-
-    nonisolated private static func sampleFlatField(from frame: RawFrameData) -> [(radiusSquared: Float, value: Float)] {
-        let pb = frame.pixelBuffer
-        guard CVPixelBufferGetPlaneCount(pb) == 0 else { return [] }
-        CVPixelBufferLockBaseAddress(pb, .readOnly)
-        defer { CVPixelBufferUnlockBaseAddress(pb, .readOnly) }
-        guard let base = CVPixelBufferGetBaseAddress(pb) else { return [] }
-        let width = CVPixelBufferGetWidth(pb), height = CVPixelBufferGetHeight(pb)
-        let bytesPerRow = CVPixelBufferGetBytesPerRow(pb)
-        guard width > 32, height > 32, bytesPerRow >= width * 2 else { return [] }
-        var result: [(Float, Float)] = []
-        for gy in 0..<7 { for gx in 0..<7 {
-            let nx = Float(gx) / 6.0, ny = Float(gy) / 6.0
-            let x = min(width - 9, max(8, Int(nx * Float(width - 1))))
-            let y = min(height - 9, max(8, Int(ny * Float(height - 1))))
-            var sum: UInt64 = 0
-            for py in -4...3 { for px in -4...3 {
-                let row = base.advanced(by: (y + py) * bytesPerRow).assumingMemoryBound(to: UInt16.self)
-                sum += UInt64(UInt16(littleEndian: row[x + px]))
-            }}
-            let value = Float(sum) / (64.0 * 65535.0)
-            let dx = nx - 0.5, dy = ny - 0.5
-            result.append((min(1, 2 * (dx * dx + dy * dy)), value))
-        }}
-        return result
     }
 
     private func syncLiveAutoValues(from frameData: RawFrameData) {
