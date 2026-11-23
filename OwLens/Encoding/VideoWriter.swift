@@ -39,6 +39,10 @@ final class VideoWriter: @unchecked Sendable {
     private var prerollAudioBuffers: [CMSampleBuffer] = []
     private let maxPrerollAudioBuffers = 60
     private var curveType: LogCurveType = .sLog3Approx
+    /// The codec the writer actually accepted. This can differ from the requested
+    /// codec when VideoToolbox declines ProRes and we fall back to HEVC.
+    private(set) var activeCodec: VideoCodecOption = .hevc
+    private var expectedPixelFormat: OSType = 0
     private let lock = NSLock()
 
     var onLowDiskSpace: (@Sendable () -> Void)?
@@ -99,8 +103,11 @@ final class VideoWriter: @unchecked Sendable {
                 kVTCompressionPropertyKey_RealTime as String: true as NSNumber,
                 AVVideoExpectedSourceFrameRateKey: Int(fps),
                 AVVideoAverageNonDroppableFrameRateKey: Int(fps),
-                AVVideoMaxKeyFrameIntervalKey: Int(fps),
-                AVVideoAllowFrameReorderingKey: false as NSNumber
+                // A two-second GOP with B-frames gives the HEVC encoder enough
+                // temporal context to preserve noisy shadows and blue gradients.
+                // This is a recording app, not a zero-latency streaming path.
+                AVVideoMaxKeyFrameIntervalKey: Int(fps * 2),
+                AVVideoAllowFrameReorderingKey: true as NSNumber
             ]
             videoSettings[AVVideoCodecKey] = AVVideoCodecType.hevc
             videoSettings[AVVideoCompressionPropertiesKey] = compression
@@ -117,29 +124,33 @@ final class VideoWriter: @unchecked Sendable {
             // AVAssetWriterInput strictly requires AVVideoTransferFunctionKey to be one of:
             // [ITU_R_2100_HLG, IEC_sRGB, SMPTE_ST_2084_PQ, Linear, ITU_R_709_2].
             // Passing custom or log transfer functions causes an NSInvalidArgumentException crash.
-            // For log profiles (Apple Log 2 and S-Log3 in BT.2020 container), omitting
+            // For log profiles, omitting
             // AVVideoColorPropertiesKey allows VideoToolbox to derive the exact 10-bit color
             // primaries, matrix, and Apple Log transfer function metadata directly from the
             // propagated CVPixelBuffer attachments (kCVImageBufferLogTransferFunctionKey).
             break
         }
 
-        let vInput = AVAssetWriterInput(mediaType: .video, outputSettings: videoSettings)
+        var resolvedCodec = codec
+        var vInput = AVAssetWriterInput(mediaType: .video, outputSettings: videoSettings)
         vInput.expectsMediaDataInRealTime = true
         vInput.mediaTimeScale = CMTimeScale(fps * 1000)
-
-        // Frames are encoded natively upright by MetalPipeline (with 180° sensor
-        // inversion applied when shooting in Landscape Left). We preserve track transform identity
-        // so all players (QuickTime, DaVinci Resolve on Mac/Win, Premiere, VLC, FCP)
-        // play the true raster upright without depending on container matrix interpretation.
         vInput.transform = .identity
 
-        // Use 10-bit bi-planar YCbCr for accurate LOG gradient recording.
-        let pixelFormatType: OSType = (curveType == .linear)
-            ? kCVPixelFormatType_32BGRA
-            : kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
+        // ProRes is intra-frame 10-bit 4:2:2. Feed it a true 10-bit 4:2:2 bi-planar buffer so
+        // Apple's encoder never has to upsample a 4:2:0 source. HEVC log stays 10-bit 4:2:0;
+        // Linear debug output remains 8-bit BGRA.
+        let isProRes = (resolvedCodec == .proRes422 || resolvedCodec == .proRes422HQ)
+        var pixelFormatType: OSType
+        if isProRes {
+            pixelFormatType = kCVPixelFormatType_422YpCbCr10BiPlanarVideoRange
+        } else if curveType == .linear {
+            pixelFormatType = kCVPixelFormatType_32BGRA
+        } else {
+            pixelFormatType = kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
+        }
 
-        let adaptor = AVAssetWriterInputPixelBufferAdaptor(
+        var adaptor = AVAssetWriterInputPixelBufferAdaptor(
             assetWriterInput: vInput,
             sourcePixelBufferAttributes: [
                 kCVPixelBufferPixelFormatTypeKey as String: pixelFormatType,
@@ -149,8 +160,61 @@ final class VideoWriter: @unchecked Sendable {
                 kCVPixelBufferIOSurfacePropertiesKey as String: [:] as [String: Any]
             ])
 
+        // Hardware ProRes encoder on iOS only supports 16:9 standard broadcast resolutions (1080p).
+        // If writer.canAdd rejects ProRes, gracefully fall back to 10-bit HEVC so recording never fails.
+        if !writer.canAdd(vInput) && (resolvedCodec == .proRes422 || resolvedCodec == .proRes422HQ) {
+            print("[VideoWriter] ProRes (\(resolvedCodec.displayName)) rejected by VideoToolbox for \(width)x\(height). Falling back to HEVC 10-bit.")
+            resolvedCodec = .hevc
+            let profileLevel: String
+            switch curveType {
+            case .linear:
+                profileLevel = kVTProfileLevel_HEVC_Main_AutoLevel as String
+            case .appleLog2, .sLog3Approx:
+                profileLevel = kVTProfileLevel_HEVC_Main10_AutoLevel as String
+            }
+            let compression: [String: Any] = [
+                AVVideoAverageBitRateKey: bitrate,
+                kVTCompressionPropertyKey_ProfileLevel as String: profileLevel,
+                kVTCompressionPropertyKey_RealTime as String: true as NSNumber,
+                AVVideoExpectedSourceFrameRateKey: Int(fps),
+                AVVideoAverageNonDroppableFrameRateKey: Int(fps),
+                AVVideoMaxKeyFrameIntervalKey: Int(fps * 2),
+                AVVideoAllowFrameReorderingKey: true as NSNumber
+            ]
+            var fallbackSettings: [String: Any] = [
+                AVVideoCodecKey: AVVideoCodecType.hevc,
+                AVVideoWidthKey: width,
+                AVVideoHeightKey: height,
+                AVVideoCompressionPropertiesKey: compression
+            ]
+            if curveType == .linear {
+                fallbackSettings[AVVideoColorPropertiesKey] = [
+                    AVVideoColorPrimariesKey: AVVideoColorPrimaries_ITU_R_709_2,
+                    AVVideoTransferFunctionKey: AVVideoTransferFunction_ITU_R_709_2,
+                    AVVideoYCbCrMatrixKey: AVVideoYCbCrMatrix_ITU_R_709_2
+                ]
+            }
+            let fallbackInput = AVAssetWriterInput(mediaType: .video, outputSettings: fallbackSettings)
+            fallbackInput.expectsMediaDataInRealTime = true
+            fallbackInput.mediaTimeScale = CMTimeScale(fps * 1000)
+            fallbackInput.transform = .identity
+            let fallbackPixelFormat = (curveType == .linear) ? kCVPixelFormatType_32BGRA : kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
+            let fallbackAdaptor = AVAssetWriterInputPixelBufferAdaptor(
+                assetWriterInput: fallbackInput,
+                sourcePixelBufferAttributes: [
+                    kCVPixelBufferPixelFormatTypeKey as String: fallbackPixelFormat,
+                    kCVPixelBufferWidthKey as String: width,
+                    kCVPixelBufferHeightKey as String: height,
+                    kCVPixelBufferMetalCompatibilityKey as String: true,
+                    kCVPixelBufferIOSurfacePropertiesKey as String: [:] as [String: Any]
+                ])
+            vInput = fallbackInput
+            adaptor = fallbackAdaptor
+            pixelFormatType = fallbackPixelFormat
+        }
+
         guard writer.canAdd(vInput) else {
-            throw NSError(domain: "RawLogCam", code: 10, userInfo: [NSLocalizedDescriptionKey: "Cannot add video input (\(codec.displayName))"])
+            throw NSError(domain: "RawLogCam", code: 10, userInfo: [NSLocalizedDescriptionKey: "Cannot add video input (\(resolvedCodec.displayName))"])
         }
         writer.add(vInput)
 
@@ -194,13 +258,15 @@ final class VideoWriter: @unchecked Sendable {
             }
         }
 
-        writer.metadata = Self.makeMetadataItems(curveType: curveType, fps: fps, width: width, height: height)
+        writer.metadata = Self.makeMetadataItems(curveType: curveType, codec: resolvedCodec, fps: fps, width: width, height: height)
 
         guard writer.startWriting() else {
             throw writer.error ?? NSError(domain: "RawLogCam", code: 11, userInfo: [NSLocalizedDescriptionKey: "AVAssetWriter failed to start"])
         }
 
         self.assetWriter = writer
+        self.activeCodec = resolvedCodec
+        self.expectedPixelFormat = pixelFormatType
         self.videoInput = vInput
         self.audioInput = aInput
         self.metadataInput = mInput
@@ -225,7 +291,7 @@ final class VideoWriter: @unchecked Sendable {
         self.lastFrameHostTime = 0
         self.isRecording = true
 
-        print("[VideoWriter] CFR \(Int(fps))fps \(width)x\(height) codec=\(codec.displayName) bitrate=\(bitrate) orientation=\(orientation.rawValue)")
+        print("[VideoWriter] CFR \(Int(fps))fps \(width)x\(height) codec=\(resolvedCodec.displayName) bitrate=\(bitrate) orientation=\(orientation.rawValue)")
     }
 
     private func drainPendingAudioBuffersLocked(upTo maxPTS: CMTime? = nil) {
@@ -281,29 +347,17 @@ final class VideoWriter: @unchecked Sendable {
                 let rawPTS = CMTimeSubtract(timings[i].presentationTimeStamp, refTime)
                 let bufferDur = timings[i].duration.isValid ? timings[i].duration : CMTime(value: 1024, timescale: 48000)
                 let pts: CMTime
-                if self.lastAudioEndPTS.isValid {
-                    let delta = CMTimeGetSeconds(CMTimeSubtract(rawPTS, self.lastAudioEndPTS))
-                    if abs(delta) < 0.050 {
-                        pts = self.lastAudioEndPTS
-                    } else if CMTimeCompare(rawPTS, self.lastAudioEndPTS) < 0 {
-                        pts = self.lastAudioEndPTS
-                    } else {
-                        pts = rawPTS
-                    }
+                if CMTimeCompare(rawPTS, .zero) < 0 {
+                    // Audio entirely before frame 0: drop it. We never snap or clamp, so the
+                    // audio timeline cannot accumulate drift or overlap the next buffer.
+                    continue
                 } else {
-                    // Initial audio buffer: anchor strictly to max(.zero, rawPTS)
-                    // If buffer starts within 25ms of Frame 0, snap precisely to .zero
-                    let rawSec = CMTimeGetSeconds(rawPTS)
-                    if rawSec <= 0.025 {
-                        pts = .zero
-                    } else {
-                        pts = rawPTS
-                    }
+                    pts = rawPTS
                 }
 
                 timings[i].presentationTimeStamp = pts
-                self.lastAudioPTS = pts
-                self.lastAudioEndPTS = CMTimeAdd(pts, bufferDur)
+                lastAudioPTS = pts
+                lastAudioEndPTS = CMTimeAdd(pts, bufferDur)
                 if timings[i].decodeTimeStamp.isValid {
                     timings[i].decodeTimeStamp = pts
                 }
@@ -370,7 +424,9 @@ final class VideoWriter: @unchecked Sendable {
 
         let pbW = CVPixelBufferGetWidth(pixelBuffer)
         let pbH = CVPixelBufferGetHeight(pixelBuffer)
-        if pbW != width || pbH != height {
+        let pixelFormat = CVPixelBufferGetPixelFormatType(pixelBuffer)
+        if pbW != width || pbH != height || pixelFormat != expectedPixelFormat {
+            print("[VideoWriter] Rejecting frame: got \(pbW)x\(pbH) format=\(pixelFormat), expected \(width)x\(height) format=\(expectedPixelFormat) for \(activeCodec.displayName)")
             droppedFrames += 1
             return false
         }
@@ -442,14 +498,12 @@ final class VideoWriter: @unchecked Sendable {
         // Calculate wall-clock elapsed time since optical session start
         let elapsed: Double
         if let captureTime = captureTime, captureTime.isValid, sessionStartTime.isValid {
-            let optical = CMTimeGetSeconds(CMTimeSubtract(captureTime, sessionStartTime))
-            let wallClock = now - startHostTime
-            // Protect against clock-domain jumps or un-anchored capture timestamps
-            if optical >= 0 && abs(optical - wallClock) < 1.0 {
-                elapsed = optical
-            } else {
-                elapsed = max(0, wallClock)
-            }
+            // Audio and AVCapturePhoto timestamps come from the same capture
+            // session clock. RAW delivery can lag exposure by well over a second;
+            // substituting arrival wall-clock time in that case made video follow
+            // processing latency while audio followed the real capture instant.
+            // Keep the optical timestamp authoritative whenever it is available.
+            elapsed = max(0, CMTimeGetSeconds(CMTimeSubtract(captureTime, sessionStartTime)))
         } else {
             elapsed = max(0, now - startHostTime)
         }
@@ -485,13 +539,13 @@ final class VideoWriter: @unchecked Sendable {
             spinAttempts += 1
         }
 
-        // Fill any missing CFR slots by repeating last frame (up to 12 frames max / 0.5s).
-        // This ensures the video container maintains strict CFR 24.0000 FPS without VFR warnings,
-        // while guaranteeing that audio and video remain in microsecond sync over long recordings!
+        // Fill every missing CFR slot by repeating the last frame. Capping this
+        // at 0.5 seconds used to leave holes in the presentation timeline after
+        // a RAW-capture stall, producing a variable-duration track while claiming
+        // CFR. A long stall now costs temporal freshness, not timeline integrity.
         if let hold = lastPixelBuffer, targetSlot > lastWrittenSlot + 1 {
-            let holdLimit = min(targetSlot, lastWrittenSlot + 13)
             var slotToFill = lastWrittenSlot + 1
-            while slotToFill < holdLimit {
+            while slotToFill < targetSlot {
                 var holdSpin = 0
                 while !input.isReadyForMoreMediaData && holdSpin < 5 {
                     lock.unlock()
@@ -659,22 +713,11 @@ final class VideoWriter: @unchecked Sendable {
             let rawPTS = CMTimeSubtract(singleTiming.presentationTimeStamp, refTime)
             let bufferDur = singleTiming.duration.isValid ? singleTiming.duration : CMTime(value: 1024, timescale: 48000)
             let pts: CMTime
-            if lastAudioEndPTS.isValid {
-                let delta = CMTimeGetSeconds(CMTimeSubtract(rawPTS, lastAudioEndPTS))
-                if abs(delta) < 0.050 {
-                    pts = lastAudioEndPTS
-                } else if CMTimeCompare(rawPTS, lastAudioEndPTS) < 0 {
-                    pts = lastAudioEndPTS
-                } else {
-                    pts = rawPTS
-                }
+            if CMTimeCompare(rawPTS, .zero) < 0 {
+                // Drop pre-roll audio rather than snapping it, preventing cumulative drift.
+                return true
             } else {
-                let rawSec = CMTimeGetSeconds(rawPTS)
-                if rawSec <= 0.025 {
-                    pts = .zero
-                } else {
-                    pts = rawPTS
-                }
+                pts = rawPTS
             }
             singleTiming.presentationTimeStamp = pts
             lastAudioPTS = pts
@@ -738,22 +781,10 @@ final class VideoWriter: @unchecked Sendable {
             let rawPTS = CMTimeSubtract(timings[i].presentationTimeStamp, refTime)
             let bufferDur = timings[i].duration.isValid ? timings[i].duration : CMTime(value: 1024, timescale: 48000)
             let pts: CMTime
-            if lastAudioEndPTS.isValid {
-                let delta = CMTimeGetSeconds(CMTimeSubtract(rawPTS, lastAudioEndPTS))
-                if abs(delta) < 0.050 {
-                    pts = lastAudioEndPTS
-                } else if CMTimeCompare(rawPTS, lastAudioEndPTS) < 0 {
-                    pts = lastAudioEndPTS
-                } else {
-                    pts = rawPTS
-                }
+            if CMTimeCompare(rawPTS, .zero) < 0 {
+                continue
             } else {
-                let rawSec = CMTimeGetSeconds(rawPTS)
-                if rawSec <= 0.025 {
-                    pts = .zero
-                } else {
-                    pts = rawPTS
-                }
+                pts = rawPTS
             }
             timings[i].presentationTimeStamp = pts
             lastAudioPTS = pts
@@ -948,6 +979,7 @@ final class VideoWriter: @unchecked Sendable {
 
     private static func makeMetadataItems(
         curveType: LogCurveType,
+        codec: VideoCodecOption = .hevc,
         fps: Double,
         width: Int,
         height: Int
@@ -957,9 +989,9 @@ final class VideoWriter: @unchecked Sendable {
         let gamut: String
         switch curveType {
         case .appleLog2:
-            gamut = "ITU-R BT.2020"
+            gamut = "Apple Wide Gamut"
         case .sLog3Approx:
-            gamut = "Sony S-Gamut3.Cine"
+            gamut = "ITU-R BT.2020"
         case .linear:
             gamut = "Rec.709"
         }
@@ -969,14 +1001,14 @@ final class VideoWriter: @unchecked Sendable {
         let desc = AVMutableMetadataItem()
         desc.keySpace = .common
         desc.key = AVMetadataKey.commonKeyDescription as (NSCopying & NSObjectProtocol)
-        desc.value = "\(gamma) · \(gamut) · 10-Bit" as (NSCopying & NSObjectProtocol)
+        desc.value = "\(gamma) · \(gamut) · \(codec.displayName)" as (NSCopying & NSObjectProtocol)
         items.append(desc)
 
         // 2. QuickTime User Data Description
         let qtDesc = AVMutableMetadataItem()
         qtDesc.keySpace = .quickTimeUserData
         qtDesc.key = AVMetadataKey.quickTimeUserDataKeyDescription as (NSCopying & NSObjectProtocol)
-        qtDesc.value = "\(gamma) · \(gamut) · 10-Bit" as (NSCopying & NSObjectProtocol)
+        qtDesc.value = "\(gamma) · \(gamut) · \(codec.displayName)" as (NSCopying & NSObjectProtocol)
         items.append(qtDesc)
 
         // 3. QuickTime Software
@@ -1004,7 +1036,7 @@ final class VideoWriter: @unchecked Sendable {
         let comment = AVMutableMetadataItem()
         comment.keySpace = .quickTimeUserData
         comment.key = AVMetadataKey.quickTimeUserDataKeyComment as (NSCopying & NSObjectProtocol)
-        comment.value = "Color Space: \(gamut) | Gamma: \(gamma) | Frame Rate: \(Int(fps)) fps | Format: \(width)x\(height) 10-Bit HEVC" as (NSCopying & NSObjectProtocol)
+        comment.value = "Color Space: \(gamut) | Gamma: \(gamma) | Frame Rate: \(Int(fps)) fps | Format: \(width)x\(height) \(codec.displayName)" as (NSCopying & NSObjectProtocol)
         items.append(comment)
 
         return items

@@ -52,6 +52,14 @@ struct WhiteBalanceParams {
         SIMD3<Float>( 0.0807,  0.8915, -0.0014), // column 1
         SIMD3<Float>( 0.0237,  0.0986,  0.9838)  // column 2
     )
+
+    /// Fallback only until the first DNG ForwardMatrix arrives. Production
+    /// frames use the live DNG-derived Apple Wide Gamut transform instead.
+    static let defaultSensorToAppleWideGamut = simd_float3x3(
+        SIMD3<Float>( 0.840227, -0.033017,  0.008419),
+        SIMD3<Float>( 0.087485,  0.960004,  0.006004),
+        SIMD3<Float>( 0.072299,  0.073026,  0.985671)
+    )
 }
 
 /// Matches `FusedParams` in Debayer.metal — must be identical layout.
@@ -94,10 +102,10 @@ enum ProcessingQuality {
 }
 
 /// Metal pipeline: Bayer → (optional CFA-safe phase-preserving 2× reduce) → (optional defect pixel correction)
-/// → fused debayer / LSC / WB / CCM / Log OETF → (optional crop & scale) → (optional unsharp mask)
-/// → 10-bit YCbCr 4:2:0 / BGRA encode.
+/// → fused debayer / LSC / WB / CCM (scene-linear RGB) → (optional crop & area-integrating scale)
+/// → official log OETF → 10-bit YCbCr 4:2:2 (ProRes) / 4:2:0 (HEVC) / BGRA (linear).
 ///
-///   • Single-pass demosaic + optical LSC + WB + Log encoding eliminates intermediate passes and VRAM traffic
+///   • Single-pass demosaic + optical LSC + WB keeps intermediate passes and VRAM traffic low
 ///   • Pre-allocated texture pool — zero per-frame allocations
 ///   • Asynchronous GPU command buffer dispatch with zero CPU stalling
 final class MetalPipeline: @unchecked Sendable {
@@ -108,15 +116,17 @@ final class MetalPipeline: @unchecked Sendable {
     private let debayerFusedPipeline: MTLComputePipelineState
     private let convertFormatPipeline: MTLComputePipelineState
     private let convertYpCbCr10Pipeline: MTLComputePipelineState
+    private let convertYpCbCr422Pipeline: MTLComputePipelineState
     private let cropAndResamplePipeline: MTLComputePipelineState
-    private let unsharpPipeline: MTLComputePipelineState
+    private let logEncodePipeline: MTLComputePipelineState
     private let defectPixelPipeline: MTLComputePipelineState
     private let binThreads: MTLSize
     private let debayerFusedThreads: MTLSize
     private let convertFormatThreads: MTLSize
     private let convertYpCbCr10Threads: MTLSize
+    private let convertYpCbCr422Threads: MTLSize
     private let cropAndResampleThreads: MTLSize
-    private let unsharpThreads: MTLSize
+    private let logEncodeThreads: MTLSize
     private let defectPixelThreads: MTLSize
     private var textureCache: CVMetalTextureCache?
 
@@ -213,13 +223,10 @@ final class MetalPipeline: @unchecked Sendable {
         }
     }
 
-    var curveType: LogCurveType = .sLog3Approx {
-        didSet {
-            headroomScale = LogCurve.defaultRMax(for: curveType)
-        }
-    }
-    /// Scene reflectance headroom multiplier: sensor [0, 1] -> R [0, headroomScale].
-    var headroomScale: Float = LogCurve.defaultRMax(for: .sLog3Approx)
+    var curveType: LogCurveType = .sLog3Approx
+    /// Unused. Retained only so `FusedParams` keeps a stable memory layout. The log OETFs
+    /// are now anchored directly to scene-linear reflectance with no shoulder or pre-gain.
+    var headroomScale: Float = 1.0
     var wbParams: WhiteBalanceParams = .identity
     var bayerPattern: Int32 = 0
     var blackLevel: Float = 0
@@ -243,8 +250,9 @@ final class MetalPipeline: @unchecked Sendable {
     /// Sensor noise reduction strength (0.0 = raw grain, 1.0 = clean calibrated denoising).
     var denoiseStrength: Float = 1.0
 
-    /// Adaptive edge sharpness strength (0.0 = off, 0.5 = natural cinema sharpness, 1.0 = sharp).
-    var sharpnessStrength: Float = 0.5
+    /// When true the recording output is encoded as 10-bit 4:2:2 (ProRes 422 / 422 HQ).
+    /// When false the output is 10-bit 4:2:0 (HEVC) or 8-bit BGRA (Linear preview/debug).
+    var use422Encoding: Bool = false
 
     /// Dynamic sensor-crop zoom factor (1.0 = native full sensor, up to 2.0 = lossless 1:1 sensor crop).
     var zoomFactor: Float = 1.0
@@ -260,9 +268,10 @@ final class MetalPipeline: @unchecked Sendable {
               let debayerFusedFunc = library.makeFunction(name: "debayerFusedLog"),
               let convertFormatFunc = library.makeFunction(name: "convertRgba16FloatToBgra8"),
               let convertYpCbCr10Func = library.makeFunction(name: "convertRgbTo420YpCbCr10"),
+              let convertYpCbCr422Func = library.makeFunction(name: "convertRgbTo422YpCbCr10"),
               let defectPixelFunc = library.makeFunction(name: "correctDefectPixelsBayer"),
-              let unsharpFunc = library.makeFunction(name: "unsharpMaskAdaptive"),
-              let cropAndResampleFunc = library.makeFunction(name: "cropAndResampleBilinear") else {
+              let logEncodeFunc = library.makeFunction(name: "applyLogOETF"),
+              let cropAndResampleFunc = library.makeFunction(name: "cropAndResampleCatmullRom") else {
             return nil
         }
         guard let scopeQueue = device.makeCommandQueue() else { return nil }
@@ -271,26 +280,29 @@ final class MetalPipeline: @unchecked Sendable {
         self.scopeCommandQueue = scopeQueue
         do {
             let bin = try device.makeComputePipelineState(function: binFunc)
-            let unsharp = try device.makeComputePipelineState(function: unsharpFunc)
+            let logEncode = try device.makeComputePipelineState(function: logEncodeFunc)
             let debayer = try device.makeComputePipelineState(function: debayerFusedFunc)
             let convertFormat = try device.makeComputePipelineState(function: convertFormatFunc)
             let convertYp = try device.makeComputePipelineState(function: convertYpCbCr10Func)
+            let convertYp422 = try device.makeComputePipelineState(function: convertYpCbCr422Func)
             let crop = try device.makeComputePipelineState(function: cropAndResampleFunc)
             let defect = try device.makeComputePipelineState(function: defectPixelFunc)
 
             self.binPipeline = bin
-            self.unsharpPipeline = unsharp
+            self.logEncodePipeline = logEncode
             self.debayerFusedPipeline = debayer
             self.convertFormatPipeline = convertFormat
             self.convertYpCbCr10Pipeline = convertYp
+            self.convertYpCbCr422Pipeline = convertYp422
             self.cropAndResamplePipeline = crop
             self.defectPixelPipeline = defect
 
             self.binThreads = Self.computeThreadsPerGroup(for: bin)
-            self.unsharpThreads = Self.computeThreadsPerGroup(for: unsharp)
+            self.logEncodeThreads = Self.computeThreadsPerGroup(for: logEncode)
             self.debayerFusedThreads = Self.computeThreadsPerGroup(for: debayer)
             self.convertFormatThreads = Self.computeThreadsPerGroup(for: convertFormat)
             self.convertYpCbCr10Threads = Self.computeThreadsPerGroup(for: convertYp)
+            self.convertYpCbCr422Threads = Self.computeThreadsPerGroup(for: convertYp422)
             self.cropAndResampleThreads = Self.computeThreadsPerGroup(for: crop)
             self.defectPixelThreads = Self.computeThreadsPerGroup(for: defect)
         } catch {
@@ -458,9 +470,14 @@ final class MetalPipeline: @unchecked Sendable {
 
     /// Pre-allocates the CVPixelBufferPool and Metal texture pools ahead of recording so Frame 0 doesn't stall allocating on the fly.
     func prewarm(width: Int, height: Int, curveType: LogCurveType) {
-        let format: OSType = (curveType == .linear)
-            ? kCVPixelFormatType_32BGRA
-            : kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
+        let format: OSType
+        if use422Encoding {
+            format = kCVPixelFormatType_422YpCbCr10BiPlanarVideoRange
+        } else if curveType == .linear {
+            format = kCVPixelFormatType_32BGRA
+        } else {
+            format = kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
+        }
         _ = getOrCreatePixelBuffer(width: width, height: height, format: format)
         let bW = pooledBinW[0] > 0 ? pooledBinW[0] : 4032
         let bH = pooledBinH[0] > 0 ? pooledBinH[0] : 3024
@@ -481,13 +498,20 @@ final class MetalPipeline: @unchecked Sendable {
             CVBufferSetAttachment(pixelBuffer, kCVImageBufferTransferFunctionKey, kCVImageBufferTransferFunction_ITU_R_709_2, .shouldPropagate)
             CVBufferSetAttachment(pixelBuffer, kCVImageBufferYCbCrMatrixKey, kCVImageBufferYCbCrMatrix_ITU_R_709_2, .shouldPropagate)
         case .appleLog2:
-            CVBufferSetAttachment(pixelBuffer, kCVImageBufferColorPrimariesKey, kCVImageBufferColorPrimaries_ITU_R_2020, .shouldPropagate)
+            // Apple Log 2 is Apple Wide Gamut, not BT.2020. Apple supplies no
+            // NCLC primaries identifier for Apple Wide Gamut; the Log 2 attachment
+            // identifies the complete profile. BT.2020 is retained only for the
+            // profile-defined Y′CbCr conversion matrix.
+            CVBufferRemoveAttachment(pixelBuffer, kCVImageBufferColorPrimariesKey)
             CVBufferSetAttachment(pixelBuffer, kCVImageBufferYCbCrMatrixKey, kCVImageBufferYCbCrMatrix_ITU_R_2020, .shouldPropagate)
             CVBufferRemoveAttachment(pixelBuffer, kCVImageBufferTransferFunctionKey)
-            if #available(iOS 17.2, *) {
-                CVBufferSetAttachment(pixelBuffer, kCVImageBufferLogTransferFunctionKey, kCVImageBufferLogTransferFunction_AppleLog, .shouldPropagate)
+            if #available(iOS 26.0, *) {
+                CVBufferSetAttachment(pixelBuffer, kCVImageBufferLogTransferFunctionKey, kCVImageBufferLogTransferFunction_AppleLog2, .shouldPropagate)
             } else {
-                CVBufferSetAttachment(pixelBuffer, "LogTransferFunction" as CFString, "com.apple.rec2020.apple-log" as CFString, .shouldPropagate)
+                // Never mis-tag Apple Log 2 as ordinary Apple Log on an older OS.
+                // The clip remains a correctly encoded custom stream but must be
+                // interpreted manually by the grading application.
+                CVBufferRemoveAttachment(pixelBuffer, "LogTransferFunction" as CFString)
             }
         case .sLog3Approx:
             CVBufferSetAttachment(pixelBuffer, kCVImageBufferColorPrimariesKey, kCVImageBufferColorPrimaries_ITU_R_2020, .shouldPropagate)
@@ -498,7 +522,9 @@ final class MetalPipeline: @unchecked Sendable {
 
     /// Encodes an RGB texture into a recording CVPixelBuffer.
     /// For Linear: encodes to 8-bit BGRA (`kCVPixelFormatType_32BGRA`).
-    /// For Apple Log 2 / S-Log3: encodes to true 10-bit Video Range BT.2020 YCbCr 4:2:0
+    /// For ProRes 422 / 422 HQ: true 10-bit Video Range BT.2020 YCbCr 4:2:2
+    /// (`kCVPixelFormatType_422YpCbCr10BiPlanarVideoRange`).
+    /// For HEVC Apple Log 2 / S-Log3: true 10-bit Video Range BT.2020 YCbCr 4:2:0
     /// (`kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange`) via direct Metal kernel dispatch.
     /// Returns the pixel buffer along with CVMetalTextures that must be retained until GPU completion.
     private func encodeOutputPixelBuffer(
@@ -507,6 +533,76 @@ final class MetalPipeline: @unchecked Sendable {
         encodeHeight: Int,
         cb: MTLCommandBuffer
     ) -> (CVPixelBuffer?, [Any]) {
+        if use422Encoding {
+            guard let pb = getOrCreatePixelBuffer(width: encodeWidth, height: encodeHeight, format: kCVPixelFormatType_422YpCbCr10BiPlanarVideoRange) else {
+                return (nil, [])
+            }
+            let yW = CVPixelBufferGetWidthOfPlane(pb, 0)
+            let yH = CVPixelBufferGetHeightOfPlane(pb, 0)
+            let uvW = CVPixelBufferGetWidthOfPlane(pb, 1)
+            let uvH = CVPixelBufferGetHeightOfPlane(pb, 1)
+
+            if let unmanaged = CVPixelBufferGetIOSurface(pb) {
+                let ioSurface = unmanaged.takeUnretainedValue()
+                let descY = MTLTextureDescriptor.texture2DDescriptor(
+                    pixelFormat: .r16Unorm, width: yW, height: yH, mipmapped: false)
+                descY.usage = [.shaderWrite]
+                descY.storageMode = .shared
+
+                let descUV = MTLTextureDescriptor.texture2DDescriptor(
+                    pixelFormat: .rg16Unorm, width: uvW, height: uvH, mipmapped: false)
+                descUV.usage = [.shaderWrite]
+                descUV.storageMode = .shared
+
+                if let yTex = device.makeTexture(descriptor: descY, iosurface: ioSurface, plane: 0),
+                   let uvTex = device.makeTexture(descriptor: descUV, iosurface: ioSurface, plane: 1),
+                   let enc = cb.makeComputeCommandEncoder() {
+                    enc.setComputePipelineState(convertYpCbCr422Pipeline)
+                    enc.setTexture(sourceTexture, index: 0)
+                    enc.setTexture(yTex, index: 1)
+                    enc.setTexture(uvTex, index: 2)
+                    var cType = Int32(curveType.rawValue)
+                    enc.setBytes(&cType, length: MemoryLayout<Int32>.stride, index: 0)
+                    dispatch(enc, width: uvW, height: uvH, threadsPerGroup: convertYpCbCr422Threads)
+                    enc.endEncoding()
+
+                    // Always refresh metadata: pixel buffers are recycled by the pool and may
+                    // still carry attachments from a previous curve/codec selection.
+                    Self.attachColorMetadata(to: pb, curveType: curveType)
+                    return (pb, [])
+                }
+            }
+
+            guard let texCache = textureCache else { return (nil, []) }
+            var cvYOut: CVMetalTexture?
+            let statusY = CVMetalTextureCacheCreateTextureFromImage(
+                nil, texCache, pb, nil, .r16Unorm, yW, yH, 0, &cvYOut)
+
+            var cvUVOut: CVMetalTexture?
+            let statusUV = CVMetalTextureCacheCreateTextureFromImage(
+                nil, texCache, pb, nil, .rg16Unorm, uvW, uvH, 1, &cvUVOut)
+
+            guard statusY == kCVReturnSuccess, statusUV == kCVReturnSuccess,
+                  let cvY = cvYOut, let yTex = CVMetalTextureGetTexture(cvY),
+                  let cvUV = cvUVOut, let uvTex = CVMetalTextureGetTexture(cvUV),
+                  let enc = cb.makeComputeCommandEncoder() else {
+                return (nil, [])
+            }
+
+            enc.setComputePipelineState(convertYpCbCr422Pipeline)
+            enc.setTexture(sourceTexture, index: 0)
+            enc.setTexture(yTex, index: 1)
+            enc.setTexture(uvTex, index: 2)
+            var cType = Int32(curveType.rawValue)
+            enc.setBytes(&cType, length: MemoryLayout<Int32>.stride, index: 0)
+            dispatch(enc, width: uvW, height: uvH, threadsPerGroup: convertYpCbCr422Threads)
+            enc.endEncoding()
+
+            // Always refresh metadata: pooled buffers may carry stale attachments.
+            Self.attachColorMetadata(to: pb, curveType: curveType)
+            return (pb, [cvY, cvUV])
+        }
+
         if curveType == .linear {
             guard let pb = getOrCreatePixelBuffer(width: encodeWidth, height: encodeHeight, format: kCVPixelFormatType_32BGRA) else {
                 return (nil, [])
@@ -525,9 +621,9 @@ final class MetalPipeline: @unchecked Sendable {
                     dispatch(enc, width: encodeWidth, height: encodeHeight, threadsPerGroup: convertFormatThreads)
                     enc.endEncoding()
 
-                    if CVBufferGetAttachment(pb, kCVImageBufferColorPrimariesKey, nil) == nil {
-                        Self.attachColorMetadata(to: pb, curveType: curveType)
-                    }
+                    // Always refresh metadata: pixel buffers are recycled by the pool and may
+                    // still carry attachments from a previous curve/codec selection.
+                    Self.attachColorMetadata(to: pb, curveType: curveType)
                     return (pb, [])
                 }
             }
@@ -547,9 +643,8 @@ final class MetalPipeline: @unchecked Sendable {
             dispatch(enc, width: encodeWidth, height: encodeHeight, threadsPerGroup: convertFormatThreads)
             enc.endEncoding()
 
-            if CVBufferGetAttachment(pb, kCVImageBufferColorPrimariesKey, nil) == nil {
-                Self.attachColorMetadata(to: pb, curveType: curveType)
-            }
+            // Always refresh metadata: pooled buffers may carry stale attachments.
+            Self.attachColorMetadata(to: pb, curveType: curveType)
             return (pb, [cvTex])
         } else {
             guard let pb = getOrCreatePixelBuffer(width: encodeWidth, height: encodeHeight, format: kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange) else {
@@ -584,9 +679,9 @@ final class MetalPipeline: @unchecked Sendable {
                     dispatch(enc, width: uvW, height: uvH, threadsPerGroup: convertYpCbCr10Threads)
                     enc.endEncoding()
 
-                    if CVBufferGetAttachment(pb, kCVImageBufferColorPrimariesKey, nil) == nil {
-                        Self.attachColorMetadata(to: pb, curveType: curveType)
-                    }
+                    // Always refresh metadata: pixel buffers are recycled by the pool and may
+                    // still carry attachments from a previous curve/codec selection.
+                    Self.attachColorMetadata(to: pb, curveType: curveType)
                     return (pb, [])
                 }
             }
@@ -616,9 +711,8 @@ final class MetalPipeline: @unchecked Sendable {
             dispatch(enc, width: uvW, height: uvH, threadsPerGroup: convertYpCbCr10Threads)
             enc.endEncoding()
 
-            if CVBufferGetAttachment(pb, kCVImageBufferColorPrimariesKey, nil) == nil {
-                Self.attachColorMetadata(to: pb, curveType: curveType)
-            }
+            // Always refresh metadata: pooled buffers may carry stale attachments.
+            Self.attachColorMetadata(to: pb, curveType: curveType)
             return (pb, [cvY, cvUV])
         }
     }
@@ -709,9 +803,9 @@ final class MetalPipeline: @unchecked Sendable {
             bayerIn = correctedBayerPass
         }
 
-        // ── Single-Pass Fused Debayer: Demosaic + LSC + WB + CCM + Log OETF in ONE kernel ──
-        // Uses debayerFusedLog to eliminate separate debayer, WB, LSC, and log passes,
-        // saving ~97.5 MB per frame of VRAM bandwidth at 12.2 MP.
+        // ── Single-Pass Fused Debayer: Demosaic + LSC + WB + CCM in ONE kernel ──
+        // Emits scene-linear RGB so crop/scale works cleanly in linear space;
+        // the official log OETF is applied afterwards in applyLogOETF without artificial sharpening.
         guard let fusedOut = getOrCreateFusedTexture(width: bayerW, height: bayerH, slot: slot) else {
             completion(nil, nil); return
         }
@@ -727,7 +821,7 @@ final class MetalPipeline: @unchecked Sendable {
                 wbGains: wbParams.gains,
                 lscCoefficients: lscCoefficients,
                 greenBalance: greenBalance,
-                headroomScale: curveType == .linear ? 1.0 : headroomScale
+                headroomScale: 1.0
             )
             enc.setBytes(&params, length: MemoryLayout<FusedParams>.stride, index: 0)
             enc.setBytes(&lscParams, length: MemoryLayout<LSCParams>.stride, index: 1)
@@ -749,25 +843,23 @@ final class MetalPipeline: @unchecked Sendable {
             cb: commandBuffer
         ) ?? fusedOut
 
-        // Adaptive unsharp masking executed on target resolution post-crop/scale.
-        // Runs for recording and preview (when not thermally throttled) to deliver true WYSIWYG
-        // cinema-grade acutance and edge sharpness.
-        let canSharpen = sharpnessStrength > 0.001 && (processingQuality == .recordQuality || !isThermalCritical)
+        // ── Official log OETF only (no sharpening / artificial colour) ──
+        // The scene-linear RGB is encoded directly with the published Apple Log 2 /
+        // S-Log3 OETF. This keeps 18% gray at exactly 0.18 entering the curve
+        // (48.8% IRE for Apple Log 2) without any local-contrast or colour processing.
         let finalTex: MTLTexture
-        if canSharpen,
-           let sTex = getOrCreateSharpenTexture(width: scaledTex.width, height: scaledTex.height, slot: slot),
+        if let logTex = getOrCreateSharpenTexture(width: scaledTex.width, height: scaledTex.height, slot: slot),
            let enc = commandBuffer.makeComputeCommandEncoder() {
-            enc.setComputePipelineState(unsharpPipeline)
+            enc.setComputePipelineState(logEncodePipeline)
             enc.setTexture(scaledTex, index: 0)
-            enc.setTexture(sTex, index: 1)
-            var s = sharpnessStrength
-            enc.setBytes(&s, length: MemoryLayout<Float>.stride, index: 0)
+            enc.setTexture(logTex, index: 1)
             var cType = Int32(curveType.rawValue)
-            enc.setBytes(&cType, length: MemoryLayout<Int32>.stride, index: 1)
-            dispatch(enc, width: scaledTex.width, height: scaledTex.height, threadsPerGroup: unsharpThreads)
+            enc.setBytes(&cType, length: MemoryLayout<Int32>.stride, index: 0)
+            dispatch(enc, width: scaledTex.width, height: scaledTex.height, threadsPerGroup: logEncodeThreads)
             enc.endEncoding()
-            finalTex = sTex
+            finalTex = logTex
         } else {
+            // Allocation failure fallback: still a valid (linear) texture for preview.
             finalTex = scaledTex
         }
 
@@ -803,7 +895,7 @@ final class MetalPipeline: @unchecked Sendable {
     // MARK: - Preview-Only (lightweight capture path)
 
     /// Fast preview path: delegates to process with encodeAsBGRA: false.
-    /// Runs single-pass fused debayer + crop/scale + unsharp mask with zero CVPixelBuffer allocation.
+    /// Runs single-pass fused debayer + crop/scale + log OETF with zero CVPixelBuffer allocation.
     func processPreviewOnly(_ pixelBuffer: CVPixelBuffer,
                             encodeWidth: Int = 2016,
                             encodeHeight: Int = 1512,
@@ -882,11 +974,11 @@ final class MetalPipeline: @unchecked Sendable {
         let startX = originX + 0.5 * scaleX
         let startY = originY + 0.5 * scaleY
 
-        // High-performance filtering policy:
-        // Use single-cycle hardware TMU sampler (cropAndResamplePipeline) to maintain rock-solid 24.000 CFR
-        // at ~0.8ms GPU frame time (saving ~13.4ms compared to 25-tap software bicubic).
-        // Combined with post-crop unsharp masking, this guarantees cinema-grade MTF acutance while completely
-        // eliminating frame drops, capture stalls, and jitter under low-ISO exposures and Rec.709 display LUT rendering.
+        // Reconstruction policy: 4×4 Catmull-Rom. At 1:1 / zoom-in it is phase-correct and
+        // exactly reconstructing; when minifying the footprint widens with the scale factor
+        // so the full source area is integrated instead of point-sampling one texel. This
+        // removes the aliasing/moiré of the old single-tap bilinear fetch while keeping the
+        // pass cheap enough for rock-solid CFR recording.
         let pipeline = cropAndResamplePipeline
         let threads = cropAndResampleThreads
 

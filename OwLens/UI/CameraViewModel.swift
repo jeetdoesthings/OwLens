@@ -197,6 +197,9 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
             if selectedBitrate.rawValue > selectedFormat.maxBitratePreset.rawValue {
                 selectedBitrate = selectedFormat.suggestedBitratePreset
             }
+            if selectedFormat == .openGate && (selectedCodec == .proRes422 || selectedCodec == .proRes422HQ) {
+                selectedCodec = .hevc
+            }
             updateStorageEstimate()
             refreshStatusLine()
         }
@@ -224,6 +227,10 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
     @Published var selectedCodec: VideoCodecOption = .hevc {
         didSet {
             guard !isRecording else { return }
+            if (selectedCodec == .proRes422 || selectedCodec == .proRes422HQ) && selectedFormat == .openGate {
+                // ProRes hardware encoding is strictly supported for 16:9 on iOS
+                selectedFormat = .hd169
+            }
             updateStorageEstimate()
             refreshStatusLine()
         }
@@ -635,6 +642,13 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
     nonisolated(unsafe) var isAppActive = true
     /// Measured LSC override from device calibration (set once at setup).
     nonisolated(unsafe) private var lscOverride: LSCCoefficients?
+    @Published private(set) var isLensCalibrating = false
+    nonisolated(unsafe) private var isLensCalibratingUnsafe = false
+    @Published private(set) var lensCalibrationProgress = 0
+    @Published private(set) var hasLensCalibration = false
+    private var lensCalibrationSamples: [(radiusSquared: Float, ratio: Float)] = []
+    private let lensCalibrationFrameTarget = 24
+    private let lensCalibrationDefaultsPrefix = "OwLens.LensCalibration."
 
     /// Measured noise coefficients from device calibration (set once at setup).
     nonisolated(unsafe) private var noiseCoeffs: (shot: Float, read: Float) = (0.012, 0.0004)
@@ -642,7 +656,7 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
     nonisolated(unsafe) private var noiseProfileForISO: NoiseProfile?
     /// Latest calibrated color matrices extracted from DNG metadata.
     nonisolated(unsafe) private var latestColorMatrix: simd_float3x3?
-    nonisolated(unsafe) private var latestSGamutMatrix: simd_float3x3?
+    nonisolated(unsafe) private var latestAppleWideGamutMatrix: simd_float3x3?
 
     enum ControlPanel: String, Identifiable {
         case exposure, iso, shutter, wb, focus, format, bitrate, denoise, mic, lens, save, logCurve
@@ -678,6 +692,10 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
         activeEncodeHeight = selectedFormat.height
         activeFPS = selectedFPS.rawValue
         selectedBitrate = selectedFormat.suggestedBitratePreset
+        // Open Gate + HEVC is the universal default. ProRes remains an explicit
+        // option only on hardware that supports it, rather than changing framing
+        // and codec behind the user's back at launch.
+        selectedCodec = .hevc
 
         NotificationCenter.default.publisher(for: ProcessInfo.thermalStateDidChangeNotification)
             .receive(on: DispatchQueue.main)
@@ -914,7 +932,10 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
         // (same openGate + 24 + 100) — other tiers get safer recommendations.
         selectedFPS = caps.recommendedFPS
         selectedFormat = caps.recommendedFormat
-        selectedBitrate = caps.recommendedBitrate
+        // 150 Mbps is the quality default for every supported hardware tier.
+        // It is the highest validated real-time HEVC rate in this RAW pipeline.
+        selectedBitrate = .mbps150
+        selectedCodec = .hevc
         activeEncodeWidth = selectedFormat.width
         activeEncodeHeight = selectedFormat.height
         activeFPS = selectedFPS.rawValue
@@ -965,6 +986,7 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
             } else {
                 selectedLens = availableLenses.first
             }
+            loadLensCalibrationForCurrentLens()
             seedControlRanges()
             captureController.setCaptureFPS(selectedFPS.rawValue)
             refreshAudioSources()
@@ -1366,6 +1388,7 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
                 } else {
                     // ISO/shutter ranges can change per lens
                     self.seedControlRanges()
+                    self.loadLensCalibrationForCurrentLens()
 
                     self.applyManualExposureAndWB()
                     self.refreshStatusLine()
@@ -1645,11 +1668,13 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
         case .linear:
             cMatrix = matrix_identity_float3x3
         case .appleLog2:
-            cMatrix = latestColorMatrix ?? WhiteBalanceParams.defaultSensorToBT2020
+            cMatrix = latestAppleWideGamutMatrix ?? WhiteBalanceParams.defaultSensorToAppleWideGamut
         case .sLog3Approx:
-            cMatrix = latestSGamutMatrix ?? WhiteBalanceParams.defaultSensorToSGamut3Cine
+            // HEVC is written with BT.2020 Y′CbCr coefficients and BT.2020
+            // signaling. Feeding it S-Gamut3.Cine RGB would be a color-space
+            // mismatch, so this remains a BT.2020 + S-Log3-transfer profile.
+            cMatrix = latestColorMatrix ?? WhiteBalanceParams.defaultSensorToBT2020
         }
-        metalPipeline?.headroomScale = LogCurve.defaultRMax(for: selectedCurve)
         metalPipeline?.wbParams = WhiteBalanceParams(
             gains: SIMD3<Float>(
                 max(gains.redGain / g, 0.01),
@@ -1777,12 +1802,21 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
             lockControls()
         }
 
+        // ProRes hardware encoding is strictly supported for standard 16:9 broadcast dimensions (1080p).
+        // If Open Gate (2016x1512) is active, safely use HEVC 10-bit so recording never fails.
+        var effectiveCodec = selectedCodec
+        if (effectiveCodec == .proRes422 || effectiveCodec == .proRes422HQ) && selectedFormat == .openGate {
+            print("[CameraViewModel] ProRes hardware encoding does not support Open Gate (2016x1512) — recording in HEVC 10-bit")
+            effectiveCodec = .hevc
+        }
+
         activeEncodeWidth = selectedFormat.width
         activeEncodeHeight = selectedFormat.height
         activeFPS = selectedFPS.rawValue
         lockAutoModesForRecording()
         metalPipeline?.curveType = selectedCurve
         metalPipeline?.denoiseStrength = denoiseStrength
+        metalPipeline?.use422Encoding = (effectiveCodec == .proRes422 || effectiveCodec == .proRes422HQ)
         metalPipeline?.zoomFactor = Float(zoomFactor)
         metalPipeline?.prewarm(width: selectedFormat.width, height: selectedFormat.height, curveType: selectedCurve)
         frameBuffer.flush()
@@ -1835,9 +1869,15 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
                 targetFPS: selectedFPS.rawValue,
                 includeAudio: includeAudio,
                 curveType: selectedCurve,
-                codec: selectedCodec,
+                codec: effectiveCodec,
                 orientation: recordOrientation
             )
+            // VideoWriter may reject ProRes for this exact device/configuration and
+            // transparently fall back to HEVC. Keep Metal's output pixel format in
+            // lock-step with the writer; 4:2:2 frames fed to a 4:2:0 HEVC adaptor
+            // otherwise fail with VideoToolbox's generic "cannot encode" error.
+            let writerCodec = videoWriter.activeCodec
+            metalPipeline?.use422Encoding = (writerCodec == .proRes422 || writerCodec == .proRes422HQ)
             isRecording = true
             isRecordingUnsafe = true
             isAudioRecordingActive = true
@@ -1859,9 +1899,9 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
                     self?.updateRecordingDuration()
                 }
             }
-            statusText = "REC · \(selectedFormat.shortLabel) · \(selectedFPS.label)fps · \(selectedCodec.displayName)"
+            statusText = "REC · \(selectedFormat.shortLabel) · \(selectedFPS.label)fps · \(writerCodec.displayName)"
             let capsLine = capabilities?.diagnosticSummary ?? ""
-            print("[CameraViewModel] Recording start \(selectedFormat.width)x\(selectedFormat.height) CFR \(selectedFPS.label) \(selectedCodec.displayName) orientation=\(recordOrientation.rawValue)\n\(capsLine)")
+            print("[CameraViewModel] Recording start \(selectedFormat.width)x\(selectedFormat.height) CFR \(selectedFPS.label) \(writerCodec.displayName) orientation=\(recordOrientation.rawValue)\n\(capsLine)")
         } catch {
             errorMessage = "Record failed: \(error.localizedDescription)"
             print("[CameraViewModel] Failed to start recording: \(error)")
@@ -2274,6 +2314,16 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
         // Never enqueue GPU work while backgrounded (IOGPUMetalError 00000006)
         guard isAppActive else { return }
 
+        // Calibration samples the unprocessed Bayer buffer. The ratios are
+        // invariant to a global exposure change, but intentionally capture
+        // lens/sensor shading before WB, CCM, demosaic, and log encoding.
+        let flatField = isLensCalibratingUnsafe ? Self.sampleFlatField(from: frameData) : []
+        if !flatField.isEmpty {
+            Task { @MainActor [weak self] in
+                self?.consumeLensCalibration(flatField)
+            }
+        }
+
         frameBuffer.enqueue(frameData)
         scheduleProcess()
     }
@@ -2369,19 +2419,16 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
         pipeline.noiseReadCoeff = noiseCoeffs.read
 
         if let cm = frameData.colorMatrix { latestColorMatrix = cm }
-        if let sm = frameData.sgamutMatrix { latestSGamutMatrix = sm }
+        if let appleWide = frameData.appleWideGamutMatrix { latestAppleWideGamutMatrix = appleWide }
 
         let cMatrix: simd_float3x3
         switch pipeline.curveType {
         case .linear:
             cMatrix = matrix_identity_float3x3
-            pipeline.headroomScale = 1.0
         case .appleLog2:
-            cMatrix = latestColorMatrix ?? WhiteBalanceParams.defaultSensorToBT2020
-            pipeline.headroomScale = LogCurve.defaultRMax(for: .appleLog2)
+            cMatrix = latestAppleWideGamutMatrix ?? WhiteBalanceParams.defaultSensorToAppleWideGamut
         case .sLog3Approx:
-            cMatrix = latestSGamutMatrix ?? WhiteBalanceParams.defaultSensorToSGamut3Cine
-            pipeline.headroomScale = LogCurve.defaultRMax(for: .sLog3Approx)
+            cMatrix = latestColorMatrix ?? WhiteBalanceParams.defaultSensorToBT2020
         }
 
         if pipeline.isAutoWBEnabled, let gains = frameData.whiteBalanceGains {
@@ -2633,6 +2680,94 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
             radial4B: r4,
             azimuthR: 0, azimuthG: 0, azimuthB: 0
         )
+    }
+
+    // MARK: - Lens Flat-Field Calibration
+
+    func beginLensCalibration() {
+        guard !isRecording, isCameraReady, selectedLens != nil else { return }
+        lensCalibrationSamples.removeAll(keepingCapacity: true)
+        lensCalibrationProgress = 0
+        isLensCalibrating = true
+        isLensCalibratingUnsafe = true
+        showToast("Aim at an evenly lit matte wall · hold still · collecting 24 RAW frames")
+    }
+
+    func resetLensCalibration() {
+        guard let id = captureController.currentLensUniqueID ?? selectedLens?.uniqueID else { return }
+        UserDefaults.standard.removeObject(forKey: lensCalibrationDefaultsPrefix + id)
+        lscOverride = nil
+        hasLensCalibration = false
+        showToast("Lens shading calibration reset")
+    }
+
+    private func loadLensCalibrationForCurrentLens() {
+        guard let id = captureController.currentLensUniqueID ?? selectedLens?.uniqueID,
+              let data = UserDefaults.standard.data(forKey: lensCalibrationDefaultsPrefix + id),
+              let profile = try? JSONDecoder().decode(LSCCoefficients.self, from: data) else {
+            lscOverride = nil
+            hasLensCalibration = false
+            return
+        }
+        lscOverride = profile
+        hasLensCalibration = true
+    }
+
+    private func consumeLensCalibration(_ flatField: [(radiusSquared: Float, value: Float)]) {
+        guard isLensCalibrating else { return }
+        let center = flatField.filter { $0.radiusSquared < 0.025 }.map(\.value).sorted()
+        guard let reference = center.dropFirst(center.count / 2).first, reference > 0 else { return }
+        for sample in flatField where sample.radiusSquared > 0.08 && sample.value > 0.02 && sample.value < 0.90 {
+            let ratio = reference / sample.value
+            // The shader applies (1 + a*r²)². Reject non-vignette samples and
+            // implausible values caused by an uneven wall or a specular patch.
+            let a = (sqrt(ratio) - 1.0) / sample.radiusSquared
+            if a > -0.02 && a < 0.60 { lensCalibrationSamples.append((sample.radiusSquared, ratio)) }
+        }
+        lensCalibrationProgress += 1
+        guard lensCalibrationProgress >= lensCalibrationFrameTarget else { return }
+
+        isLensCalibrating = false
+        isLensCalibratingUnsafe = false
+        let estimates = lensCalibrationSamples.map { (sqrt($0.ratio) - 1.0) / $0.radiusSquared }.sorted()
+        guard estimates.count >= 80 else {
+            showToast("Calibration failed · use a brighter, evenly lit matte surface")
+            return
+        }
+        let alpha = min(0.45, max(0, estimates[estimates.count / 2]))
+        let profile = LSCCoefficients(radialR: alpha, radialG: alpha, radialB: alpha)
+        guard let id = captureController.currentLensUniqueID ?? selectedLens?.uniqueID,
+              let data = try? JSONEncoder().encode(profile) else { return }
+        UserDefaults.standard.set(data, forKey: lensCalibrationDefaultsPrefix + id)
+        lscOverride = profile
+        hasLensCalibration = true
+        showToast(String(format: "Lens shading calibrated · edge gain %.2f×", pow(1 + alpha, 2)))
+    }
+
+    nonisolated private static func sampleFlatField(from frame: RawFrameData) -> [(radiusSquared: Float, value: Float)] {
+        let pb = frame.pixelBuffer
+        guard CVPixelBufferGetPlaneCount(pb) == 0 else { return [] }
+        CVPixelBufferLockBaseAddress(pb, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(pb, .readOnly) }
+        guard let base = CVPixelBufferGetBaseAddress(pb) else { return [] }
+        let width = CVPixelBufferGetWidth(pb), height = CVPixelBufferGetHeight(pb)
+        let bytesPerRow = CVPixelBufferGetBytesPerRow(pb)
+        guard width > 32, height > 32, bytesPerRow >= width * 2 else { return [] }
+        var result: [(Float, Float)] = []
+        for gy in 0..<7 { for gx in 0..<7 {
+            let nx = Float(gx) / 6.0, ny = Float(gy) / 6.0
+            let x = min(width - 9, max(8, Int(nx * Float(width - 1))))
+            let y = min(height - 9, max(8, Int(ny * Float(height - 1))))
+            var sum: UInt64 = 0
+            for py in -4...3 { for px in -4...3 {
+                let row = base.advanced(by: (y + py) * bytesPerRow).assumingMemoryBound(to: UInt16.self)
+                sum += UInt64(UInt16(littleEndian: row[x + px]))
+            }}
+            let value = Float(sum) / (64.0 * 65535.0)
+            let dx = nx - 0.5, dy = ny - 0.5
+            result.append((min(1, 2 * (dx * dx + dy * dy)), value))
+        }}
+        return result
     }
 
     private func syncLiveAutoValues(from frameData: RawFrameData) {

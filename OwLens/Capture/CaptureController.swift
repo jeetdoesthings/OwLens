@@ -29,6 +29,7 @@ struct RawFrameData {
     let exposureDurationSeconds: Double
     let colorMatrix: simd_float3x3?
     let sgamutMatrix: simd_float3x3?
+    let appleWideGamutMatrix: simd_float3x3?
     let timestamp: CMTime
     var sequenceID: UInt64 = 0
     let recordingSessionID: UInt64
@@ -110,20 +111,16 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
     private var cachedTint: Float?
     private var cachedFM1: [Float]?
     private var cachedFM2: [Float]?
-    private var cachedColorMatrices: (bt2020: simd_float3x3?, sgamut: simd_float3x3?)?
+    private var cachedColorMatrices: (bt2020: simd_float3x3?, sgamut: simd_float3x3?, appleWideGamut: simd_float3x3?)?
     private var lastComputedMatrixKelvin: Float?
-    private var cachedLSC: SIMD4<Float> = SIMD4<Float>(0.38, 0.0, 0.0, 0.0)
+    // Do not apply guessed vignette correction. Lens shading needs a measured,
+    // per-lens calibration map; a generic radial boost brightens/noisifies the
+    // corners and is less accurate than leaving the native falloff intact.
+    private var cachedLSC: SIMD4<Float> = .zero
     private var lastWBGains: AVCaptureDevice.WhiteBalanceGains?
 
     private func updateCachedLSC(for camera: AVCaptureDevice) {
-        switch camera.deviceType {
-        case .builtInUltraWideCamera:
-            cachedLSC = SIMD4<Float>(0.48, 0.0, 0.0, 0.0)
-        case .builtInTelephotoCamera:
-            cachedLSC = SIMD4<Float>(0.20, 0.0, 0.0, 0.0)
-        default:
-            cachedLSC = SIMD4<Float>(0.38, 0.0, 0.0, 0.0)
-        }
+        cachedLSC = .zero
     }
 
     // MARK: - Session Configuration
@@ -1551,6 +1548,7 @@ extension CaptureController: AVCapturePhotoCaptureDelegate {
             exposureDurationSeconds: device?.exposureDuration.seconds ?? 0,
             colorMatrix: colorMatrices.bt2020 ?? cachedColorMatrices?.bt2020,
             sgamutMatrix: colorMatrices.sgamut ?? cachedColorMatrices?.sgamut,
+            appleWideGamutMatrix: colorMatrices.appleWideGamut ?? cachedColorMatrices?.appleWideGamut,
             timestamp: photo.timestamp,
             recordingSessionID: shotSessionID,
             kelvin: smoothedKelvin,
@@ -1560,7 +1558,7 @@ extension CaptureController: AVCapturePhotoCaptureDelegate {
         onRawFrameData?(frameData)
     }
 
-    private func extractColorMatrices(from photo: AVCapturePhoto, kelvin: Float? = nil) -> (bt2020: simd_float3x3?, sgamut: simd_float3x3?) {
+    private func extractColorMatrices(from photo: AVCapturePhoto, kelvin: Float? = nil) -> (bt2020: simd_float3x3?, sgamut: simd_float3x3?, appleWideGamut: simd_float3x3?) {
         if let k = kelvin, let lastK = lastComputedMatrixKelvin, abs(k - lastK) < 25, let cached = cachedColorMatrices {
             return cached
         }
@@ -1579,6 +1577,14 @@ extension CaptureController: AVCapturePhotoCaptureDelegate {
             SIMD3<Float>(-0.174344,  0.197160,  1.157947)  // column 2
         )
 
+        // CIE XYZ D50 -> Apple Wide Gamut (D65), derived from the Apple Log 2
+        // profile primaries and the same Bradford adaptation used above.
+        let mD50toAppleWideGamut = simd_float3x3(
+            SIMD3<Float>( 1.661564, -0.582667,  0.026745),
+            SIMD3<Float>(-0.516901,  1.410576,  0.014736),
+            SIMD3<Float>(-0.103427,  0.183355,  1.162852)
+        )
+
         // Standard CIE XYZ D65 to ITU-R BT.2020 matrix (stored column-major):
         let mXYZto2020 = simd_float3x3(
             SIMD3<Float>( 1.716651, -0.666684,  0.017640),
@@ -1591,6 +1597,13 @@ extension CaptureController: AVCapturePhotoCaptureDelegate {
             SIMD3<Float>( 1.846779, -0.444153,  0.040855),
             SIMD3<Float>(-0.525986,  1.259443,  0.015641),
             SIMD3<Float>(-0.210545,  0.149400,  0.868207)
+        )
+
+        // CIE XYZ D65 -> Apple Wide Gamut, from Apple Wide Gamut primaries.
+        let mXYZtoAppleWideGamut = simd_float3x3(
+            SIMD3<Float>( 1.726844, -0.570496,  0.017715),
+            SIMD3<Float>(-0.475386,  1.386473,  0.032715),
+            SIMD3<Float>(-0.152336,  0.143022,  0.872724)
         )
 
         // Priority 1: DNG ForwardMatrix (Dual-Illuminant Interpolation between Standard Light A ~2856K and D65 ~6504K)
@@ -1640,10 +1653,14 @@ extension CaptureController: AVCapturePhotoCaptureDelegate {
                 SIMD3<Float>(fmVals[2], fmVals[5], fmVals[8])  // column 2
             )
             if abs(fmMatrix.determinant) > 1e-5 {
-                let camTo2020 = Self.normalizeMatrixRows(mD50to2020 * fmMatrix)
-                let camToSGamut = Self.normalizeMatrixRows(mD50toSGamut * fmMatrix)
+                // A DNG ForwardMatrix already maps white-balanced camera RGB to
+                // XYZ D50. Do not normalize its rows: that alters calibrated hue
+                // and exposure relationships.
+                let camTo2020 = mD50to2020 * fmMatrix
+                let camToSGamut = mD50toSGamut * fmMatrix
+                let camToAppleWideGamut = mD50toAppleWideGamut * fmMatrix
                 lastComputedMatrixKelvin = kelvin
-                let result = (camTo2020, camToSGamut)
+                let result = (camTo2020, camToSGamut, camToAppleWideGamut)
                 cachedColorMatrices = result
                 return result
             }
@@ -1661,7 +1678,7 @@ extension CaptureController: AVCapturePhotoCaptureDelegate {
                 SIMD3<Float>(cmVals[1], cmVals[4], cmVals[7]), // column 1
                 SIMD3<Float>(cmVals[2], cmVals[5], cmVals[8])  // column 2
             )
-            guard abs(cmMatrix.determinant) > 1e-5 else { return (nil, nil) }
+            guard abs(cmMatrix.determinant) > 1e-5 else { return (nil, nil, nil) }
 
             // Compute sensor native white balance under D65:
             let d65White = SIMD3<Float>(0.95047, 1.00000, 1.08883)
@@ -1675,15 +1692,16 @@ extension CaptureController: AVCapturePhotoCaptureDelegate {
             )
             let camToXYZ = cmMatrix.inverse * dInv
 
-            let camTo2020 = Self.normalizeMatrixRows(mXYZto2020 * camToXYZ)
-            let camToSGamut = Self.normalizeMatrixRows(mXYZtoSGamut * camToXYZ)
+            let camTo2020 = mXYZto2020 * camToXYZ
+            let camToSGamut = mXYZtoSGamut * camToXYZ
+            let camToAppleWideGamut = mXYZtoAppleWideGamut * camToXYZ
             lastComputedMatrixKelvin = kelvin
-            let result = (camTo2020, camToSGamut)
+            let result = (camTo2020, camToSGamut, camToAppleWideGamut)
             cachedColorMatrices = result
             return result
         }
 
-        return cachedColorMatrices ?? (nil, nil)
+        return cachedColorMatrices ?? (nil, nil, nil)
     }
 
     private static func parseMatrixFloats(_ raw: [Any]) -> [Float]? {
@@ -1700,18 +1718,6 @@ extension CaptureController: AVCapturePhotoCaptureDelegate {
         let g = gains.greenGain.isNaN ? 1.0 : max(1.0, min(maxGain, gains.greenGain))
         let b = gains.blueGain.isNaN ? 1.0 : max(1.0, min(maxGain, gains.blueGain))
         return AVCaptureDevice.WhiteBalanceGains(redGain: r, greenGain: g, blueGain: b)
-    }
-
-    private static func normalizeMatrixRows(_ m: simd_float3x3) -> simd_float3x3 {
-        let r0Sum = m[0, 0] + m[1, 0] + m[2, 0]
-        let r1Sum = m[0, 1] + m[1, 1] + m[2, 1]
-        let r2Sum = m[0, 2] + m[1, 2] + m[2, 2]
-        guard abs(r0Sum) > 1e-4, abs(r1Sum) > 1e-4, abs(r2Sum) > 1e-4 else { return m }
-        return simd_float3x3(
-            SIMD3<Float>(m[0, 0] / r0Sum, m[0, 1] / r1Sum, m[0, 2] / r2Sum),
-            SIMD3<Float>(m[1, 0] / r0Sum, m[1, 1] / r1Sum, m[1, 2] / r2Sum),
-            SIMD3<Float>(m[2, 0] / r0Sum, m[2, 1] / r1Sum, m[2, 2] / r2Sum)
-        )
     }
 
     private func extractBlackWhiteLevels(from photo: AVCapturePhoto, pixelFormat: OSType) -> (Float, Float) {

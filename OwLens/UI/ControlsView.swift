@@ -760,7 +760,7 @@ struct ControlsView: View {
                                                 .fill(isSelected ? Color.black.opacity(0.12) : Color.white.opacity(0.18))
                                         )
                                 }
-                                Text(curve == .appleLog2 ? "Native Apple Log OETF · ITU-R BT.2020 · 12 stops dynamic range" : "Sony S-Log3 OETF · S-Gamut3.Cine · Standardized Cine EI")
+                                Text(curve == .appleLog2 ? "Apple Wide Gamut · Apple Log 2 OETF · calibration required" : "S-Log3 transfer · BT.2020 container · manual CST required")
                                     .font(.appFont(.regular, size: 9))
                                     .foregroundColor(isSelected ? .black.opacity(0.60) : OwLensTheme.textSecondary)
                             }
@@ -1027,6 +1027,9 @@ struct ControlsView: View {
                         let isSelected = viewModel.selectedFormat == fmt
                         Button {
                             Haptics.selection()
+                            if fmt == .openGate && (viewModel.selectedCodec == .proRes422 || viewModel.selectedCodec == .proRes422HQ) {
+                                viewModel.selectedCodec = .hevc
+                            }
                             viewModel.selectedFormat = fmt
                         } label: {
                             VStack(spacing: 3) {
@@ -1053,6 +1056,7 @@ struct ControlsView: View {
                     }
                 }
             }
+
         }
     }
 
@@ -1071,6 +1075,9 @@ struct ControlsView: View {
                         let isSelected = viewModel.selectedCodec == codec
                         Button {
                             Haptics.selection()
+                            if (codec == .proRes422 || codec == .proRes422HQ) && viewModel.selectedFormat == .openGate {
+                                viewModel.selectedFormat = .hd169
+                            }
                             viewModel.selectedCodec = codec
                         } label: {
                             VStack(spacing: 2) {
@@ -1098,7 +1105,12 @@ struct ControlsView: View {
                 }
 
                 if !VideoCodecOption.isProResSupported {
-                    Text("ProRes hardware encoding requires iPhone 13 Pro or newer (A15+).")
+                    Text("ProRes is unavailable on this hardware. HEVC 10-bit is selected.")
+                        .font(.appFont(.regular, size: 9.5))
+                        .foregroundColor(OwLensTheme.textMuted)
+                        .padding(.top, 2)
+                } else if viewModel.selectedCodec != .hevc {
+                    Text("ProRes records in 1080p 16:9. Open Gate 4:3 uses HEVC 10-bit.")
                         .font(.appFont(.regular, size: 9.5))
                         .foregroundColor(OwLensTheme.textMuted)
                         .padding(.top, 2)
@@ -1219,6 +1231,37 @@ struct ControlsView: View {
                         .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
+                }
+            }
+
+            Divider().overlay(OwLensTheme.glassBorder)
+            lensCalibrationControls
+        }
+    }
+
+    private var lensCalibrationControls: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("LENS SHADING CALIBRATION")
+                .font(.appMono(.medium, size: 8)).foregroundColor(OwLensTheme.textMuted)
+            Text(viewModel.isLensCalibrating
+                 ? "Keep a uniformly lit matte wall filling the frame · \(viewModel.lensCalibrationProgress)/24"
+                 : "Fix center-bright / edge-dark falloff using a measured flat field. Lock lens, focus, ISO, shutter, and WB first.")
+                .font(.appFont(.regular, size: 9.5)).foregroundColor(OwLensTheme.textSecondary)
+                .fixedSize(horizontal: false, vertical: true)
+            HStack(spacing: 6) {
+                Button { Haptics.selection(); viewModel.beginLensCalibration() } label: {
+                    Text(viewModel.isLensCalibrating ? "COLLECTING…" : "CALIBRATE THIS LENS")
+                        .font(.appMono(.semiBold, size: 9)).foregroundColor(.black)
+                        .frame(maxWidth: .infinity).padding(.vertical, 9)
+                        .background(RoundedRectangle(cornerRadius: OwLensTheme.radiusCard).fill(OwLensTheme.glassActive))
+                }
+                .buttonStyle(.plain).disabled(viewModel.isLensCalibrating)
+                if viewModel.hasLensCalibration {
+                    Button("RESET") { viewModel.resetLensCalibration() }
+                        .font(.appMono(.medium, size: 9)).foregroundColor(OwLensTheme.textSecondary)
+                        .padding(.horizontal, 10).padding(.vertical, 9)
+                        .background(RoundedRectangle(cornerRadius: OwLensTheme.radiusCard).stroke(OwLensTheme.glassBorder))
+                        .buttonStyle(.plain)
                 }
             }
         }

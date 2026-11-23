@@ -57,20 +57,23 @@ enum VideoCodecOption: String, CaseIterable, Identifiable {
         }
     }
 
-    /// Dynamically detects if the iOS device hardware encoder supports Apple ProRes.
-    /// ProRes hardware encoding is available on A15 Bionic and later (iPhone 13 Pro+, iPhone 14 Pro+, iPhone 15/15 Pro+, iPhone 16/16 Pro+).
+    /// Detect ProRes from the actual hardware encoder, then verify the exact
+    /// 1080p writer configuration. Model-name heuristics and `canAdd` alone
+    /// have both produced false positives on some devices.
     static let isProResSupported: Bool = {
-        if #available(iOS 15.0, *) {
-            let testInput = AVAssetWriterInput(mediaType: .video, outputSettings: [
-                AVVideoCodecKey: AVVideoCodecType.proRes422,
-                AVVideoWidthKey: 1920,
-                AVVideoHeightKey: 1080
-            ])
-            if let dummyWriter = try? AVAssetWriter(outputURL: URL(fileURLWithPath: "/dev/null"), fileType: .mov) {
-                return dummyWriter.canAdd(testInput)
-            }
-        }
-        return false
+        guard #available(iOS 15.0, *) else { return false }
+        // AVAssetWriter must be given a writable file URL; "/dev/null" makes the initializer
+        // fail on iOS and silently disables ProRes for every device. Use a unique temp file.
+        let probeURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("owlens_prores_probe_\(UUID().uuidString).mov")
+        defer { try? FileManager.default.removeItem(at: probeURL) }
+        guard let writer = try? AVAssetWriter(outputURL: probeURL, fileType: .mov) else { return false }
+        let testInput = AVAssetWriterInput(mediaType: .video, outputSettings: [
+            AVVideoCodecKey: AVVideoCodecType.proRes422,
+            AVVideoWidthKey: 1920,
+            AVVideoHeightKey: 1080
+        ])
+        return writer.canAdd(testInput)
     }()
 
     static var availableCases: [VideoCodecOption] {
@@ -211,15 +214,15 @@ struct DeviceCapabilities: Sendable {
         case .a12a13:
             recFPS = .fps24
             recFormat = .openGate
-            recBitrate = .mbps80
+            recBitrate = .mbps150
         case .a14:
             recFPS = .fps24
             recFormat = .openGate
-            recBitrate = .mbps100
+            recBitrate = .mbps150
         case .a15:
             recFPS = .fps24
             recFormat = .openGate
-            recBitrate = .mbps100
+            recBitrate = .mbps150
         case .a16Plus:
             recFPS = .fps24
             recFormat = .openGate
@@ -227,7 +230,7 @@ struct DeviceCapabilities: Sendable {
         case .unknown:
             recFPS = .fps24
             recFormat = .openGate
-            recBitrate = .mbps80
+            recBitrate = .mbps150
         }
 
         let formatsDesc = bayerFormats.map { fourCCString($0) }.joined(separator: ", ")

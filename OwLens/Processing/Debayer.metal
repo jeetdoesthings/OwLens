@@ -110,39 +110,17 @@ kernel void binBayerCFA(
 }
 
 
-// Smooth filmic rational highlight shoulder mapping sensor linear to scene reflectance.
-// Preserves 100% linear calibration for midtones & diffuse whites (r <= rKnee = 0.90),
-// with exact C1 first-derivative continuity and asymptotic roll-off to rMax.
-static inline float applyHighlightShoulderMetal(float r, float rKnee, float rMax) {
-    if (rMax <= rKnee + 1e-4f) return r;
-    if (r <= rKnee) return r;
-
-    float x = r - rKnee;
-    float H = rMax - rKnee;
-    // Asymptotic rational shoulder: exact f'(rKnee) = 1.0, f(r) -> rMax as r -> inf
-    return rKnee + H * (x / (x + H));
-}
-
-static inline float3 applyHighlightShoulder3(float3 rgb, float rKnee, float rMax) {
-    float peak = max(rgb.r, max(rgb.g, rgb.b));
-    if (rMax <= rKnee + 1e-4f || peak <= rKnee) return rgb;
-
-    float peakShoulder = applyHighlightShoulderMetal(peak, rKnee, rMax);
-    float scale = peakShoulder / max(peak, 1e-6f);
-    return rgb * scale;
-}
-
-constant float kSensorToSceneGain = 1.85f;
-
-static inline float3 encodeLogCurve(float3 rgb, int curveType, float headroomScale = 1.0f) {
+// Official manufacturer log transfer functions.
+//
+// IMPORTANT: the input is scene-linear reflectance, not a gain-adjusted sensor value.
+// 18% middle gray must arrive as exactly 0.18 here.  Apple Log 2 then maps it to
+// 0.488272 (48.8% IRE) and S-Log3 maps it to 420/1023 (41.1% IRE), exactly as the
+// published white papers specify.  Do not apply a sensor-to-scene pre-gain and do
+// not add a rational highlight shoulder: Apple Log 2 already carries 12.0x scene
+// reflectance (12.0 -> 1.0), and S-Log3 already carries its own published range.
+static inline float3 encodeLogCurve(float3 rgb, int curveType) {
     if (curveType == 0) {
         return saturate(rgb);
-    }
-
-    rgb *= kSensorToSceneGain;
-
-    if (headroomScale > 1.0f) {
-        rgb = applyHighlightShoulder3(rgb, 0.90f, headroomScale);
     }
 
     if (curveType == 3) {
@@ -205,7 +183,7 @@ struct FusedParams {
     float3 wbGains;
     float4 lscCoefficients;
     float greenBalance;
-    float headroomScale;  // Scene reflectance multiplier: sensor [0,1] → R [0, headroomScale]
+    float headroomScale;  // Retained for layout compatibility; curves are now anchored to official OETFs.
 };
 
 struct LSCParams {
@@ -262,9 +240,10 @@ static inline BayerNeighborhood fetchBayerNeighborhood(texture2d<float, access::
 
 
 // ──────────────────────────────────────────────────────────────────────
-// FUSED: demosaic + LSC + WB + CCM + Log OETF in ONE kernel.
+// FUSED: demosaic + LSC + WB + CCM in ONE kernel, outputting scene-linear RGB.
 // Used for all recording and live viewfinder preview paths.
 // Eliminates intermediate passes and ~196 MB/frame of memory traffic.
+// Log encoding happens later, after crop/scale and scene-linear sharpening.
 // ──────────────────────────────────────────────────────────────────────
 kernel void debayerFusedLog(
     texture2d<float, access::read>  rawTexture [[texture(0)]],
@@ -372,48 +351,43 @@ kernel void debayerFusedLog(
         float cos2Theta = (dx * dx - dy * dy) / max(dx * dx + dy * dy, 1e-6f);
         gain += float3(lsc.azimuthR, lsc.azimuthG, lsc.azimuthB) * cos2Theta;
     }
-    float3 rgb = min(float3(r, g, b) * gain, float3(8.0f));
+    // Cap at 16x reflectance so Apple Log 2's full 12x highlight range survives the CCM;
+    // the old 8x clamp silently clipped the top ~0.6 stop of speculars.
+    float3 rgb = min(float3(r, g, b) * gain, float3(16.0f));
 
     // ── Color Correction Matrix (Sensor Native → Target Gamut e.g. BT.2020) ──
     rgb = colorMatrix * rgb;
     rgb = max(rgb, float3(0.0));
 
-    // Measure sensor saturation and clipping flag
-    bool isClipped = (rawPeak >= 0.985f);
-    float alpha = isClipped ? 0.0f : 1.0f;
-
-    // Organic cinema highlight desaturation:
-    // Under typical lighting, the Green sensor channel clips before Red or Blue, while the Blue WB
-    // multiplier (up to 4.5x) and LSC gains boost the unclipped Blue channel far above Green.
-    // Post-CCM this creates an intense electric blue/cyan color shift in specular highlights,
-    // which HEVC 4:2:0 quantizes into flashing blue macroblocks.
-    // We softly roll off saturation in specular highlights (above diffuse white maxCh > 0.85),
-    // smoothly neutralizing blown-out light sources, lamps, reflections, and windows to pure white glare.
+    // ── Highlight White-Point Neutralization (Anti-Magenta / Anti-Cyan) ──
+    // When physical sensor photosites approach saturation, Green clips
+    // before Red or Blue, while digital White Balance multipliers (up to 4.5x on Blue, 2.5x on Red)
+    // boost the unclipped photosites. Post-CCM, this imbalance produces severe magenta or cyan
+    // tinting in specular highlights.
+    // We smoothly roll off chrominance as photosites saturate, converging blown-out light
+    // sources, reflections, lamps, and sun to pure neutral white (R = G = B).
     float maxCh = max(rgb.r, max(rgb.g, rgb.b));
-    if (maxCh > 0.85f || rawPeak >= 0.90f) {
-        float uRaw = clamp((rawPeak - 0.90f) * 12.5f, 0.0f, 1.0f);
-        float uCh = smoothstep(0.85f, 2.2f, maxCh);
-        float desat = max(uRaw * uRaw, uCh);
+    if (rawPeak >= 0.82f || maxCh > 0.90f) {
+        // Start before the green photosites fully clip. The previous 0.88
+        // threshold and squared blend left a visible magenta fringe in the
+        // last fraction of a stop before saturation.
+        float uRaw = smoothstep(0.82f, 0.985f, rawPeak);
+        float uCh = smoothstep(0.90f, 2.25f, maxCh);
+        float desat = max(uRaw, uCh);
         float lum = dot(rgb, float3(0.2627f, 0.6780f, 0.0593f));
         float targetVal = max(lum, maxCh);
         rgb = mix(rgb, float3(targetVal), desat);
     }
 
-    // Cinema shadow desaturation roll-off:
-    // Sensor read noise and high Blue WB multiplier create strong chromatic noise in deep blacks.
-    // Smoothly desaturate only in the extreme sub-visual noise floor (< -4.8 stops below middle gray),
-    // eliminating sensor thermal noise in pitch blacks while keeping 100% of true colors, navy blues,
-    // and shadows completely untouched and color-accurate.
-    float linLuma = dot(rgb, float3(0.2627f, 0.6780f, 0.0593f));
-    if (linLuma < 0.0035f) {
-        float shadowSat = smoothstep(0.0006f, 0.0035f, linLuma);
-        rgb = mix(float3(linLuma), rgb, shadowSat);
-    }
+    // Sensor-saturation flag used by optional zebra overlay (1.0 = normal, 0.0 = clipped)
+    bool isClipped = (rawPeak >= 0.985f);
+    float alpha = isClipped ? 0.0f : 1.0f;
 
-    // ── Direct Log OETF Encoding ──
-    float3 logRGB = encodeLogCurve(rgb, params.curveType, params.headroomScale);
-
-    outTexture.write(float4(logRGB, alpha), gid);
+    // ── Output scene-linear RGB ──
+    // Log encoding is performed after crop/scale in the dedicated encodeLogCurve kernel.
+    // Keeping this pass linear means the OETF always receives true scene reflectance
+    // (18% gray = 0.18), with no artificial tinting or sharpening.
+    outTexture.write(float4(rgb, alpha), gid);
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -521,30 +495,23 @@ kernel void convertRgbTo420YpCbCr10(
 
     // Log shadow chroma noise gating:
     // When log encoding is active, residual sensor read noise around the log black pedestal
-    // causes high-frequency temporal chroma fluctuations. In HEVC 4:2:0 inter-frame compression,
-    // this leads to coarse 16x16 / 32x32 quantized chroma macroblocks that flash/pulse between frames.
-    // Gating chroma near the log pedestal guarantees dead-neutral Cb=512, Cr=512 in blacks,
-    // completely eliminating blocky blue flashing while preserving clean encoder bit allocation.
+    // causes high-frequency temporal chroma fluctuations. Gate only the first few percent above
+    // the pedestal so true colours (including deep blues and warm highlights) are never touched.
     float logPedestal = 0.0f;
     if (curveType == 3) {
         logPedestal = 0.1505f; // Apple Log
     } else if (curveType == 2) {
         logPedestal = 0.0929f; // S-Log3
     }
-    if (logPedestal > 0.0f && avgY < (logPedestal + 0.012f)) {
-        float chromaGate = smoothstep(logPedestal + 0.001f, logPedestal + 0.012f, avgY);
+    if (logPedestal > 0.0f && avgY < (logPedestal + 0.006f)) {
+        float chromaGate = smoothstep(logPedestal + 0.0005f, logPedestal + 0.006f, avgY);
         cb *= chromaGate;
         cr *= chromaGate;
     }
 
-    // Specular highlight chroma roll-off:
-    // Suppress residual chroma fluctuations in specular highlights (> 78% IRE in log space)
-    // to prevent HEVC 4:2:0 inter-frame quantization from generating flashing blue macroblocks.
-    if (avgY > 0.78f) {
-        float highChromaAtten = 1.0f - smoothstep(0.78f, 0.94f, avgY) * 0.92f;
-        cb *= highChromaAtten;
-        cr *= highChromaAtten;
-    }
+    // NOTE: the former >78% IRE chroma attenuation has been removed. It was a workaround for
+    // HEVC 4:2:0 inter-frame quantization and visibly desaturated warm highlights. ProRes 422 HQ
+    // (and the corrected 10-bit HEVC path) preserve the full highlight chroma instead.
 
     float normCb = metal::fma(clamp(cb, -0.5f, 0.5f), kScaleC, kOffsetC);
     float normCr = metal::fma(clamp(cr, -0.5f, 0.5f), kScaleC, kOffsetC);
@@ -553,77 +520,100 @@ kernel void convertRgbTo420YpCbCr10(
 }
 
 // ──────────────────────────────────────────────────────────────────────
-// ADAPTIVE UNSHARP MASK: enhances fine edge details without boosting noise.
+// 10-BIT YCBCR 4:2:2 ENCODING: rgba16Float -> 422YpCbCr10BiPlanar
+// Required for Apple ProRes 422 / 422 HQ (10-bit intra-frame, 4:2:2).
+//   Plane 0 (Y):  .r16Unorm, width x height
+//   Plane 1 (UV): .rg16Unorm, (width/2) x height
+// Dispatched over (width/2) x height grid: one thread writes two luma samples
+// and one horizontally co-sited chroma pair.  Vertical chroma is full resolution,
+// so no 4:2:0 macroblock chroma quantisation can occur.
 // ──────────────────────────────────────────────────────────────────────
-kernel void unsharpMaskAdaptive(
-    texture2d<float, access::read>  inTexture  [[texture(0)]],
-    texture2d<float, access::write> outTexture [[texture(1)]],
-    constant float &strength                   [[buffer(0)]],
-    constant int   &curveType                  [[buffer(1)]],
+kernel void convertRgbTo422YpCbCr10(
+    texture2d<float, access::read>  srcRGB    [[texture(0)]],
+    texture2d<float, access::write> dstY      [[texture(1)]],
+    texture2d<float, access::write> dstUV     [[texture(2)]],
+    constant int                   &curveType [[buffer(0)]],
     uint2 gid [[thread_position_in_grid]])
 {
-    if (gid.x >= outTexture.get_width() || gid.y >= outTexture.get_height()) return;
+    uint uvW = dstUV.get_width();
+    uint uvH = dstUV.get_height();
+    if (gid.x >= uvW || gid.y >= uvH) return;
 
-    float4 center = inTexture.read(gid);
-    if (strength <= 0.001f) {
-        outTexture.write(center, gid);
-        return;
+    uint srcW = srcRGB.get_width();
+    uint srcH = srcRGB.get_height();
+    if (srcW == 0 || srcH == 0) return;
+
+    uint y = min(gid.y, srcH - 1u);
+    uint x0 = min(gid.x * 2u, srcW - 1u);
+    uint x1 = min(x0 + 1u, srcW - 1u);
+
+    float3 p0 = srcRGB.read(uint2(x0, y)).rgb;
+    float3 p1 = srcRGB.read(uint2(x1, y)).rgb;
+
+    // BT.2020 for log masters; Rec.709 for the linear debug path (matching its metadata).
+    bool is709 = (curveType == 0);
+    float3 wY = is709 ? float3(0.2126f, 0.7152f, 0.0722f) : float3(0.2627f, 0.6780f, 0.0593f);
+    float y0 = dot(p0, wY);
+    float y1 = dot(p1, wY);
+
+    constexpr float kScaleY = (876.0f * 64.0f) / 65535.0f;
+    constexpr float kOffsetY = (64.0f * 64.0f) / 65535.0f;
+    constexpr float kScaleC = (896.0f * 64.0f) / 65535.0f;
+    constexpr float kOffsetC = (512.0f * 64.0f) / 65535.0f;
+    float kInvChromaB = is709 ? (1.0f / 1.8556f) : (1.0f / 1.8814f);
+    float kInvChromaR = is709 ? (1.0f / 1.5748f) : (1.0f / 1.4746f);
+
+    uint dstYW = dstY.get_width();
+    uint dstYH = dstY.get_height();
+    if (x0 < dstYW && y < dstYH) {
+        dstY.write(float4(metal::fma(saturate(y0), kScaleY, kOffsetY), 0.0f, 0.0f, 1.0f), uint2(x0, y));
+    }
+    if (x1 < dstYW && y < dstYH && x1 != x0) {
+        dstY.write(float4(metal::fma(saturate(y1), kScaleY, kOffsetY), 0.0f, 0.0f, 1.0f), uint2(x1, y));
     }
 
-    int x = int(gid.x);
-    int y = int(gid.y);
-    int w = inTexture.get_width();
-    int h = inTexture.get_height();
+    // Horizontally co-sited chroma: average the two luma columns covered by this sample.
+    float3 avgRGB = 0.5f * (p0 + p1);
+    float avgY = 0.5f * (y0 + y1);
+    float cb = (avgRGB.b - avgY) * kInvChromaB;
+    float cr = (avgRGB.r - avgY) * kInvChromaR;
 
-    int ym1 = max(0, y - 1);
-    int yp1 = min(h - 1, y + 1);
-    int xm1 = max(0, x - 1);
-    int xp1 = min(w - 1, x + 1);
-
-    // 3x3 Gaussian blur approximation on Luma
-    constexpr float3 kLumaCoeffs = float3(0.2627f, 0.6780f, 0.0593f);
-    float centerLuma = dot(center.rgb, kLumaCoeffs);
-
-    float blurLuma = (
-        dot(inTexture.read(uint2(xm1, ym1)).rgb, kLumaCoeffs) * 1.0f +
-        dot(inTexture.read(uint2(x,   ym1)).rgb, kLumaCoeffs) * 2.0f +
-        dot(inTexture.read(uint2(xp1, ym1)).rgb, kLumaCoeffs) * 1.0f +
-        dot(inTexture.read(uint2(xm1, y)).rgb,   kLumaCoeffs) * 2.0f +
-        centerLuma                                            * 4.0f +
-        dot(inTexture.read(uint2(xp1, y)).rgb,   kLumaCoeffs) * 2.0f +
-        dot(inTexture.read(uint2(xm1, yp1)).rgb, kLumaCoeffs) * 1.0f +
-        dot(inTexture.read(uint2(x,   yp1)).rgb, kLumaCoeffs) * 2.0f +
-        dot(inTexture.read(uint2(xp1, yp1)).rgb, kLumaCoeffs) * 1.0f
-    ) * (1.0f / 16.0f);
-
-    float highPassLuma = centerLuma - blurLuma;
-    float detailLuma = abs(highPassLuma);
-
-    // Adaptive coring: only sharpen true edge detail & micro-texture, rejecting sub-visual sensor noise
-    float coringThreshold = 0.0025f;
-    float coringFactor = smoothstep(0.0004f, coringThreshold, detailLuma);
-
-    // Suppress sharpening in deep noise floor below and around log pedestal
-    // (Apple Log = 0.1505, S-Log3 = 0.0929, Linear = 0.0).
-    // Prevents boosting sensor read noise into high-contrast edge artifacts,
-    // while delivering crisp cinema sharpness to real details, midtones, and highlights.
-    float pedestal = 0.0f;
+    // Minimal shadow gate only; ProRes is intra-frame so highlight chroma needs no attenuation.
+    float logPedestal = 0.0f;
     if (curveType == 3) {
-        pedestal = 0.1505f;
+        logPedestal = 0.1505f;
     } else if (curveType == 2) {
-        pedestal = 0.0929f;
+        logPedestal = 0.0929f;
     }
-    float shadowMask = smoothstep(pedestal + 0.03f, pedestal + 0.12f, centerLuma);
+    if (logPedestal > 0.0f && avgY < (logPedestal + 0.006f)) {
+        float chromaGate = smoothstep(logPedestal + 0.0005f, logPedestal + 0.006f, avgY);
+        cb *= chromaGate;
+        cr *= chromaGate;
+    }
 
-    // Suppress sharpening on blown-out specular highlights:
-    // Prevents unsharp mask from creating harsh ringing halos or amplifying highlight chromatic fringes.
-    float highlightMask = 1.0f - smoothstep(0.80f, 0.94f, centerLuma);
-    float edgeMask = shadowMask * highlightMask;
+    float normCb = metal::fma(clamp(cb, -0.5f, 0.5f), kScaleC, kOffsetC);
+    float normCr = metal::fma(clamp(cr, -0.5f, 0.5f), kScaleC, kOffsetC);
+    dstUV.write(float4(normCb, normCr, 0.0f, 1.0f), gid);
+}
 
-    float3 sharpened = center.rgb + float3(highPassLuma * (strength * coringFactor * edgeMask));
-    sharpened = max(sharpened, float3(0.0f));
+// ──────────────────────────────────────────────────────────────────────
+// LOG OETF ONLY
+//
+// No sharpening, unsharp masking, local contrast, or artificial colour is
+// applied. The scene-linear RGB from the debayer/scale passes is encoded
+// directly with the official Apple Log 2 / S-Log3 OETF.
+// ──────────────────────────────────────────────────────────────────────
+kernel void applyLogOETF(
+    texture2d<float, access::read>  inLinear   [[texture(0)]],
+    texture2d<float, access::write> outLog     [[texture(1)]],
+    constant int   &curveType                  [[buffer(0)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    if (gid.x >= outLog.get_width() || gid.y >= outLog.get_height()) return;
 
-    outTexture.write(float4(sharpened, center.a), gid);
+    float4 center = inLinear.read(gid);
+    float3 logRGB = encodeLogCurve(center.rgb, curveType);
+    outLog.write(float4(logRGB, center.a), gid);
 }
 
 
@@ -661,81 +651,77 @@ fragment float4 displayFragment(
     constexpr sampler s(coord::normalized, address::clamp_to_edge, filter::linear);
     float4 color = tex.sample(s, uv);
     
-    float isClipped = step(color.a, 0.5);
+    float isClipped = (color.a < 0.5f) ? 1.0f : 0.0f;
     
     float3 finalColor = color.rgb;
 
-    // ── Viewfinder Rec.709 Display LUT ──
-    // Decodes log-encoded texture back to scene-linear according to active curve,
-    // applies color gamut mapping (BT.2020 or S-Gamut3.Cine -> BT.709),
-    // filmic tone mapping, and sRGB gamma for natural on-screen monitoring.
-    // The recorded file is NOT affected — this is display-only.
+    // ── Viewfinder Rec.709 Display Transform ──
+    // This is deliberately a color transform, not a contrast-only display LUT:
+    // log code -> linear BT.2020 -> linear BT.709 -> Rec.709 OETF. It is exact
+    // for values that fit SDR. Values outside the Rec.709 display gamut/range are
+    // clipped here; an aesthetic highlight roll-off belongs in a separate monitor
+    // LUT and must never be presented as an accurate Rec.709 conversion.
+    // The recording texture is never modified.
     if (uniforms.showDisplayLUT > 0) {
-        float3 lin;
-        float3 rgb709;
-
+        float3 linear;
         if (uniforms.curveType == 2) {
-            // Inverse Sony S-Log3 decode (code value -> scene-linear reflectance)
-            // fast exp2: 10^x = 2^(x * log2(10)), log2(10) ~ 3.32192809489f
+            // Inverse S-Log3 OETF. This app stores that transfer curve in a
+            // BT.2020 container, not Sony S-Gamut3.Cine.
             constexpr float log2_10 = 3.32192809489f;
-            for (int i = 0; i < 3; i++) {
+            for (int i = 0; i < 3; ++i) {
                 float p = finalColor[i];
-                if (p >= 171.2102946929f / 1023.0f) {
-                    float a = metal::exp2(((p * 1023.0f - 420.0f) / 261.5f) * log2_10);
-                    lin[i] = a * (0.18f + 0.01f) - 0.01f;
-                } else {
-                    lin[i] = (p * 1023.0f - 95.0f) * 0.01125000f / (171.2102946929f - 95.0f);
-                }
+                linear[i] = p >= (171.2102946929f / 1023.0f)
+                    ? metal::exp2(((p * 1023.0f - 420.0f) / 261.5f) * log2_10) * 0.19f - 0.01f
+                    : (p * 1023.0f - 95.0f) * 0.01125f / (171.2102946929f - 95.0f);
             }
-            lin = max(lin, float3(0.0));
-
-            // Sony S-Gamut3.Cine -> BT.709 color gamut mapping (row sums = 1.0)
-            const float3x3 mSGamutto709 = float3x3(
-                float3( 1.6762f, -0.1839f, -0.0458f),
-                float3(-0.4827f,  1.2670f, -0.1751f),
-                float3(-0.1935f, -0.0831f,  1.2208f)
-            );
-            rgb709 = mSGamutto709 * lin;
-        } else {
-            // Inverse Apple Log 2 decode (log code value -> scene-linear reflectance)
+        } else if (uniforms.curveType == 3) {
+            // Inverse Apple Log 2 OETF.
             constexpr float r0 = -0.05641088f;
-            constexpr float rt = 0.01f;
-            constexpr float c_al = 47.28711236f;
+            constexpr float c = 47.28711236f;
             constexpr float beta = 0.00964052f;
-            constexpr float inv_gam = 1.0f / 0.08550479f;
-            constexpr float del = 0.69336945f;
-            constexpr float pt = c_al * (rt - r0) * (rt - r0);
-
-            for (int i = 0; i < 3; i++) {
+            constexpr float invGamma = 1.0f / 0.08550479f;
+            constexpr float delta = 0.69336945f;
+            constexpr float breakpoint = c * (0.01f - r0) * (0.01f - r0);
+            for (int i = 0; i < 3; ++i) {
                 float p = finalColor[i];
-                if (p < 0.0f) {
-                    lin[i] = r0;
-                } else if (p < pt) {
-                    lin[i] = sqrt(p / c_al) + r0;
-                } else {
-                    lin[i] = metal::exp2((p - del) * inv_gam) - beta;
-                }
+                linear[i] = p < breakpoint
+                    ? metal::sqrt(max(p, 0.0f) / c) + r0
+                    : metal::exp2((p - delta) * invGamma) - beta;
             }
-            lin = max(lin, float3(0.0));
-
-            // BT.2020 -> BT.709 color gamut mapping (standard ITU matrix)
-            const float3x3 m2020to709 = float3x3(
-                float3( 1.6605f, -0.1246f, -0.0182f),
-                float3(-0.5876f,  1.1329f, -0.1006f),
-                float3(-0.0728f, -0.0083f,  1.1187f)
-            );
-            rgb709 = m2020to709 * lin;
+        } else {
+            linear = finalColor;
         }
-        rgb709 = max(rgb709, float3(0.0));
+        linear = max(linear, float3(0.0f));
 
-        // Calibrated cinema display tone curve (Hill/ACES fitted filmic response):
-        // Maps 18% middle gray (0.18) -> ~41% display IRE, 90% diffuse white (0.90) -> ~88% display IRE,
-        // with smooth highlight shoulder rolling off specular highlights to 100% display IRE.
-        float3 a = rgb709 * (rgb709 + 0.0245786f) - 0.000090537f;
-        float3 b = rgb709 * (0.983729f * rgb709 + 0.4329510f) + 0.238081f;
-        float3 mapped = saturate(a / max(b, 1e-4f));
-        constexpr float inv_gamma = 1.0f / 2.2f;
-        finalColor = metal::pow(mapped, float3(inv_gamma));
+        // Linear BT.2020 (D65) -> linear BT.709 (D65), column-major.
+        const float3x3 bt2020To709 = float3x3(
+            float3( 1.660491f, -0.124550f, -0.018151f),
+            float3(-0.587641f,  1.132900f, -0.100579f),
+            float3(-0.072850f, -0.008349f,  1.118730f)
+        );
+        // Apple Log 2 uses Apple Wide Gamut, not BT.2020. This is the
+        // Apple Wide Gamut (D65) -> BT.709 matrix derived from its published
+        // RGB-to-XYZ primaries.
+        const float3x3 appleWideGamutTo709 = float3x3(
+            float3( 1.707280f, -0.125011f, -0.043624f),
+            float3(-0.519020f,  1.314662f, -0.191214f),
+            float3(-0.188261f, -0.189652f,  1.234839f)
+        );
+        float3 rgb709;
+        if (uniforms.curveType == 3) {
+            rgb709 = appleWideGamutTo709 * linear;
+        } else if (uniforms.curveType == 0) {
+            rgb709 = linear;
+        } else {
+            rgb709 = bt2020To709 * linear;
+        }
+        rgb709 = saturate(rgb709);
+
+        // ITU-R BT.709 OETF (not the similar-but-different 2.2 display gamma).
+        for (int i = 0; i < 3; ++i) {
+            float v = rgb709[i];
+            finalColor[i] = v < 0.018f ? 4.5f * v : 1.099f * metal::pow(v, 0.45f) - 0.099f;
+        }
     }
 
     // ── Cinema Diagonal Zebra Stripes for Highlight Clipping ──
@@ -809,10 +795,13 @@ fragment float4 displayFragment(
 
 
 // ──────────────────────────────────────────────────────────────────────
-// HARDWARE BILINEAR CROP AND RESAMPLE
-// Single-pass crop and hardware-filtered resample directly into destination.
-// Eliminates intermediate crop blit copies (~146 MB/frame bandwidth) and
-// replaces multi-tap sinc convolution with GPU texture unit filtering (TMUs).
+// AREA-INTEGRATING ANTI-ALIASED CROP AND RESAMPLE
+//
+// Clean 4-tap footprint integration using hardware bilinear filtering.
+// Eliminates:
+//   1. Negative-lobe ringing & moiré patterns (the "dotted overlay")
+//   2. Optical axis phase interference (the "colorless shape in centre")
+//   3. False color fringing and haloing on high-contrast edges
 // ──────────────────────────────────────────────────────────────────────
 struct CropParams {
     float scaleX;
@@ -822,7 +811,7 @@ struct CropParams {
     int   flip180;
 };
 
-kernel void cropAndResampleBilinear(
+kernel void cropAndResampleCatmullRom(
     texture2d<float, access::sample> src [[texture(0)]],
     texture2d<float, access::write>  dst [[texture(1)]],
     constant CropParams &crop            [[buffer(0)]],
@@ -838,7 +827,26 @@ kernel void cropAndResampleBilinear(
     float srcX = metal::fma(effectiveX, crop.scaleX, crop.startX);
     float srcY = metal::fma(effectiveY, crop.scaleY, crop.startY);
 
-    dst.write(src.sample(s, float2(srcX, srcY)), gid);
+    float4 result;
+    if (crop.scaleX > 1.05f || crop.scaleY > 1.05f) {
+        // Anti-aliased area integration over 4 quadrants with positive weights (+0.25 each):
+        // Each bilinear tap averages a 2x2 texel block; 4 symmetrically spaced taps cover
+        // the entire footprint smoothly without negative lobes or checkerboard moiré.
+        float offX = 0.25f * crop.scaleX;
+        float offY = 0.25f * crop.scaleY;
+        float4 s00 = src.sample(s, float2(srcX - offX, srcY - offY));
+        float4 s10 = src.sample(s, float2(srcX + offX, srcY - offY));
+        float4 s01 = src.sample(s, float2(srcX - offX, srcY + offY));
+        float4 s11 = src.sample(s, float2(srcX + offX, srcY + offY));
+        result = 0.25f * (s00 + s10 + s01 + s11);
+    } else {
+        // 1:1 sensor-crop or zoom: single phase-correct hardware-filtered sample
+        result = src.sample(s, float2(srcX, srcY));
+    }
+
+    result.rgb = max(result.rgb, float3(0.0f));
+    result.a = saturate(result.a);
+    dst.write(result, gid);
 }
 
 

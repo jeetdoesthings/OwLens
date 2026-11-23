@@ -100,70 +100,44 @@ enum LogCurve {
         }
     }
 
-    /// Target maximum scene reflectance Rmax mapped to sensor highlight ceiling.
-    /// - Apple Log 2: R = 4.5 maps to filmic ~88% IRE ceiling (leaving cushion below hard clip).
-    /// - Sony S-Log3: R = 9.0 maps to standard Sony ~85% IRE ceiling (code ~870).
-    /// - Linear: R = 1.0.
+    /// Scene reflectance range carried by each curve (informational).
+    /// Apple Log 2 encodes 12.0x reflectance at 100% code value; S-Log3 carries ~9x.
+    /// These values are *not* applied as a pre-gain or shoulder — the OETFs below are
+    /// anchored directly to scene-linear reflectance (0.18 = 18% middle gray).
     static func defaultRMax(for type: LogCurveType) -> Float {
         switch type {
         case .linear: return 1.0
-        case .appleLog2: return 4.5
+        case .appleLog2: return 12.0
         case .sLog3Approx: return 9.0
         }
     }
 
-    /// Smooth filmic rational highlight shoulder mapping sensor linear to scene reflectance.
-    /// Perfectly preserves 100% linear calibration for midtones & diffuse whites (r <= rKnee = 0.90),
-    /// while smoothly rolling off specular highlights up to the container ceiling with C1 continuity.
-    static func applyHighlightShoulder(_ r: Float, rKnee: Float = 0.90, rMax: Float = 4.5) -> Float {
-        guard rMax > rKnee + 1e-4 else { return r }
-        if r <= rKnee {
-            return r
-        }
-        let x = r - rKnee
-        let h = rMax - rKnee
-        return rKnee + h * (x / (x + h))
-    }
-
-    /// Calibrated sensor-to-scene exposure multiplier before highlight shoulder and log encoding.
-    static let kSensorToSceneGain: Float = 1.85
-
-    static func applyHighlightShoulder3(_ rgb: SIMD3<Float>, rKnee: Float = 0.90, rMax: Float = 4.5) -> SIMD3<Float> {
-        let peak = max(rgb.x, max(rgb.y, rgb.z))
-        guard rMax > rKnee + 1e-4, peak > rKnee else { return rgb }
-        let peakShoulder = applyHighlightShoulder(peak, rKnee: rKnee, rMax: rMax)
-        let scale = peakShoulder / max(peak, 1e-6)
-        return rgb * scale
-    }
-
-    static func apply(_ rgb: SIMD3<Float>, type: LogCurveType, headroomScale: Float = 1.0) -> SIMD3<Float> {
-        if type == .linear {
-            return simd_clamp(rgb, SIMD3(0,0,0), SIMD3(1,1,1))
-        }
-        var input = rgb * kSensorToSceneGain
-        if headroomScale > 1.0 {
-            input = applyHighlightShoulder3(input, rKnee: 0.90, rMax: headroomScale)
-        }
+    /// Applies the official OETF directly to scene-linear reflectance.
+    ///
+    /// There is deliberately no sensor-to-scene gain and no artificial highlight shoulder:
+    /// Apple Log 2 maps 0.18 -> 0.488272 (48.8% IRE) and S-Log3 maps 0.18 -> 420/1023
+    /// (41.1% IRE), exactly as the published white papers specify.  Any extra gain shifts
+    /// middle gray and clips diffuse white, which was the root cause of the soft, washed-out
+    /// footage and cyan speculars.
+    static func apply(_ rgb: SIMD3<Float>, type: LogCurveType) -> SIMD3<Float> {
         switch type {
         case .linear:
-            return simd_clamp(input, SIMD3(0,0,0), SIMD3(1,1,1))
+            return simd_clamp(rgb, SIMD3(0,0,0), SIMD3(1,1,1))
         case .sLog3Approx:
-            return SIMD3(sLog3Approx(input.x), sLog3Approx(input.y), sLog3Approx(input.z))
+            return SIMD3(sLog3Approx(rgb.x), sLog3Approx(rgb.y), sLog3Approx(rgb.z))
         case .appleLog2:
-            return SIMD3(appleLog2Encode(input.x), appleLog2Encode(input.y), appleLog2Encode(input.z))
+            return SIMD3(appleLog2Encode(rgb.x), appleLog2Encode(rgb.y), appleLog2Encode(rgb.z))
         }
     }
 
     static func inverse(_ rgb: SIMD3<Float>, type: LogCurveType) -> SIMD3<Float> {
-        let decoded: SIMD3<Float>
         switch type {
         case .linear:
             return simd_clamp(rgb, SIMD3(0,0,0), SIMD3(1,1,1))
         case .sLog3Approx:
-            decoded = SIMD3(inverseSLog3Approx(rgb.x), inverseSLog3Approx(rgb.y), inverseSLog3Approx(rgb.z))
+            return SIMD3(inverseSLog3Approx(rgb.x), inverseSLog3Approx(rgb.y), inverseSLog3Approx(rgb.z))
         case .appleLog2:
-            decoded = SIMD3(appleLog2Decode(rgb.x), appleLog2Decode(rgb.y), appleLog2Decode(rgb.z))
+            return SIMD3(appleLog2Decode(rgb.x), appleLog2Decode(rgb.y), appleLog2Decode(rgb.z))
         }
-        return decoded / kSensorToSceneGain
     }
 }

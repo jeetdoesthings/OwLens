@@ -387,61 +387,56 @@ extension MetalPipeline {
         return passed
     }
 
-    /// Validates rational highlight shoulder linearity, continuity, monotonicity, and asymptotic ceiling.
+    /// Verifies that the log OETFs are anchored directly to scene-linear reflectance with
+    /// no sensor-to-scene pre-gain and no artificial highlight shoulder.
     static func runHighlightShoulderTest() -> Bool {
         var allPassed = true
         let eps: Float = 1e-4
 
-        // 1. Linearity: r <= 0.90 (diffuse white) must remain 100% untouched
-        let linearTestPoints: [Float] = [0.0, 0.01, 0.05, 0.18, 0.25, 0.36, 0.50, 0.75, 0.90]
-        for r in linearTestPoints {
-            let outApple = LogCurve.applyHighlightShoulder(r, rKnee: 0.90, rMax: 4.5)
-            let outSony = LogCurve.applyHighlightShoulder(r, rKnee: 0.90, rMax: 9.0)
-            if abs(outApple - r) > eps {
-                print("[HighlightShoulderTest] FAIL Apple Log shoulder altered midtone r=\(r): got \(outApple)")
-                allPassed = false
-            }
-            if abs(outSony - r) > eps {
-                print("[HighlightShoulderTest] FAIL S-Log3 shoulder altered midtone r=\(r): got \(outSony)")
-                allPassed = false
-            }
-        }
-
-        // 2. Asymptotic roll-off: extreme highlight approaches rMax smoothly without overshooting
-        let clipApple = LogCurve.applyHighlightShoulder(100.0, rKnee: 0.90, rMax: 4.5)
-        if abs(clipApple - 4.5) > 0.1 {
-            print("[HighlightShoulderTest] FAIL Apple Log shoulder asymptotic limit: expected ~4.5, got \(clipApple)")
+        // 1. Official 18% middle-gray anchors.
+        let apple18 = LogCurve.apply(SIMD3<Float>(repeating: 0.18), type: .appleLog2).x
+        if abs(apple18 - 0.488272) > eps {
+            print("[LogAnchorTest] FAIL Apple Log 2 18% gray: got \(apple18), expected 0.488272")
             allPassed = false
         }
-        let clipSony = LogCurve.applyHighlightShoulder(100.0, rKnee: 0.90, rMax: 9.0)
-        if abs(clipSony - 9.0) > 0.1 {
-            print("[HighlightShoulderTest] FAIL S-Log3 shoulder asymptotic limit: expected ~9.0, got \(clipSony)")
+        let sony18 = LogCurve.apply(SIMD3<Float>(repeating: 0.18), type: .sLog3Approx).x
+        if abs(sony18 - 420.0 / 1023.0) > eps {
+            print("[LogAnchorTest] FAIL S-Log3 18% gray: got \(sony18), expected \(420.0 / 1023.0)")
             allPassed = false
         }
 
-        // 3. Monotonicity: strictly increasing from r = 0 to 5.0
-        var prevVal: Float = -1.0
-        for i in 0...500 {
+        // 2. Diffuse white must not be pre-gained or shoulder-compressed.
+        let appleWhite = LogCurve.apply(SIMD3<Float>(repeating: 0.90), type: .appleLog2).x
+        if abs(appleWhite - LogCurve.appleLog2Encode(0.90)) > eps {
+            print("[LogAnchorTest] FAIL Apple Log 2 diffuse white was altered: \(appleWhite)")
+            allPassed = false
+        }
+
+        // 3. Strict monotonicity of the complete CPU path.
+        var prev: Float = -1.0
+        for i in 0...1000 {
             let r = Float(i) / 100.0
-            let val = LogCurve.applyHighlightShoulder(r, rKnee: 0.90, rMax: 4.5)
-            if val <= prevVal && i > 0 {
-                print("[HighlightShoulderTest] FAIL Monotonicity broken at r=\(r): val=\(val), prev=\(prevVal)")
+            let v = LogCurve.apply(SIMD3<Float>(repeating: r), type: .appleLog2).x
+            if v < prev {
+                print("[LogAnchorTest] FAIL non-monotonic at r=\(r)")
                 allPassed = false
+                break
             }
-            prevVal = val
+            prev = v
         }
 
-        // 4. C1 continuity at knee (numerical derivative before and after knee)
-        let h: Float = 0.0001
-        let dBelow = (LogCurve.applyHighlightShoulder(0.90, rKnee: 0.90, rMax: 4.5) - LogCurve.applyHighlightShoulder(0.90 - h, rKnee: 0.90, rMax: 4.5)) / h
-        let dAbove = (LogCurve.applyHighlightShoulder(0.90 + h, rKnee: 0.90, rMax: 4.5) - LogCurve.applyHighlightShoulder(0.90, rKnee: 0.90, rMax: 4.5)) / h
-        if abs(dBelow - 1.0) > 0.01 || abs(dAbove - 1.0) > 0.01 {
-            print("[HighlightShoulderTest] FAIL C1 continuity at knee: dBelow=\(dBelow), dAbove=\(dAbove)")
-            allPassed = false
+        // 4. Round-trip through the inverse must recover scene reflectance exactly (no 1.85 gain).
+        for r in [Float(0.0), 0.01, 0.18, 0.5, 0.9, 1.0] {
+            let enc = LogCurve.apply(SIMD3<Float>(repeating: r), type: .appleLog2)
+            let dec = LogCurve.inverse(enc, type: .appleLog2)
+            if abs(dec.x - r) > 0.0002 {
+                print("[LogAnchorTest] FAIL round-trip at r=\(r): got \(dec.x)")
+                allPassed = false
+            }
         }
 
         if allPassed {
-            print("[HighlightShoulderTest] PASS: Highlight shoulder linearity, continuity, monotonicity, and ceiling reach verified")
+            print("[LogAnchorTest] PASS: official Apple Log 2 / S-Log3 anchors verified, no pre-gain or shoulder")
         }
         return allPassed
     }
@@ -483,11 +478,11 @@ extension MetalPipeline {
                 allPassed = false
             }
 
-            // Test norm-preserving highlight shoulder with neutral white input
+            // Official OETF must preserve neutral balance (no per-channel gain or shoulder skew)
             let neutralIn = SIMD3<Float>(v, v, v)
-            let shoulderOut = LogCurve.applyHighlightShoulder3(neutralIn, rKnee: 0.90, rMax: 4.5)
-            if abs(shoulderOut.x - shoulderOut.y) > eps || abs(shoulderOut.y - shoulderOut.z) > eps {
-                print("[MalvarTest] FAIL: Highlight shoulder skewed neutral white \(neutralIn) -> \(shoulderOut)")
+            let encoded = LogCurve.apply(neutralIn, type: .appleLog2)
+            if abs(encoded.x - encoded.y) > eps || abs(encoded.y - encoded.z) > eps {
+                print("[MalvarTest] FAIL: OETF skewed neutral white \(neutralIn) -> \(encoded)")
                 allPassed = false
             }
         }
@@ -521,7 +516,7 @@ extension MetalPipeline {
         }
 
         if allPassed {
-            print("[MalvarTest] PASS: Malvar-He-Cutler demosaic neutrality & norm-preserving shoulder verified")
+            print("[MalvarTest] PASS: Malvar-He-Cutler demosaic neutrality & official OETF balance verified")
         }
         return allPassed
     }
