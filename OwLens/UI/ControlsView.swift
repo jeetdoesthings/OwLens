@@ -482,6 +482,15 @@ struct ControlsView: View {
             ) {
                 viewModel.toggleScopes()
             }
+
+            // Lens calibration is a capture correction, not a buried preference.
+            // Keep it visible so users can reach the guided flat-field workflow.
+            monitoringToolButton(
+                text: "CAL",
+                isActive: viewModel.isLensCalibrating || viewModel.hasLensCalibration
+            ) {
+                viewModel.togglePanel(.lens)
+            }
         }
         .padding(4)
         .glassPanel(cornerRadius: OwLensTheme.radiusLg, background: OwLensTheme.glassBaseHeavy)
