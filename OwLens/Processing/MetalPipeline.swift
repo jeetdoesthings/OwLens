@@ -84,6 +84,7 @@ struct LSCParams {
     var azimuthR: Float
     var azimuthG: Float
     var azimuthB: Float
+    var radialRolloff: Float = 0
 }
 
 struct CropParams {
@@ -138,6 +139,8 @@ final class MetalPipeline: @unchecked Sendable {
     private var pooledBinTex: [MTLTexture?] = [nil, nil, nil]
     private var pooledBinW: [Int] = [0, 0, 0]
     private var pooledBinH: [Int] = [0, 0, 0]
+    private var lastRawWidth = 0
+    private var lastRawHeight = 0
     private var pooledFusedTex: [MTLTexture?] = [nil, nil, nil]
     private var pooledFusedW: [Int] = [0, 0, 0]
     private var pooledFusedH: [Int] = [0, 0, 0]
@@ -479,12 +482,22 @@ final class MetalPipeline: @unchecked Sendable {
             format = kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
         }
         _ = getOrCreatePixelBuffer(width: width, height: height, format: format)
-        let bW = pooledBinW[0] > 0 ? pooledBinW[0] : 4032
-        let bH = pooledBinH[0] > 0 ? pooledBinH[0] : 3024
+        let rawW = lastRawWidth
+        let rawH = lastRawHeight
+        let halfW = (rawW / 2) & ~1
+        let halfH = (rawH / 2) & ~1
+        let thermal = thermalState == .serious || thermalState == .critical
+        let bin = thermal && halfW >= width && halfH >= height
         for s in 0..<poolSlotCount {
-            _ = getOrCreateBinTexture(width: bW, height: bH, slot: s)
-            _ = getOrCreateCorrectedBayerTexture(width: bW, height: bH, slot: s)
-            _ = getOrCreateFusedTexture(width: bW, height: bH, slot: s)
+            if rawW > 0 && rawH > 0 {
+                if bin { _ = getOrCreateBinTexture(width: halfW, height: halfH, slot: s) }
+                let workW = bin ? halfW : rawW
+                let workH = bin ? halfH : rawH
+                if !thermal && workW <= 4096 && denoiseStrength > 0.001 {
+                    _ = getOrCreateCorrectedBayerTexture(width: workW, height: workH, slot: s)
+                }
+                _ = getOrCreateFusedTexture(width: workW, height: workH, slot: s)
+            }
             _ = getOrCreateScaleTexture(width: width, height: height, slot: s)
             _ = getOrCreateSharpenTexture(width: width, height: height, slot: s)
         }
@@ -742,6 +755,8 @@ final class MetalPipeline: @unchecked Sendable {
         let fullW = CVPixelBufferGetWidth(pixelBuffer)
         let fullH = CVPixelBufferGetHeight(pixelBuffer)
         guard fullW > 0, fullH > 0 else { completion(nil, nil); return }
+        lastRawWidth = fullW
+        lastRawHeight = fullH
 
         guard let fullBayer = makeRawTexture(from: pixelBuffer, slot: slot) else {
             print("[MetalPipeline] Failed to create input texture")
@@ -887,7 +902,11 @@ final class MetalPipeline: @unchecked Sendable {
             if let error = cb.error {
                 print("[MetalPipeline] ERROR: Command buffer failed: \(error.localizedDescription)")
             }
-            completionBox.value(finalTexBox.value, outputPBBox.value)
+            if cb.status == .completed {
+                completionBox.value(finalTexBox.value, outputPBBox.value)
+            } else {
+                completionBox.value(nil, nil)
+            }
         }
         commandBuffer.commit()
     }

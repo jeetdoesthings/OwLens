@@ -57,16 +57,21 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
     private let captureLock = OSAllocatedUnfairLock()
     /// Sensor-stage in-flight counter: tracks active physical exposure and sensor readout.
     /// Released immediately when `didCapturePhotoFor` fires.
-    private var sensorInFlight = 0
     private var maxSensorInFlight = 2
     private var sensorActiveIDs: Set<Int64> = []
 
     /// ISP-stage in-flight counter: tracks total active DNG processing jobs in mediaserverd.
     /// Released when `didFinishProcessingPhoto` (or `didFinishCaptureFor` fallback) fires.
-    private var ispInFlight = 0
     private var maxISPInFlight = 5
     private var activeCaptureIDs: Set<Int64> = []
-    private var isCapturePending = false
+    private var recordingCaptureRequests = 0
+    private var recordingSensorBusyTicks = 0
+    private var recordingISPBusyTicks = 0
+    private var recordingRawFrames = 0
+    private var recordingCopyMilliseconds = 0.0
+    private var recordingMaxCopyMilliseconds = 0.0
+    private var recordingExposureGaps = 0
+    private var lastRecordingExposure = CMTime.invalid
     private var recordingSessionCounter: UInt64 = 0
     private var currentRecordingSessionID: UInt64 = 0
     private var captureSessionIDs: [Int64: UInt64] = [:]
@@ -80,9 +85,8 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
 
     private var rawPixelFormat: OSType = 0
     private var formatCFAPattern: Int32 = 0
-    private var targetFPS: Double = 24
-    private var minFrameInterval: Double = 1.0 / 24.0
-    private var lastCaptureStart: CFTimeInterval = 0
+    private let targetFPS = CaptureFrameRate.fps24.rawValue
+    private let minFrameInterval = 1.0 / CaptureFrameRate.fps24.rawValue
     private var selectedAudioPortUID: String?
     private var isReconfiguringAudio = false
     /// Whether the capture timer runs in recording mode (tighter settings).
@@ -99,7 +103,6 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
     /// DMA blits directly into the same queue, guaranteeing sequential execution before compute shaders
     /// with ZERO CPU waitUntilCompleted() stall!
     var sharedCommandQueue: MTLCommandQueue?
-    private var framesSincePreparedReplenish: Int = 0
     private var cachedMaxPhotoDimensions: CMVideoDimensions?
     private var cachedShutterSoundSuppression: Bool = false
 
@@ -113,14 +116,28 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
     private var cachedFM2: [Float]?
     private var cachedColorMatrices: (bt2020: simd_float3x3?, sgamut: simd_float3x3?, appleWideGamut: simd_float3x3?)?
     private var lastComputedMatrixKelvin: Float?
-    // Do not apply guessed vignette correction. Lens shading needs a measured,
-    // per-lens calibration map; a generic radial boost brightens/noisifies the
-    // corners and is less accurate than leaving the native falloff intact.
+    private let hardwareModel = DeviceCapabilities.hardwareMachineIdentifier()
     private var cachedLSC: SIMD4<Float> = .zero
     private var lastWBGains: AVCaptureDevice.WhiteBalanceGains?
 
     private func updateCachedLSC(for camera: AVCaptureDevice) {
+        // Fit to the inverse-S-Log3 luma of the supplied Open Gate stills.
+        // Use patch medians, allow a lighting gradient in the fit, and treat
+        // flat-topped patches as lower bounds. Limit the fitted gain in stops
+        // because the exports include target lighting and highlight clipping.
+        // Gain = 1 + ((1 + x*r²)² - 1 + y*r⁴) / (1 + z*r²).
         cachedLSC = .zero
+        guard hardwareModel == "iPhone13,3", camera.position == .back else { return }
+        switch camera.deviceType {
+        case .builtInUltraWideCamera:
+            cachedLSC = SIMD4(1.325, -0.2556, 1.7668, 0) // 2.50× at the corner
+        case .builtInWideAngleCamera:
+            cachedLSC = SIMD4(0.2002, 0.8094, 0, 0) // 2.25× at the corner
+        case .builtInTelephotoCamera:
+            cachedLSC = SIMD4(0.0377, 0.3732, 0, 0) // 1.45× at the corner
+        default:
+            break
+        }
     }
 
     // MARK: - Session Configuration
@@ -469,26 +486,14 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
                 prewarmBayerBufferPool(width: targetW, height: targetH, format: rawPixelFormat)
             }
         }
-        let prepared = (0..<24).map { _ in makeRAWPhotoSettings() }
-        photoOutput.setPreparedPhotoSettingsArray(prepared) { preparedOK, error in
+        // AVFoundation prepares resource types, which persist for future
+        // requests. One representative describes this lens's RAW settings.
+        photoOutput.setPreparedPhotoSettingsArray([makeRAWPhotoSettings()]) { preparedOK, error in
             if let error {
                 print("[CaptureController] prepare RAW settings failed: \(error)")
             } else {
                 print("[CaptureController] RAW photo resources prepared=\(preparedOK)")
             }
-        }
-    }
-
-    /// Keep AVFoundation's RAW settings pool warm during a long burst without flooding mediaserverd.
-    private func replenishPreparedPhotoSettingsIfNeeded() {
-        guard session.isRunning else { return }
-        framesSincePreparedReplenish += 1
-        guard framesSincePreparedReplenish >= 16 else { return }
-        framesSincePreparedReplenish = 0
-        let currentCount = photoOutput.preparedPhotoSettingsArray.count
-        if currentCount < 6 {
-            let prepared = (0..<16).map { _ in makeRAWPhotoSettings() }
-            photoOutput.setPreparedPhotoSettingsArray(prepared, completionHandler: nil)
         }
     }
 
@@ -743,14 +748,11 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
             let wasRunning = self.session.isRunning
             self.captureTimer?.cancel()
             self.captureTimer = nil
+            self.waitForInFlightClear(timeout: 0.5)
             self.captureLock.withLock {
-                self.isCapturePending = false
-                self.sensorInFlight = 0
-                self.ispInFlight = 0
                 self.sensorActiveIDs.removeAll()
                 self.activeCaptureIDs.removeAll()
             }
-            self.waitForInFlightClear(timeout: 0.5)
 
             // Invalidate buffer pool from previous lens to reclaim memory immediately
             self.bayerBufferPool = nil
@@ -811,6 +813,7 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
                             self.session.addInput(old)
                             self.videoInput = old
                             self.device = prev
+                            self.updateCachedLSC(for: prev)
                         }
                         self.session.sessionPreset = .photo
                         self.photoOutput.maxPhotoQualityPrioritization = .speed
@@ -845,12 +848,12 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
                 self.prepareRAWPhotoResources()
 
                 if wasRunning {
-                    self.startFrameTimer(fps: self.targetFPS)
+                    self.startFrameTimer()
                 }
                 print("[CaptureController] Lens → \(camera.localizedName)")
                 DispatchQueue.main.async { completion?(nil) }
             } catch {
-                if wasRunning { self.startFrameTimer(fps: self.targetFPS) }
+                if wasRunning { self.startFrameTimer() }
                 print("[CaptureController] Lens switch failed: \(error)")
                 DispatchQueue.main.async { completion?(error) }
             }
@@ -915,7 +918,7 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
                 if let portUID {
                     guard let port = audioSession.availableInputs?.first(where: { $0.uid == portUID }) else {
                         self.isReconfiguringAudio = false
-                        if wasRunning { self.startFrameTimer(fps: self.targetFPS) }
+                        if wasRunning { self.startFrameTimer() }
                         let err = NSError(domain: "OwLens", code: 5, userInfo: [NSLocalizedDescriptionKey: "Mic port not found — reconnect"])
                         DispatchQueue.main.async { completion?(err) }
                         return
@@ -959,11 +962,11 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
                 }
 
                 self.isReconfiguringAudio = false
-                if wasRunning { self.startFrameTimer(fps: self.targetFPS) }
+                if wasRunning { self.startFrameTimer() }
                 DispatchQueue.main.async { completion?(nil) }
             } catch {
                 self.isReconfiguringAudio = false
-                if wasRunning { self.startFrameTimer(fps: self.targetFPS) }
+                if wasRunning { self.startFrameTimer() }
                 print("[CaptureController] Audio switch failed: \(error)")
                 DispatchQueue.main.async { completion?(error) }
             }
@@ -1102,7 +1105,7 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
         captureQueue.async { [weak self] in
             guard let self else { return }
             self.session.startRunning()
-            self.startFrameTimer(fps: self.targetFPS)
+            self.startFrameTimer()
         }
     }
 
@@ -1110,9 +1113,6 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
         captureTimer?.cancel()
         captureTimer = nil
         captureLock.withLock {
-            isCapturePending = false
-            sensorInFlight = 0
-            ispInFlight = 0
             sensorActiveIDs.removeAll()
             activeCaptureIDs.removeAll()
         }
@@ -1121,27 +1121,15 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
         }
     }
 
-    func setCaptureFPS(_ fps: Double) {
-        let clamped = 24.0
-        // Stop the timer on the capture queue first to prevent firing mid-change.
+    func lockCaptureTo24FPS() {
         captureQueue.async { [weak self] in
             guard let self else { return }
             self.captureTimer?.cancel()
             self.captureTimer = nil
-            self.targetFPS = clamped
-            self.minFrameInterval = 1.0 / clamped
             if let camera = self.device {
-                self.lockSensorToTargetFPS(on: camera, fps: clamped)
+                self.lockSensorToTargetFPS(on: camera, fps: self.targetFPS)
             }
-            // Only start the new timer if the session is running and enough time
-            // has passed since the last capture start (avoids firing during config).
-            guard self.session.isRunning else { return }
-            // Restart timer immediately; session.isRunning guard prevents firing during teardown.
-            let deadline = DispatchTime.now()
-            self.captureQueue.asyncAfter(deadline: deadline) { [weak self] in
-                guard let self, self.session.isRunning else { return }
-                self.startFrameTimer(fps: clamped)
-            }
+            self.startFrameTimer()
         }
     }
 
@@ -1152,34 +1140,34 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
         captureLock.withLock {
             isRecordingMode = recording
             if recording {
+                recordingCaptureRequests = 0
+                recordingSensorBusyTicks = 0
+                recordingISPBusyTicks = 0
+                recordingRawFrames = 0
+                recordingCopyMilliseconds = 0
+                recordingMaxCopyMilliseconds = 0
+                recordingExposureGaps = 0
+                lastRecordingExposure = .invalid
                 recordingSessionCounter &+= 1
                 currentRecordingSessionID = recordingSessionCounter
             } else {
+                if currentRecordingSessionID > 0 {
+                    let meanCopy = recordingCopyMilliseconds / Double(max(1, recordingRawFrames))
+                    print("[CaptureController] lens=\(device?.deviceType.rawValue ?? "unknown") RAW requests=\(recordingCaptureRequests) delivered=\(recordingRawFrames) sensorBusy=\(recordingSensorBusyTicks) ispBusy=\(recordingISPBusyTicks) exposureGaps=\(recordingExposureGaps) copyMsMean=\(meanCopy) copyMsMax=\(recordingMaxCopyMilliseconds)")
+                }
                 currentRecordingSessionID = 0
                 captureSessionIDs.removeAll()
             }
-        }
-        if recording {
-            enableBurstHelpersIfSafe()
-        }
-        if photoOutput.isResponsiveCaptureEnabled {
-            maxISPInFlight = 6
-        } else {
-            maxISPInFlight = 5
         }
     }
 
     // MARK: - Continuous RAW Capture Loop
 
-    private func startFrameTimer(fps: Double) {
+    private func startFrameTimer() {
         // Don't start if session isn't running (can happen during configuration changes)
         guard session.isRunning else { return }
         captureTimer?.cancel()
         captureTimer = nil
-        captureLock.withLock {
-            isCapturePending = false
-        }
-        minFrameInterval = 1.0 / max(1, fps)
         let timer = DispatchSource.makeTimerSource(queue: captureQueue)
         timer.schedule(deadline: .now(), repeating: minFrameInterval, leeway: .nanoseconds(500_000))
         timer.setEventHandler { [weak self] in
@@ -1187,23 +1175,12 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
         }
         timer.resume()
         captureTimer = timer
-        print("[CaptureController] Capture burst → \(fps) fps (interval \(String(format: "%.3f", minFrameInterval))s)")
+        print("[CaptureController] Capture burst → \(targetFPS) fps (interval \(String(format: "%.3f", minFrameInterval))s)")
     }
 
     private func captureOneRawFrame() {
         if isReconfiguringAudio { return }
         guard session.isRunning, !isReconfiguringSession else { return }
-
-        let canCapture: Bool = captureLock.withLock {
-            if sensorInFlight >= maxSensorInFlight || ispInFlight >= maxISPInFlight {
-                return false
-            }
-            sensorInFlight += 1
-            ispInFlight += 1
-            lastCaptureStart = CACurrentMediaTime()
-            return true
-        }
-        guard canCapture else { return }
 
         if rawPixelFormat == 0 {
             if let first = Self.preferredBayerFormat(
@@ -1214,53 +1191,50 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
                 rawPixelFormat = first
                 formatCFAPattern = Self.cfaPattern(forBayerFormat: first)
             } else {
-                endInFlight()
                 return
             }
         }
 
         // Unique settings object every shot (required). Type matches prepared array.
         let settings = makeRAWPhotoSettings()
-        captureLock.withLock {
+        let canCapture = captureLock.withLock {
+            let sensorBusy = sensorActiveIDs.count >= maxSensorInFlight
+            let ispBusy = activeCaptureIDs.count >= maxISPInFlight
+            if sensorBusy || ispBusy {
+                if isRecordingMode {
+                    if sensorBusy { recordingSensorBusyTicks += 1 }
+                    if ispBusy { recordingISPBusyTicks += 1 }
+                }
+                return false
+            }
             _ = activeCaptureIDs.insert(settings.uniqueID)
             _ = sensorActiveIDs.insert(settings.uniqueID)
             if isRecordingMode && currentRecordingSessionID > 0 {
                 captureSessionIDs[settings.uniqueID] = currentRecordingSessionID
+                recordingCaptureRequests += 1
             }
+            return true
         }
+        guard canCapture else { return }
         photoOutput.capturePhoto(with: settings, delegate: self)
-    }
-
-    private func endInFlight(uniqueID: Int64? = nil) {
-        captureLock.withLock {
-            if let uid = uniqueID {
-                activeCaptureIDs.remove(uid)
-                sensorActiveIDs.remove(uid)
-                captureSessionIDs.removeValue(forKey: uid)
-            }
-            sensorInFlight = max(0, sensorInFlight - 1)
-            ispInFlight = max(0, ispInFlight - 1)
-        }
     }
 
     private func releaseSensorSlot(for uniqueID: Int64) {
         captureLock.withLock {
             _ = sensorActiveIDs.remove(uniqueID)
-            sensorInFlight = max(0, sensorInFlight - 1)
         }
     }
 
     private func releaseISPSlot(for uniqueID: Int64) {
         captureLock.withLock {
             _ = activeCaptureIDs.remove(uniqueID)
-            ispInFlight = max(0, ispInFlight - 1)
         }
     }
 
     private func waitForInFlightClear(timeout: TimeInterval) {
         let deadline = Date().addingTimeInterval(timeout)
         while true {
-            let n = captureLock.withLock { sensorInFlight + ispInFlight }
+            let n = captureLock.withLock { sensorActiveIDs.count + activeCaptureIDs.count }
             if n == 0 || Date() >= deadline { break }
             Thread.sleep(forTimeInterval: 0.005)
         }
@@ -1418,9 +1392,8 @@ extension CaptureController: AVCapturePhotoCaptureDelegate {
 
     func photoOutput(_ output: AVCapturePhotoOutput, didCapturePhotoFor resolvedSettings: AVCaptureResolvedPhotoSettings) {
         AudioServicesDisposeSystemSoundID(1108)
-        // Release sensor slot IMMEDIATELY when sensor exposure and readout completes.
-        // This allows the next 24 FPS timer tick to expose on the sensor without waiting
-        // for mediaserverd to finish DNG packaging, maintaining true 24.000 CFR!
+        // Release the sensor slot as soon as exposure/readout finishes so
+        // another request can start while the RAW callback is still pending.
         releaseSensorSlot(for: resolvedSettings.uniqueID)
     }
 
@@ -1431,9 +1404,15 @@ extension CaptureController: AVCapturePhotoCaptureDelegate {
         // Fallback cleanups in case didCapturePhotoFor or didFinishProcessingPhoto were skipped
         releaseSensorSlot(for: resolvedSettings.uniqueID)
         releaseISPSlot(for: resolvedSettings.uniqueID)
+        captureLock.withLock {
+            _ = captureSessionIDs.removeValue(forKey: resolvedSettings.uniqueID)
+        }
     }
 
     func photoOutput(_ output: AVCapturePhotoOutput, didFinishProcessingPhoto photo: AVCapturePhoto, error: Error?) {
+        let requestID = photo.resolvedSettings.uniqueID
+        guard captureLock.withLock({ activeCaptureIDs.contains(requestID) }) else { return }
+        let lensID = device?.uniqueID ?? ""
         defer {
             releaseISPSlot(for: photo.resolvedSettings.uniqueID)
         }
@@ -1449,12 +1428,13 @@ extension CaptureController: AVCapturePhotoCaptureDelegate {
         }
 
         // CRITICAL: copy into our pooled buffer so system can recycle systemBuffer.
+        let copyStart = CACurrentMediaTime()
         guard let owned = copyBayerPixelBuffer(systemBuffer) else {
             print("[CaptureController] Failed to copy Bayer buffer")
             return
         }
 
-        replenishPreparedPhotoSettingsIfNeeded()
+        let copyMilliseconds = (CACurrentMediaTime() - copyStart) * 1000
 
         let bufferFormat = CVPixelBufferGetPixelFormatType(owned)
         // Priority: device-model override → cached pattern → DNG metadata → OSType FourCC → session default → RGGB
@@ -1488,10 +1468,6 @@ extension CaptureController: AVCapturePhotoCaptureDelegate {
         let black = levels.0
         let white = levels.1
 
-        // Optical Lens Shading Correction (LSC) to counteract physical lens vignetting (cos⁴θ falloff):
-        // Wide (24-26mm f/1.5-f/1.8): ~3.42x corner compensation (alpha = 0.85, +1.78 EV)
-        // Ultra-wide (13-14mm f/2.2-f/2.4): ~4.62x corner compensation (alpha = 1.15, +2.21 EV)
-        // Telephoto (52-77mm+): ~1.69x corner compensation (alpha = 0.30, +0.76 EV)
         let lsc = cachedLSC
 
         let activeGains = device?.deviceWhiteBalanceGains
@@ -1533,9 +1509,21 @@ extension CaptureController: AVCapturePhotoCaptureDelegate {
         }
 
         let shotSessionID: UInt64 = captureLock.withLock {
-            captureSessionIDs.removeValue(forKey: photo.resolvedSettings.uniqueID) ?? 0
+            let id = captureSessionIDs.removeValue(forKey: requestID) ?? 0
+            if id > 0 && id == currentRecordingSessionID {
+                recordingRawFrames += 1
+                recordingCopyMilliseconds += copyMilliseconds
+                recordingMaxCopyMilliseconds = max(recordingMaxCopyMilliseconds, copyMilliseconds)
+                if lastRecordingExposure.isNumeric, photo.timestamp.isNumeric,
+                   CMTimeSubtract(photo.timestamp, lastRecordingExposure).seconds > 1.5 * minFrameInterval {
+                    recordingExposureGaps += 1
+                }
+                if photo.timestamp.isNumeric { lastRecordingExposure = photo.timestamp }
+            }
+            return id
         }
 
+        guard captureLock.withLock({ activeCaptureIDs.contains(requestID) }), lensID == device?.uniqueID else { return }
         let frameData = RawFrameData(
             pixelBuffer: owned,
             whiteBalanceGains: activeGains,

@@ -196,6 +196,7 @@ struct LSCParams {
     float azimuthR;
     float azimuthG;
     float azimuthB;
+    float radialRolloff;
 };
 
 
@@ -332,7 +333,7 @@ kernel void debayerFusedLog(
     g = max(g, 0.0f);
     b = max(b, 0.0f);
 
-    // Fast Lens Shading Correction (LSC): true cos⁴θ optical inverse model
+    // Lens shading correction in uncropped sensor coordinates.
     float outW = float(outTexture.get_width());
     float outH = float(outTexture.get_height());
     float dx = float(x) + 0.5f - 0.5f * outW;
@@ -346,6 +347,9 @@ kernel void debayerFusedLog(
     float3 gain = baseGain * baseGain;
     if (lsc.radial4R != 0.0f || lsc.radial4G != 0.0f || lsc.radial4B != 0.0f) {
         gain += float3(lsc.radial4R, lsc.radial4G, lsc.radial4B) * (rNormSq * rNormSq);
+    }
+    if (lsc.radialRolloff > 0.0f) {
+        gain = 1.0f + (gain - 1.0f) / (1.0f + lsc.radialRolloff * rNormSq);
     }
     if (lsc.azimuthR != 0.0f || lsc.azimuthG != 0.0f || lsc.azimuthB != 0.0f) {
         float cos2Theta = (dx * dx - dy * dy) / max(dx * dx + dy * dy, 1e-6f);

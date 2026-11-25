@@ -129,6 +129,7 @@ final class ZoomMonitor: ObservableObject {
 
     func scheduleDismiss(delaySeconds: Double = 3.5) {
         zoomDismissTask?.cancel()
+        guard !UIAccessibility.isVoiceOverRunning else { return }
         zoomDismissTask = Task { @MainActor in
             try? await Task.sleep(nanoseconds: UInt64(delaySeconds * 1_000_000_000))
             guard !Task.isCancelled else { return }
@@ -207,7 +208,7 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
     @Published var selectedFPS: CaptureFrameRate = .fps24 {
         didSet {
             guard !controlsLocked, !isRecording else { return }
-            captureController.setCaptureFPS(selectedFPS.rawValue)
+            captureController.lockCaptureTo24FPS()
             activeFPS = selectedFPS.rawValue
             // 180° shutter rule is now natively maintained by the angle system.
             // We just need to refresh limits and push the new duration to hardware.
@@ -621,8 +622,11 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
     // Sequencer for guaranteeing strictly monotonic frame ordering during recording
     nonisolated(unsafe) private var nextDispatchSequenceID: UInt64 = 0
     nonisolated(unsafe) private var nextOutputSequenceID: UInt64 = 0
-    nonisolated(unsafe) private var lastOutputSequenceTime: CFTimeInterval = 0
     nonisolated(unsafe) private var gapStartTime: CFTimeInterval = 0
+    nonisolated(unsafe) private var gpuFrameCount = 0
+    nonisolated(unsafe) private var gpuMilliseconds = 0.0
+    nonisolated(unsafe) private var gpuMaxMilliseconds = 0.0
+    nonisolated(unsafe) private var gpuFrameFailures = 0
     nonisolated(unsafe) private var reorderBuffer: [UInt64: (MTLTexture?, CVPixelBuffer?, RawFrameData)] = [:]
 
     nonisolated(unsafe) private var activeEncodeWidth = 2016
@@ -805,9 +809,11 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
             self.processAudioSample(sample)
             // Forward audio to videoWriter strictly while recording and audio capture are active
             if self.isRecordingUnsafe && self.isAudioRecordingActive {
+                let sessionID = self.activeRecordingSessionID
+                let audio = SendableBox(value: sample)
                 self.recordingQueue.async { [weak self] in
-                    guard let self, self.isRecordingUnsafe, self.isAudioRecordingActive else { return }
-                    _ = self.videoWriter.appendAudio(sampleBuffer: sample)
+                    guard let self, sessionID > 0, self.activeRecordingSessionID == sessionID else { return }
+                    _ = self.videoWriter.appendAudio(sampleBuffer: audio.value)
                 }
             }
         }
@@ -880,7 +886,7 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
         startStorageMonitor()
         // Restart session if we already configured once
         if captureController.activeDevice != nil {
-            captureController.setCaptureFPS(selectedFPS.rawValue)
+            captureController.lockCaptureTo24FPS()
             captureController.startSession()
             if !controlsLocked {
                 applyManualExposureAndWB()
@@ -980,7 +986,7 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
                 selectedLens = availableLenses.first
             }
             seedControlRanges()
-            captureController.setCaptureFPS(selectedFPS.rawValue)
+            captureController.lockCaptureTo24FPS()
             refreshAudioSources()
             captureController.startSession()
             applyManualExposureAndWB()
@@ -1752,7 +1758,8 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
     private var cameraReadyTime: Date?
 
     func toggleRecording() {
-        guard isCameraReady, !isDeviceUnsupportedForLog, !isSaving else { return }
+        guard isCameraReady, !isDeviceUnsupportedForLog, !isSaving,
+              !isSwitchingLens, !isSwitchingMic else { return }
         // Guard against any spurious triggers during camera spin-up and initial stabilization
         guard let readyTime = cameraReadyTime, Date().timeIntervalSince(readyTime) > 1.5 else {
             print("[CameraViewModel] Ignored shutter toggle during camera stabilization window")
@@ -1771,7 +1778,7 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
             errorMessage = "Recording disabled — device has no Bayer RAW."
             return
         }
-        guard !isRecording, !isSaving else { return }
+        guard !isRecording, !isSaving, !isSwitchingLens, !isSwitchingMic else { return }
 
         // Clean stale temporary recordings from previous interrupted sessions in background
         Task.detached(priority: .utility) {
@@ -1809,17 +1816,17 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
         metalPipeline?.denoiseStrength = denoiseStrength
         metalPipeline?.use422Encoding = (effectiveCodec == .proRes422 || effectiveCodec == .proRes422HQ)
         metalPipeline?.zoomFactor = Float(zoomFactor)
-        metalPipeline?.prewarm(width: selectedFormat.width, height: selectedFormat.height, curveType: selectedCurve)
         frameBuffer.flush()
         processLock.withLock {
             nextDispatchSequenceID = 0
             nextOutputSequenceID = 0
-            lastOutputSequenceTime = CACurrentMediaTime()
             gapStartTime = 0
             reorderBuffer.removeAll()
+            gpuFrameCount = 0
+            gpuMilliseconds = 0
+            gpuMaxMilliseconds = 0
+            gpuFrameFailures = 0
         }
-        captureController.setRecordingMode(true)
-        activeRecordingSessionID = captureController.activeRecordingSessionID
         let effectiveBitrate = min(selectedBitrate.bitsPerSecond, selectedFormat.maxBitratePreset.bitsPerSecond)
         if effectiveBitrate < selectedBitrate.bitsPerSecond {
             print("[CameraViewModel] Bitrate clamped: \(selectedBitrate.label)Mbps → \(selectedFormat.maxBitratePreset.label)Mbps (max for \(selectedFormat.shortLabel))")
@@ -1857,7 +1864,7 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
                 width: selectedFormat.width,
                 height: selectedFormat.height,
                 bitrate: effectiveBitrate,
-                targetFPS: selectedFPS.rawValue,
+                captureClock: captureController.session.synchronizationClock,
                 includeAudio: includeAudio,
                 curveType: selectedCurve,
                 codec: effectiveCodec,
@@ -1869,16 +1876,14 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
             // otherwise fail with VideoToolbox's generic "cannot encode" error.
             let writerCodec = videoWriter.activeCodec
             metalPipeline?.use422Encoding = (writerCodec == .proRes422 || writerCodec == .proRes422HQ)
+            let width = selectedFormat.width, height = selectedFormat.height, curve = selectedCurve
+            // Texture pools belong to the same serial queue that submits GPU work.
+            processQueue.sync { metalPipeline?.prewarm(width: width, height: height, curveType: curve) }
+            captureController.setRecordingMode(true)
+            activeRecordingSessionID = captureController.activeRecordingSessionID
             isRecording = true
             isRecordingUnsafe = true
             isAudioRecordingActive = true
-            processLock.withLock {
-                nextDispatchSequenceID = 0
-                nextOutputSequenceID = 0
-                lastOutputSequenceTime = CACurrentMediaTime()
-                gapStartTime = 0
-                reorderBuffer.removeAll()
-            }
             frameIndex = 0
             frameCount = 0
             recordingStartTime = recordingDate
@@ -1947,7 +1952,11 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
         isRecording = false
         isSaving = true
         isAudioRecordingActive = false
-        isRecordingUnsafe = false
+        let gpuStats = processLock.withLock {
+            isRecordingUnsafe = false
+            let mean = gpuMilliseconds / Double(max(1, gpuFrameCount))
+            return "gpuFrames=\(gpuFrameCount) gpuFailures=\(gpuFrameFailures) gpuMsMean=\(mean) gpuMsMax=\(gpuMaxMilliseconds)"
+        }
         videoWriter.onLowDiskSpace = nil
         recordingTimer?.invalidate()
         recordingTimer = nil
@@ -1966,21 +1975,13 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
             }
         }
 
-        let remaining: [(MTLTexture, CVPixelBuffer?, RawFrameData)] = processLock.withLock {
-            let bufferedKeys = reorderBuffer.keys.sorted()
-            var rem: [(MTLTexture, CVPixelBuffer?, RawFrameData)] = []
-            for k in bufferedKeys {
-                if let item = reorderBuffer.removeValue(forKey: k), let tex = item.0 {
-                    rem.append((tex, item.1, item.2))
+        processLock.withLock {
+            for key in reorderBuffer.keys.sorted() {
+                if let item = reorderBuffer.removeValue(forKey: key), let buffer = item.1 {
+                    enqueueVideoFrame(buffer, frameData: item.2)
                 }
             }
-            lastOutputSequenceTime = 0
             gapStartTime = 0
-            return rem
-        }
-
-        for item in remaining {
-            dispatchOrderedRecordedFrame(item.0, bgraPB: item.1, frameData: item.2, isTailFlush: true)
         }
 
         recordingQueue.async { [weak self] in
@@ -2006,7 +2007,7 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
         }
 
         frameCount = Int(frameIndex)
-        let realNote = "frames=\(frameCount) drops=\(droppedFrames) fps=\(selectedFPS.label) fmt=\(selectedFormat.shortLabel)"
+        let realNote = "lens=\(selectedLens?.shortLabel ?? "unknown") frames=\(frameCount) queueDrops=\(frameBuffer.droppedCount) fps=\(selectedFPS.label) fmt=\(selectedFormat.shortLabel) \(gpuStats)"
         print("[CameraViewModel] Recording stopped \(realNote)")
         if let caps = capabilities {
             print("[CameraViewModel] Tester diagnostics:\n\(caps.diagnosticSummary)\n\(realNote)")
@@ -2438,9 +2439,20 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
             // ── Recording ──
             let isThermalElevated = (metalPipeline?.thermalState.rawValue ?? 0) >= ProcessInfo.ThermalState.serious.rawValue
             pipeline.processingQuality = isThermalElevated ? .previewFast : .recordQuality
+            let submittedAt = CACurrentMediaTime()
             pipeline.process(frameData.pixelBuffer, encodeWidth: w, encodeHeight: h, encodeAsBGRA: true, slot: slot) { [weak self] framed, bgraPB in
                 guard let self else { completion(); return }
-                handleRecordedFrame(framed, bgraPB: bgraPB, frameData: frameData, completion: completion)
+                let milliseconds = (CACurrentMediaTime() - submittedAt) * 1000
+                let failed = framed == nil || bgraPB == nil
+                self.processLock.withLock {
+                    if self.isRecordingUnsafe, self.activeRecordingSessionID == frameData.recordingSessionID {
+                        self.gpuFrameCount += 1
+                        self.gpuMilliseconds += milliseconds
+                        self.gpuMaxMilliseconds = max(self.gpuMaxMilliseconds, milliseconds)
+                        if failed { self.gpuFrameFailures += 1 }
+                    }
+                }
+                self.handleRecordedFrame(framed, bgraPB: bgraPB, frameData: frameData, completion: completion)
             }
         } else {
             // ── Preview (non-recording): lightweight path ──
@@ -2524,7 +2536,7 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
             // Preview path: release GPU slot immediately, no reordering needed
             completion()
             if let framed {
-                dispatchOrderedRecordedFrame(framed, bgraPB: bgraPB, frameData: frameData)
+                publishFramePreview(framed, frameData: frameData)
             }
             return
         }
@@ -2535,7 +2547,8 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
         // freeSlots.insert) before reorderBuffer insertion created a race where
         // freeSlots.count could become artificially high, triggering premature
         // gap-skip and permanently discarding in-flight frames.
-        let readyFrames: [(MTLTexture, CVPixelBuffer?, RawFrameData)] = processLock.withLock {
+        let readyFrames: [(MTLTexture, RawFrameData)] = processLock.withLock {
+            guard isRecordingUnsafe, frameData.recordingSessionID == activeRecordingSessionID else { return [] }
             if frameData.sequenceID < nextOutputSequenceID {
                 // Stale frame after timeout skip — do not insert into reorderBuffer!
             } else if let framed {
@@ -2575,10 +2588,14 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
                 gapStartTime = 0
             }
 
-            var ready: [(MTLTexture, CVPixelBuffer?, RawFrameData)] = []
+            var ready: [(MTLTexture, RawFrameData)] = []
             while let next = reorderBuffer.removeValue(forKey: nextOutputSequenceID) {
                 if let tex = next.0 {
-                    ready.append((tex, next.1, next.2))
+                    ready.append((tex, next.2))
+                }
+                if let buffer = next.1 {
+                    // Enqueue while sequence order is still protected by the lock.
+                    enqueueVideoFrame(buffer, frameData: next.2)
                 }
                 nextOutputSequenceID &+= 1
                 gapStartTime = 0
@@ -2591,18 +2608,23 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
         completion()
 
         for item in readyFrames {
-            dispatchOrderedRecordedFrame(item.0, bgraPB: item.1, frameData: item.2)
+            publishFramePreview(item.0, frameData: item.1)
         }
     }
 
-    nonisolated private func dispatchOrderedRecordedFrame(
-        _ framed: MTLTexture?,
-        bgraPB: CVPixelBuffer?,
-        frameData: RawFrameData,
-        isTailFlush: Bool = false
-    ) {
-        guard let framed else { return }
+    nonisolated private func enqueueVideoFrame(_ buffer: CVPixelBuffer, frameData: RawFrameData) {
+        let sessionID = frameData.recordingSessionID
+        let timestamp = frameData.timestamp
+        let pixels = SendableBox(value: buffer)
+        recordingQueue.async { [weak self] in
+            guard let self, sessionID > 0, self.activeRecordingSessionID == sessionID else { return }
+            if self.videoWriter.appendFrame(pixelBuffer: pixels.value, captureTime: timestamp) {
+                self.frameIndex += 1
+            }
+        }
+    }
 
+    nonisolated private func publishFramePreview(_ framed: MTLTexture, frameData: RawFrameData) {
         let cfaName: String
         switch frameData.cfaPattern {
         case 0: cfaName = "RGGB"
@@ -2614,19 +2636,6 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
         let drops = frameBuffer.droppedCount
 
         updateScopesIfNeeded(from: framed, pipeline: metalPipeline)
-
-        let isRecordingFrame = (isRecordingUnsafe || isTailFlush) && frameData.recordingSessionID == activeRecordingSessionID && frameData.recordingSessionID > 0
-        if let bgraPB, isRecordingFrame {
-            let timestamp = frameData.timestamp
-            recordingQueue.async { [weak self] in
-                guard let self else { return }
-                if isTailFlush || self.isRecordingUnsafe {
-                    if self.videoWriter.appendFrame(pixelBuffer: bgraPB, captureTime: timestamp) {
-                        self.frameIndex += 1
-                    }
-                }
-            }
-        }
 
         // Submit texture directly to PreviewFeed for zero-allocation rendering on MTKView
         previewFeed.submit(texture: framed)
@@ -2648,7 +2657,7 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
         }
     }
 
-    /// Convert SIMD4 LSC coefficients (radial k1, radial k2, azimuth, unused) to LSCParams.
+    /// Convert fixed lens coefficients to the shader's equal-RGB gains.
     nonisolated private static func simd4ToLSCParams(_ coeffs: SIMD4<Float>) -> LSCParams {
         let r2 = coeffs[0]
         let r4 = coeffs[1]
@@ -2659,7 +2668,8 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
             radial4R: r4,
             radial4G: r4,
             radial4B: r4,
-            azimuthR: 0, azimuthG: 0, azimuthB: 0
+            azimuthR: 0, azimuthG: 0, azimuthB: 0,
+            radialRolloff: coeffs.z
         )
     }
 

@@ -1621,7 +1621,8 @@ struct ControlsView: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .disabled(viewModel.isDeviceUnsupportedForLog || viewModel.isSaving)
+        .disabled(viewModel.isDeviceUnsupportedForLog || viewModel.isSaving ||
+                  viewModel.isSwitchingLens || viewModel.isSwitchingMic)
     }
 
     // MARK: - Utilities & Formatters
@@ -2031,6 +2032,11 @@ private struct LensButtonView: View {
         .frame(width: 32, height: 32)
         .contentShape(Circle())
         .gesture(lensGesture)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("\(labelText) \(lens.name)")
+        .accessibilityAddTraits(isSelected ? [.isButton, .isSelected] : .isButton)
+        .accessibilityHint(isSelected ? "Opens lens and zoom controls" : "Switches camera lens")
+        .accessibilityAction(.default, onTap)
     }
 
     private var lensGesture: some Gesture {
