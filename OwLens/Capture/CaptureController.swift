@@ -130,9 +130,9 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
         guard hardwareModel == "iPhone13,3", camera.position == .back else { return }
         switch camera.deviceType {
         case .builtInUltraWideCamera:
-            cachedLSC = SIMD4(1.325, -0.2556, 1.7668, 0) // 2.50× at the corner
+            cachedLSC = SIMD4(1.545, -0.7170, 1.7668, 0) // 2.72× at the corner
         case .builtInWideAngleCamera:
-            cachedLSC = SIMD4(0.2002, 0.8094, 0, 0) // 2.25× at the corner
+            cachedLSC = SIMD4(0.2002, 1.0094, 0, 0) // 2.45× at the corner
         case .builtInTelephotoCamera:
             cachedLSC = SIMD4(0.0377, 0.3732, 0, 0) // 1.45× at the corner
         default:
