@@ -31,10 +31,10 @@ struct RawFrameData {
     let sgamutMatrix: simd_float3x3?
     let appleWideGamutMatrix: simd_float3x3?
     let timestamp: CMTime
-    var sequenceID: UInt64 = 0
     let recordingSessionID: UInt64
     let kelvin: Float?
     let tint: Float?
+    let isLowLatencyUltraWide: Bool
 }
 
 final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
@@ -51,6 +51,7 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
     private var videoInput: AVCaptureDeviceInput?
     private var audioInput: AVCaptureDeviceInput?
     private var captureTimer: DispatchSourceTimer?
+    private var captureTickID: UInt64 = 0
     private let captureQueue = DispatchQueue(label: "raw.capture.queue", qos: .userInteractive)
     private let audioQueue = DispatchQueue(label: "raw.audio.queue", qos: .userInitiated)
 
@@ -67,6 +68,7 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
     private var recordingCaptureRequests = 0
     private var recordingSensorBusyTicks = 0
     private var recordingISPBusyTicks = 0
+    private var recordingRecoveredTicks = 0
     private var recordingRawFrames = 0
     private var recordingCopyMilliseconds = 0.0
     private var recordingMaxCopyMilliseconds = 0.0
@@ -100,8 +102,7 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
     private let metalDevice: MTLDevice? = MTLCreateSystemDefaultDevice()
     private lazy var blitCommandQueue: MTLCommandQueue? = metalDevice?.makeCommandQueue()
     /// Shared Metal command queue from MetalPipeline. When set, copyBayerPixelBuffer enqueues
-    /// DMA blits directly into the same queue, guaranteeing sequential execution before compute shaders
-    /// with ZERO CPU waitUntilCompleted() stall!
+    /// Fallback queue for RAW copies when a dedicated blit queue is unavailable.
     var sharedCommandQueue: MTLCommandQueue?
     private var cachedMaxPhotoDimensions: CMVideoDimensions?
     private var cachedShutterSoundSuppression: Bool = false
@@ -117,6 +118,9 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
     private var cachedColorMatrices: (bt2020: simd_float3x3?, sgamut: simd_float3x3?, appleWideGamut: simd_float3x3?)?
     private var lastComputedMatrixKelvin: Float?
     private let hardwareModel = DeviceCapabilities.hardwareMachineIdentifier()
+    private func usesLowLatencyPath(for camera: AVCaptureDevice?) -> Bool {
+        hardwareModel == "iPhone13,3" && camera?.deviceType == .builtInUltraWideCamera
+    }
     private var cachedLSC: SIMD4<Float> = .zero
     private var lastWBGains: AVCaptureDevice.WhiteBalanceGains?
 
@@ -1143,6 +1147,7 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
                 recordingCaptureRequests = 0
                 recordingSensorBusyTicks = 0
                 recordingISPBusyTicks = 0
+                recordingRecoveredTicks = 0
                 recordingRawFrames = 0
                 recordingCopyMilliseconds = 0
                 recordingMaxCopyMilliseconds = 0
@@ -1153,7 +1158,7 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
             } else {
                 if currentRecordingSessionID > 0 {
                     let meanCopy = recordingCopyMilliseconds / Double(max(1, recordingRawFrames))
-                    print("[CaptureController] lens=\(device?.deviceType.rawValue ?? "unknown") RAW requests=\(recordingCaptureRequests) delivered=\(recordingRawFrames) sensorBusy=\(recordingSensorBusyTicks) ispBusy=\(recordingISPBusyTicks) exposureGaps=\(recordingExposureGaps) copyMsMean=\(meanCopy) copyMsMax=\(recordingMaxCopyMilliseconds)")
+                    print("[CaptureController] lens=\(device?.deviceType.rawValue ?? "unknown") RAW requests=\(recordingCaptureRequests) delivered=\(recordingRawFrames) sensorBusy=\(recordingSensorBusyTicks) ispBusy=\(recordingISPBusyTicks) recoveredTicks=\(recordingRecoveredTicks) exposureGaps=\(recordingExposureGaps) copyMsMean=\(meanCopy) copyMsMax=\(recordingMaxCopyMilliseconds)")
                 }
                 currentRecordingSessionID = 0
                 captureSessionIDs.removeAll()
@@ -1168,19 +1173,23 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
         guard session.isRunning else { return }
         captureTimer?.cancel()
         captureTimer = nil
+        captureTickID &+= 1
         let timer = DispatchSource.makeTimerSource(queue: captureQueue)
         timer.schedule(deadline: .now(), repeating: minFrameInterval, leeway: .nanoseconds(500_000))
         timer.setEventHandler { [weak self] in
-            self?.captureOneRawFrame()
+            guard let self else { return }
+            self.captureTickID &+= 1
+            self.captureOneRawFrame(tickID: self.captureTickID)
         }
         timer.resume()
         captureTimer = timer
         print("[CaptureController] Capture burst → \(targetFPS) fps (interval \(String(format: "%.3f", minFrameInterval))s)")
     }
 
-    private func captureOneRawFrame() {
+    private func captureOneRawFrame(tickID: UInt64, retryUntil: DispatchTime? = nil) {
         if isReconfiguringAudio { return }
-        guard session.isRunning, !isReconfiguringSession else { return }
+        guard session.isRunning, !isReconfiguringSession, captureTimer != nil, tickID == captureTickID else { return }
+        if let retryUntil, DispatchTime.now() > retryUntil { return }
 
         if rawPixelFormat == 0 {
             if let first = Self.preferredBayerFormat(
@@ -1201,7 +1210,7 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
             let sensorBusy = sensorActiveIDs.count >= maxSensorInFlight
             let ispBusy = activeCaptureIDs.count >= maxISPInFlight
             if sensorBusy || ispBusy {
-                if isRecordingMode {
+                if isRecordingMode && retryUntil == nil {
                     if sensorBusy { recordingSensorBusyTicks += 1 }
                     if ispBusy { recordingISPBusyTicks += 1 }
                 }
@@ -1212,10 +1221,22 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
             if isRecordingMode && currentRecordingSessionID > 0 {
                 captureSessionIDs[settings.uniqueID] = currentRecordingSessionID
                 recordingCaptureRequests += 1
+                if retryUntil != nil { recordingRecoveredTicks += 1 }
             }
             return true
         }
-        guard canCapture else { return }
+        guard canCapture else {
+            // Let a nearly finished readout release its slot before skipping
+            // a full 24fps interval. A retry expires within the same tick.
+            if retryUntil == nil && usesLowLatencyPath(for: device) {
+                let now = DispatchTime.now()
+                let deadline = now + .milliseconds(8)
+                captureQueue.asyncAfter(deadline: now + .milliseconds(4)) { [weak self] in
+                    self?.captureOneRawFrame(tickID: tickID, retryUntil: deadline)
+                }
+            }
+            return
+        }
         photoOutput.capturePhoto(with: settings, delegate: self)
     }
 
@@ -1349,17 +1370,15 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
                 // complete; otherwise the queued frames contend for/reuse an
                 // IOSurface and the RAW burst collapses under load.
                 cb.waitUntilCompleted()
-                return dst
+                if cb.status == .completed { return dst }
             }
         }
 
-        // CPU memcpy fallback if Metal IOSurface texture mapping is unavailable
-        CVPixelBufferLockBaseAddress(src, .readOnly)
-        CVPixelBufferLockBaseAddress(dst, [])
-        defer {
-            CVPixelBufferUnlockBaseAddress(src, .readOnly)
-            CVPixelBufferUnlockBaseAddress(dst, [])
-        }
+        // CPU fallback for unsupported surfaces or a failed blit.
+        guard CVPixelBufferLockBaseAddress(src, .readOnly) == kCVReturnSuccess else { return nil }
+        defer { CVPixelBufferUnlockBaseAddress(src, .readOnly) }
+        guard CVPixelBufferLockBaseAddress(dst, []) == kCVReturnSuccess else { return nil }
+        defer { CVPixelBufferUnlockBaseAddress(dst, []) }
 
         guard let srcBase = CVPixelBufferGetBaseAddress(src),
               let dstBase = CVPixelBufferGetBaseAddress(dst) else { return nil }
@@ -1412,7 +1431,8 @@ extension CaptureController: AVCapturePhotoCaptureDelegate {
     func photoOutput(_ output: AVCapturePhotoOutput, didFinishProcessingPhoto photo: AVCapturePhoto, error: Error?) {
         let requestID = photo.resolvedSettings.uniqueID
         guard captureLock.withLock({ activeCaptureIDs.contains(requestID) }) else { return }
-        let lensID = device?.uniqueID ?? ""
+        let camera = device
+        let lensID = camera?.uniqueID ?? ""
         defer {
             releaseISPSlot(for: photo.resolvedSettings.uniqueID)
         }
@@ -1540,7 +1560,8 @@ extension CaptureController: AVCapturePhotoCaptureDelegate {
             timestamp: photo.timestamp,
             recordingSessionID: shotSessionID,
             kelvin: smoothedKelvin,
-            tint: smoothedTint
+            tint: smoothedTint,
+            isLowLatencyUltraWide: usesLowLatencyPath(for: camera)
         )
 
         onRawFrameData?(frameData)

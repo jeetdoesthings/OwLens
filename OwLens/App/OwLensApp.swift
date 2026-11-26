@@ -50,8 +50,7 @@ struct RootView: View {
                             showFocusPeaking: $viewModel.showFocusPeaking,
                             showDisplayLUT: viewModel.showDisplayLUT,
                             overlayOnly: false,
-                            targetFPS: viewModel.selectedFPS.rawValue,
-                            orientation: viewModel.currentOrientation
+                            targetFPS: viewModel.selectedFPS.rawValue
                         )
                         .opacity(1)
                         .allowsHitTesting(true)
@@ -102,7 +101,7 @@ struct RootView: View {
                         let nx = (loc.x - videoRect.minX) / videoRect.width
                         let ny = (loc.y - videoRect.minY) / videoRect.height
 
-                        let interfaceOrientation = viewModel.currentOrientation
+                        let interfaceOrientation = viewModel.viewfinderOrientation
 
                         let rawX = interfaceOrientation == .landscapeLeft ? (1.0 - nx) : nx
                         let rawY = interfaceOrientation == .landscapeLeft ? (1.0 - ny) : ny
@@ -201,9 +200,6 @@ struct RootView: View {
         }
         .onDisappear {
             viewModel.teardownCamera()
-        }
-        .onReceive(NotificationCenter.default.publisher(for: UIDevice.orientationDidChangeNotification)) { _ in
-            viewModel.updateOrientation()
         }
     }
 

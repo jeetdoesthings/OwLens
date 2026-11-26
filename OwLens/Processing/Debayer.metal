@@ -44,10 +44,10 @@ kernel void correctDefectPixelsBayer(
     if (gid.x >= dst.get_width() || gid.y >= dst.get_height()) return;
 
     float center = src.read(gid).r;
-    // Defect pixels only exist in the noise floor and midtones. Saturated highlights and
-    // high-contrast optical specular peaks must bypass DPC to prevent false outlier clamping
-    // on distance-2 Red/Blue neighbors, which creates artificial greenish fringing.
-    if (noise.denoiseStrength <= 0.001f || center >= 0.85f * params.whiteLevel) {
+    float signalNorm = saturate((center - params.blackLevel) / max(params.whiteLevel - params.blackLevel, 1e-6f));
+    // Fade the correction out in highlights so a specular cannot toggle
+    // between its actual value and the neighborhood median on adjacent frames.
+    if (noise.denoiseStrength <= 0.001f || signalNorm >= 0.80f) {
         dst.write(float4(center, 0.0f, 0.0f, 1.0f), gid);
         return;
     }
@@ -73,11 +73,12 @@ kernel void correctDefectPixelsBayer(
     float midHi = min(max01, max23);
     float median = 0.5f * (midLo + midHi);
 
-    float signalNorm = saturate(center / params.whiteLevel);
     float sigmaRaw = sqrt(noise.shotCoeff * signalNorm + noise.readCoeff) * params.whiteLevel;
     float threshold = (5.0f / max(noise.denoiseStrength, 0.2f)) * max(sigmaRaw, 1e-3f);
 
-    float out = (abs(center - median) > threshold) ? median : center;
+    float correction = smoothstep(threshold, 1.5f * threshold, abs(center - median));
+    correction *= 1.0f - smoothstep(0.45f, 0.80f, signalNorm);
+    float out = mix(center, median, correction);
     dst.write(float4(out, 0.0f, 0.0f, 1.0f), gid);
 }
 
@@ -197,6 +198,7 @@ struct LSCParams {
     float azimuthG;
     float azimuthB;
     float radialRolloff;
+    float outputScale;
 };
 
 
@@ -370,28 +372,25 @@ kernel void debayerFusedLog(
     // tinting in specular highlights.
     // We smoothly roll off chrominance as photosites saturate, converging blown-out light
     // sources, reflections, lamps, and sun to pure neutral white (R = G = B).
-    float maxCh = max(rgb.r, max(rgb.g, rgb.b));
-    if (rawPeak >= 0.82f || maxCh > 0.90f) {
-        // Start before the green photosites fully clip. The previous 0.88
-        // threshold and squared blend left a visible magenta fringe in the
-        // last fraction of a stop before saturation.
-        float uRaw = smoothstep(0.82f, 0.985f, rawPeak);
-        float uCh = smoothstep(0.90f, 2.25f, maxCh);
-        float desat = max(uRaw, uCh);
-        float lum = dot(rgb, float3(0.2627f, 0.6780f, 0.0593f));
-        float targetVal = max(lum, maxCh);
-        rgb = mix(rgb, float3(targetVal), desat);
+    if (rawPeak > 0.78f) {
+        float desat = smoothstep(0.78f, 0.998f, rawPeak);
+        // Use luminance in the output gamut. Retaining luminance prevents
+        // a changing largest RGB channel from pumping highlight brightness.
+        float3 weights = params.curveType == 3
+            ? float3(0.270410f, 0.816097f, -0.086507f)
+            : (params.curveType == 2 ? float3(0.2627f, 0.6780f, 0.0593f) : float3(0.2126f, 0.7152f, 0.0722f));
+        float lum = max(0.0f, dot(rgb, weights));
+        rgb = mix(rgb, float3(lum), desat);
     }
 
-    // Sensor-saturation flag used by optional zebra overlay (1.0 = normal, 0.0 = clipped)
-    bool isClipped = (rawPeak >= 0.985f);
-    float alpha = isClipped ? 0.0f : 1.0f;
+    // Fade the display-only zebra mask across the clipping threshold.
+    float alpha = 1.0f - smoothstep(0.975f, 0.995f, rawPeak);
 
     // ── Output scene-linear RGB ──
     // Log encoding is performed after crop/scale in the dedicated encodeLogCurve kernel.
     // Keeping this pass linear means the OETF always receives true scene reflectance
     // (18% gray = 0.18), with no artificial tinting or sharpening.
-    outTexture.write(float4(rgb, alpha), gid);
+    outTexture.write(float4(rgb * lsc.outputScale, alpha), gid);
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -600,27 +599,6 @@ kernel void convertRgbTo422YpCbCr10(
     dstUV.write(float4(normCb, normCr, 0.0f, 1.0f), gid);
 }
 
-// ──────────────────────────────────────────────────────────────────────
-// LOG OETF ONLY
-//
-// No sharpening, unsharp masking, local contrast, or artificial colour is
-// applied. The scene-linear RGB from the debayer/scale passes is encoded
-// directly with the official Apple Log 2 / S-Log3 OETF.
-// ──────────────────────────────────────────────────────────────────────
-kernel void applyLogOETF(
-    texture2d<float, access::read>  inLinear   [[texture(0)]],
-    texture2d<float, access::write> outLog     [[texture(1)]],
-    constant int   &curveType                  [[buffer(0)]],
-    uint2 gid [[thread_position_in_grid]])
-{
-    if (gid.x >= outLog.get_width() || gid.y >= outLog.get_height()) return;
-
-    float4 center = inLinear.read(gid);
-    float3 logRGB = encodeLogCurve(center.rgb, curveType);
-    outLog.write(float4(logRGB, center.a), gid);
-}
-
-
 struct VertexOut {
     float4 position [[position]];
 };
@@ -640,6 +618,7 @@ struct DisplayUniforms {
     int  overlayOnly;
     int  showDisplayLUT;
     int  curveType;
+    int  flip180;
 };
 
 fragment float4 displayFragment(
@@ -651,11 +630,14 @@ fragment float4 displayFragment(
     if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) {
         return uniforms.overlayOnly > 0 ? float4(0.0, 0.0, 0.0, 0.0) : float4(0.0, 0.0, 0.0, 1.0);
     }
+    if (uniforms.flip180 != 0) {
+        uv = 1.0f - uv;
+    }
     
     constexpr sampler s(coord::normalized, address::clamp_to_edge, filter::linear);
     float4 color = tex.sample(s, uv);
     
-    float isClipped = (color.a < 0.5f) ? 1.0f : 0.0f;
+    float clipStrength = saturate(1.0f - color.a);
     
     float3 finalColor = color.rgb;
 
@@ -731,9 +713,9 @@ fragment float4 displayFragment(
     // ── Cinema Diagonal Zebra Stripes for Highlight Clipping ──
     float3 zebraColor = float3(1.0f, 0.15f, 0.15f);
     float zebraAlpha = 0.0f;
-    if (uniforms.showClipping > 0 && isClipped > 0.5f) {
+    if (uniforms.showClipping > 0 && clipStrength > 0.0f) {
         float stripe = step(0.5f, fract((in.position.x + in.position.y) / 14.0f));
-        zebraAlpha = stripe * 0.85f;
+        zebraAlpha = stripe * 0.85f * clipStrength;
     }
 
     // ── Cinema 3x3 Sobel Focus Peaking ──
@@ -815,18 +797,13 @@ struct CropParams {
     int   flip180;
 };
 
-kernel void cropAndResampleCatmullRom(
-    texture2d<float, access::sample> src [[texture(0)]],
-    texture2d<float, access::write>  dst [[texture(1)]],
-    constant CropParams &crop            [[buffer(0)]],
-    uint2 gid [[thread_position_in_grid]])
+static inline float4 sampleCrop(
+    texture2d<float, access::sample> src, constant CropParams &crop, uint2 size, uint2 gid)
 {
-    if (gid.x >= dst.get_width() || gid.y >= dst.get_height()) return;
-
     constexpr sampler s(coord::pixel, address::clamp_to_edge, filter::linear);
 
-    float effectiveX = crop.flip180 ? float(dst.get_width() - 1 - gid.x) : float(gid.x);
-    float effectiveY = crop.flip180 ? float(dst.get_height() - 1 - gid.y) : float(gid.y);
+    float effectiveX = crop.flip180 ? float(size.x - 1 - gid.x) : float(gid.x);
+    float effectiveY = crop.flip180 ? float(size.y - 1 - gid.y) : float(gid.y);
 
     float srcX = metal::fma(effectiveX, crop.scaleX, crop.startX);
     float srcY = metal::fma(effectiveY, crop.scaleY, crop.startY);
@@ -850,7 +827,32 @@ kernel void cropAndResampleCatmullRom(
 
     result.rgb = max(result.rgb, float3(0.0f));
     result.a = saturate(result.a);
-    dst.write(result, gid);
+    return result;
+}
+
+kernel void cropAndResampleCatmullRom(
+    texture2d<float, access::sample> src [[texture(0)]],
+    texture2d<float, access::write> dst [[texture(1)]],
+    constant CropParams &crop [[buffer(0)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    uint2 size(dst.get_width(), dst.get_height());
+    if (any(gid >= size)) return;
+    dst.write(sampleCrop(src, crop, size, gid), gid);
+}
+
+kernel void cropAndEncodeLog(
+    texture2d<float, access::sample> src [[texture(0)]],
+    texture2d<float, access::write> dst [[texture(1)]],
+    constant CropParams &crop [[buffer(0)]],
+    constant int &curveType [[buffer(1)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    uint2 size(dst.get_width(), dst.get_height());
+    if (any(gid >= size)) return;
+    // Match the previous RGBA16Float crop intermediate's rounding in registers.
+    float4 linear = float4(half4(sampleCrop(src, crop, size, gid)));
+    dst.write(float4(encodeLogCurve(linear.rgb, curveType), linear.a), gid);
 }
 
 

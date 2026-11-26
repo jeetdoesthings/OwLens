@@ -94,7 +94,7 @@ struct ControlsView: View {
             // If bottom has home indicator (>= 20pt) but left/right report < 30pt (e.g. edge case or early layout pass),
             // determine the notch side from interface orientation so the UI is NEVER under the notch:
             if insets.bottom >= 20 && insets.left < 30 && insets.right < 30 {
-                let orientation = activeScene?.interfaceOrientation ?? .landscapeRight
+            let orientation = activeScene?.effectiveGeometry.interfaceOrientation ?? .landscapeRight
                 if orientation == .landscapeLeft {
                     // Home button on left -> Notch is on the RIGHT
                     insets.right = 59
@@ -1701,7 +1701,7 @@ private struct LensAndZoomWheelControl: View {
         }
         .animation(.spring(response: 0.28, dampingFraction: 0.84), value: isExpanded)
         .animation(.spring(response: 0.28, dampingFraction: 0.84), value: zoomMonitor.isWheelActive)
-        .onChange(of: viewModel.activePanel) { panel in
+        .onChange(of: viewModel.activePanel) { _, panel in
             if panel != nil && isExpanded {
                 withAnimation(.spring(response: 0.24, dampingFraction: 0.85)) {
                     zoomMonitor.hideWheelAndSwitcher()

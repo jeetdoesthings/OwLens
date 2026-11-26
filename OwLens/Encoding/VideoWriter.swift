@@ -709,10 +709,6 @@ final class VideoWriter: @unchecked Sendable {
 
         lock.unlock()
 
-        vIn?.markAsFinished()
-        aIn?.markAsFinished()
-        mIn?.markAsFinished()
-
         // `writer` (AVAssetWriter) is non-Sendable; box it so the @Sendable
         // finishWriting callback can capture it. If there is no writer there is
         // nothing to finalize — report failure instead of silently never
@@ -724,7 +720,7 @@ final class VideoWriter: @unchecked Sendable {
 
         if real == 0 {
             print("[VideoWriter] No real frames were appended to the video timeline.")
-            writer.cancelWriting()
+            if writer.status == .writing { writer.cancelWriting() }
             gyroRecorder.stop()
             if let url {
                 try? FileManager.default.removeItem(at: url)
@@ -732,6 +728,16 @@ final class VideoWriter: @unchecked Sendable {
             completion(nil, NSError(domain: "OwLens", code: 102, userInfo: [NSLocalizedDescriptionKey: "Recording ended with no frames"]))
             return
         }
+        guard writer.status == .writing else {
+            gyroRecorder.stop()
+            completion(nil, writer.error ?? NSError(domain: "OwLens", code: 103, userInfo: [
+                NSLocalizedDescriptionKey: "Video writer failed to finalize file"
+            ]))
+            return
+        }
+        vIn?.markAsFinished()
+        aIn?.markAsFinished()
+        mIn?.markAsFinished()
         let boxedWriter = SendableBox(value: writer)
         writer.finishWriting {
             let status = boxedWriter.value.status
@@ -741,7 +747,7 @@ final class VideoWriter: @unchecked Sendable {
             let outputURL = boxedWriter.value.outputURL
             let gcsvData = self.gyroRecorder.exportGCSVData(videoFileName: outputURL.lastPathComponent)
             self.gyroRecorder.stop()
-            if status == .failed {
+            if status != .completed {
                 let err = boxedWriter.value.error ?? NSError(domain: "OwLens", code: 103, userInfo: [NSLocalizedDescriptionKey: "Video writer failed to finalize file"])
                 print("[VideoWriter] Error: \(err)")
                 completion(nil, err)
@@ -764,47 +770,75 @@ final class VideoWriter: @unchecked Sendable {
     /// in the metadata track's 'stsd' box with 'camm' (Google Camera Motion Metadata).
     /// This enables standard Gyroflow and DaVinci Resolve OpenFX plugin to natively detect
     /// and parse the embedded gyroscope stream with zero external sidecar files.
-    private static func patchMebxToCamm(at url: URL) {
-        guard let fileHandle = try? FileHandle(forUpdating: url) else { return }
-        defer { try? fileHandle.close() }
+    static func patchMebxToCamm(at url: URL) {
+        guard let file = try? FileHandle(forUpdating: url) else { return }
+        defer { try? file.close() }
 
-        let fileSize = fileHandle.seekToEndOfFile()
-        guard fileSize > 64 else { return }
-
-        let mebxBytes = Data("mebx".utf8)
-        let cammBytes = Data("camm".utf8)
-        let stsdBytes = Data("stsd".utf8)
-
-        var regionsToScan: [(offset: UInt64, length: Int)] = []
-        let headLength = Int(min(fileSize, 2 * 1024 * 1024))
-        regionsToScan.append((offset: 0, length: headLength))
-
-        let tailLength = Int(min(fileSize, 8 * 1024 * 1024))
-        let tailOffset = fileSize - UInt64(tailLength)
-        if tailOffset > UInt64(headLength) {
-            regionsToScan.append((offset: tailOffset, length: tailLength))
+        func fourCC(_ text: String) -> UInt32 {
+            text.utf8.reduce(0) { $0 << 8 | UInt32($1) }
         }
 
-        for region in regionsToScan {
-            fileHandle.seek(toFileOffset: region.offset)
-            let buffer = fileHandle.readData(ofLength: region.length)
-            var searchStart = 0
+        func read(at offset: UInt64, count: Int) throws -> Data? {
+            try file.seek(toOffset: offset)
+            guard let bytes = try file.read(upToCount: count), bytes.count == count else { return nil }
+            return bytes
+        }
 
-            while searchStart < buffer.count {
-                guard let stsdRange = buffer.range(of: stsdBytes, options: [], in: searchStart..<buffer.count) else {
-                    break
-                }
-                let windowEnd = min(buffer.count, stsdRange.upperBound + 64)
-                let searchWindow = stsdRange.upperBound..<windowEnd
-                if let mebxRange = buffer.range(of: mebxBytes, options: [], in: searchWindow) {
-                    let filePatchOffset = region.offset + UInt64(mebxRange.lowerBound)
-                    fileHandle.seek(toFileOffset: filePatchOffset)
-                    fileHandle.write(cammBytes)
-                    print("[VideoWriter] Successfully patched stsd entry 'mebx' -> 'camm' at offset \(filePatchOffset)")
-                    return
-                }
-                searchStart = stsdRange.upperBound
+        struct Box {
+            let type: UInt32
+            let body: UInt64
+            let end: UInt64
+        }
+
+        func box(at offset: UInt64, through limit: UInt64) throws -> Box? {
+            guard offset <= limit, limit - offset >= 8,
+                  let header = try read(at: offset, count: 8) else { return nil }
+            let size32 = header.withUnsafeBytes { UInt32(bigEndian: $0.loadUnaligned(as: UInt32.self)) }
+            let type = header.withUnsafeBytes { UInt32(bigEndian: $0.loadUnaligned(fromByteOffset: 4, as: UInt32.self)) }
+            let headerSize: UInt64 = size32 == 1 ? 16 : 8
+            let size: UInt64
+            if size32 == 1 {
+                guard limit - offset >= headerSize, let bytes = try read(at: offset + 8, count: 8) else { return nil }
+                size = bytes.withUnsafeBytes { UInt64(bigEndian: $0.loadUnaligned(as: UInt64.self)) }
+            } else {
+                size = size32 == 0 ? limit - offset : UInt64(size32)
             }
+            guard size >= headerSize, size <= limit - offset else { return nil }
+            return Box(type: type, body: offset + headerSize, end: offset + size)
+        }
+
+        let mebx = fourCC("mebx")
+        func findEntry(from start: UInt64, through limit: UInt64, path: ArraySlice<UInt32>) throws -> UInt64? {
+            if let child = path.first {
+                var offset = start
+                while let atom = try box(at: offset, through: limit) {
+                    if atom.type == child,
+                       let found = try findEntry(from: atom.body, through: atom.end, path: path.dropFirst()) {
+                        return found
+                    }
+                    offset = atom.end
+                }
+            } else if limit - start >= 8, let header = try read(at: start, count: 8) {
+                let count = header.withUnsafeBytes { UInt32(bigEndian: $0.loadUnaligned(fromByteOffset: 4, as: UInt32.self)) }
+                var offset = start + 8
+                for _ in 0..<count {
+                    guard let entry = try box(at: offset, through: limit) else { return nil }
+                    if entry.type == mebx && entry.end - entry.body >= 8 { return offset + 4 }
+                    offset = entry.end
+                }
+            }
+            return nil
+        }
+
+        do {
+            let size = try file.seekToEnd()
+            let path = ["moov", "trak", "mdia", "minf", "stbl", "stsd"].map(fourCC)
+            if let offset = try findEntry(from: 0, through: size, path: path[...]) {
+                try file.seek(toOffset: offset)
+                try file.write(contentsOf: Data("camm".utf8))
+            }
+        } catch {
+            print("[VideoWriter] Could not tag CAMM metadata: \(error.localizedDescription)")
         }
     }
 

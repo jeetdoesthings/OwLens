@@ -1,4 +1,5 @@
 import SwiftUI
+import CoreMedia
 import UIKit
 import MetalKit
 import QuartzCore
@@ -8,20 +9,26 @@ import os
 /// Completely bypasses SwiftUI's view body evaluation loop at 24 fps,
 /// scheduling direct layer updates onto the MTKView.
 final class PreviewFeed: @unchecked Sendable {
+    struct Frame {
+        let log: LogFrameTexture
+        let flipped180: Bool
+        let timestamp: CMTime
+    }
+
     private let lock = OSAllocatedUnfairLock()
-    private(set) var currentTexture: MTLTexture?
+    private var currentFrame: Frame?
     private weak var targetView: MTKView?
     private weak var coordinator: CameraPreviewView.Coordinator?
     private var isRenderScheduled = false
 
     func register(view: MTKView, coordinator: CameraPreviewView.Coordinator) {
-        let tex = lock.withLock {
+        let frame = lock.withLock {
             self.targetView = view
             self.coordinator = coordinator
-            return self.currentTexture
+            return self.currentFrame
         }
-        if let tex {
-            coordinator.currentTexture = tex
+        if let frame {
+            coordinator.currentFrame = frame
             view.setNeedsDisplay()
         }
     }
@@ -34,25 +41,27 @@ final class PreviewFeed: @unchecked Sendable {
         }
     }
 
-    func submit(texture: MTLTexture) {
-        let shouldSchedule: Bool = lock.withLock {
-            currentTexture = texture
-            guard targetView != nil, coordinator != nil else { return false }
-            if isRenderScheduled { return false }
+    @discardableResult
+    func submit(_ frame: Frame) -> Bool {
+        let (accepted, shouldSchedule) = lock.withLock {
+            if let currentFrame, currentFrame.timestamp.isNumeric, frame.timestamp.isNumeric,
+               frame.timestamp < currentFrame.timestamp { return (false, false) }
+            currentFrame = frame
+            guard targetView != nil, coordinator != nil, !isRenderScheduled else { return (true, false) }
             isRenderScheduled = true
-            return true
+            return (true, true)
         }
-        guard shouldSchedule else { return }
+        guard shouldSchedule else { return accepted }
 
         let updateBlock = { [weak self] in
             guard let self else { return }
-            let (tex, view, coord): (MTLTexture?, MTKView?, CameraPreviewView.Coordinator?) = self.lock.withLock {
+            let (frame, view, coord) = self.lock.withLock {
                 self.isRenderScheduled = false
-                return (self.currentTexture, self.targetView, self.coordinator)
+                return (self.currentFrame, self.targetView, self.coordinator)
             }
 
-            if let tex, let coord, let view {
-                coord.currentTexture = tex
+            if let frame, let coord, let view {
+                coord.currentFrame = frame
                 view.setNeedsDisplay()
             }
         }
@@ -62,6 +71,7 @@ final class PreviewFeed: @unchecked Sendable {
         } else {
             DispatchQueue.main.async(execute: updateBlock)
         }
+        return accepted
     }
 }
 
@@ -74,7 +84,6 @@ struct CameraPreviewView: UIViewRepresentable {
     var showDisplayLUT: Bool = false
     var overlayOnly: Bool = false
     var targetFPS: Double = 24.0
-    var orientation: UIInterfaceOrientation = .landscapeRight
 
     func makeUIView(context: Context) -> MTKView {
         let mtkView = MTKView(frame: .zero, device: metalPipeline.device)
@@ -120,7 +129,6 @@ struct CameraPreviewView: UIViewRepresentable {
         context.coordinator.showFocusPeaking = showFocusPeaking
         context.coordinator.showDisplayLUT = showDisplayLUT
         context.coordinator.targetFPS = targetFPS
-        context.coordinator.orientation = orientation
         context.coordinator.isAppActive = UIApplication.shared.applicationState == .active
         if context.coordinator.overlayOnly != overlayOnly {
             context.coordinator.overlayOnly = overlayOnly
@@ -147,18 +155,18 @@ struct CameraPreviewView: UIViewRepresentable {
         var overlayOnly: Int32
         var showDisplayLUT: Int32
         var curveType: Int32
+        var flip180: Int32
     }
 
     final class Coordinator: NSObject, MTKViewDelegate {
         let metalPipeline: MetalPipeline
         weak var previewFeed: PreviewFeed?
-        var currentTexture: MTLTexture?
+        var currentFrame: PreviewFeed.Frame?
         var showClipping: Bool = false
         var showFocusPeaking: Bool = false
         var showDisplayLUT: Bool = false
         var overlayOnly: Bool = false
         var targetFPS: Double = 24.0
-        var orientation: UIInterfaceOrientation = .landscapeRight
         /// Cached app state — updated from MainActor via updateUIView, read on render thread.
         var isAppActive: Bool = true
         /// No redundant-draw guard needed: the display link runs at 24 fps and frames
@@ -216,7 +224,7 @@ struct CameraPreviewView: UIViewRepresentable {
             let destW = dest.width
             let destH = dest.height
  
-            guard let texture = currentTexture, destW > 0, destH > 0 else {
+            guard let frame = currentFrame, destW > 0, destH > 0 else {
                 if let renderPassDescriptor = view.currentRenderPassDescriptor,
                    let renderEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: renderPassDescriptor) {
                     renderEncoder.endEncoding()
@@ -225,6 +233,7 @@ struct CameraPreviewView: UIViewRepresentable {
                 commandBuffer.commit()
                 return
             }
+            let texture = frame.log.texture
  
             let srcW = CGFloat(texture.width)
             let srcH = CGFloat(texture.height)
@@ -272,6 +281,7 @@ struct CameraPreviewView: UIViewRepresentable {
                 renderEncoder.setRenderPipelineState(renderPipeline)
                 renderEncoder.setFragmentTexture(texture, index: 0)
                 
+                let interfaceFlipped = view.window?.windowScene?.effectiveGeometry.interfaceOrientation == .landscapeLeft
                 var uniforms = DisplayUniforms(
                     destOffset: SIMD2<Int32>(Int32(originX), Int32(originY)),
                     destSize: SIMD2<Int32>(Int32(fitW), Int32(fitH)),
@@ -279,13 +289,15 @@ struct CameraPreviewView: UIViewRepresentable {
                     showFocusPeaking: showFocusPeaking ? 1 : 0,
                     overlayOnly: overlayOnly ? 1 : 0,
                     showDisplayLUT: showDisplayLUT ? 1 : 0,
-                    curveType: Int32(metalPipeline.curveType.rawValue)
+                    curveType: Int32(frame.log.curve.rawValue),
+                    flip180: interfaceFlipped != frame.flipped180 ? 1 : 0
                 )
                 renderEncoder.setFragmentBytes(&uniforms, length: MemoryLayout<DisplayUniforms>.stride, index: 0)
                 
                 // Draw full-screen triangle
                 renderEncoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
                 renderEncoder.endEncoding()
+                commandBuffer.addCompletedHandler { [log = frame.log] _ in withExtendedLifetime(log) {} }
             }
  
             commandBuffer.present(drawable)

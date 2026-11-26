@@ -3,7 +3,6 @@ import MetalKit
 import CoreVideo
 import simd
 import os
-import UIKit
 
 /// Wraps a non-Sendable value so it can be captured by a `@Sendable` closure
 /// (e.g. `MTLTexture`, `CVPixelBuffer?`, or completion callbacks inside
@@ -12,6 +11,22 @@ import UIKit
 /// mirrors the codebase's existing `SendablePixelBuffer` idiom.
 struct SendableBox<Value>: @unchecked Sendable {
     let value: Value
+}
+
+/// A log surface is reusable only after its compute, display, and scope
+/// consumers have released their references.
+final class LogFrameTexture: @unchecked Sendable {
+    let texture: MTLTexture
+    let curve: LogCurveType
+    private let recycle: (MTLTexture) -> Void
+
+    init(texture: MTLTexture, curve: LogCurveType, recycle: @escaping (MTLTexture) -> Void) {
+        self.texture = texture
+        self.curve = curve
+        self.recycle = recycle
+    }
+
+    deinit { recycle(texture) }
 }
 
 struct DebayerParams {
@@ -85,6 +100,7 @@ struct LSCParams {
     var azimuthG: Float
     var azimuthB: Float
     var radialRolloff: Float = 0
+    var outputScale: Float = 1
 }
 
 struct CropParams {
@@ -145,20 +161,16 @@ final class MetalPipeline: @unchecked Sendable {
     private var pooledFusedW: [Int] = [0, 0, 0]
     private var pooledFusedH: [Int] = [0, 0, 0]
 
-    private var pooledSharpenTex: [MTLTexture?] = [nil, nil, nil]
-    private var pooledSharpenW: [Int] = [0, 0, 0]
-    private var pooledSharpenH: [Int] = [0, 0, 0]
+    private let availableLogTextures = OSAllocatedUnfairLock(initialState: [SendableBox<MTLTexture>]())
 
     private var pooledCorrectedBayerTex: [MTLTexture?] = [nil, nil, nil]
     private var pooledCorrectedBayerW: [Int] = [0, 0, 0]
     private var pooledCorrectedBayerH: [Int] = [0, 0, 0]
 
-    private var pooledScaleTex: [MTLTexture?] = [nil, nil, nil]
-    private var pooledScaleW: [Int] = [0, 0, 0]
-    private var pooledScaleH: [Int] = [0, 0, 0]
     private var pooledScopeTex: MTLTexture?
     private var pooledScopeW: Int = 0
     private var pooledScopeH: Int = 0
+    private let scopeInFlight = OSAllocatedUnfairLock(initialState: false)
     
     private var pixelBufferPool: CVPixelBufferPool?
     private var pixelBufferPoolW: Int = 0
@@ -260,8 +272,6 @@ final class MetalPipeline: @unchecked Sendable {
     /// Dynamic sensor-crop zoom factor (1.0 = native full sensor, up to 2.0 = lossless 1:1 sensor crop).
     var zoomFactor: Float = 1.0
 
-    /// Active interface orientation: when .landscapeLeft, the pipeline inverts the 180° sensor image so preview and recording are natively upright.
-    var orientation: UIInterfaceOrientation = .landscapeRight
 
     init?(customLibraryURL: URL? = nil) {
         guard let device = MTLCreateSystemDefaultDevice(),
@@ -273,7 +283,7 @@ final class MetalPipeline: @unchecked Sendable {
               let convertYpCbCr10Func = library.makeFunction(name: "convertRgbTo420YpCbCr10"),
               let convertYpCbCr422Func = library.makeFunction(name: "convertRgbTo422YpCbCr10"),
               let defectPixelFunc = library.makeFunction(name: "correctDefectPixelsBayer"),
-              let logEncodeFunc = library.makeFunction(name: "applyLogOETF"),
+              let logEncodeFunc = library.makeFunction(name: "cropAndEncodeLog"),
               let cropAndResampleFunc = library.makeFunction(name: "cropAndResampleCatmullRom") else {
             return nil
         }
@@ -341,20 +351,23 @@ final class MetalPipeline: @unchecked Sendable {
         return tex
     }
 
-    private func getOrCreateSharpenTexture(width: Int, height: Int, slot: Int = 0) -> MTLTexture? {
-        let i = slot % poolSlotCount
-        if let tex = pooledSharpenTex[i], pooledSharpenW[i] == width, pooledSharpenH[i] == height {
-            return tex
+    private func acquireLogTexture(width: Int, height: Int, curve: LogCurveType) -> LogFrameTexture? {
+        let cached = availableLogTextures.withLock { textures -> SendableBox<MTLTexture>? in
+            guard let index = textures.lastIndex(where: { $0.value.width == width && $0.value.height == height }) else {
+                return nil
+            }
+            textures.swapAt(index, textures.count - 1)
+            return textures.removeLast()
         }
-        let desc = MTLTextureDescriptor.texture2DDescriptor(
-            pixelFormat: .rgba16Float, width: width, height: height, mipmapped: false)
-        desc.usage = [.shaderWrite, .shaderRead]
-        desc.storageMode = .private
-        guard let tex = device.makeTexture(descriptor: desc) else { return nil }
-        pooledSharpenTex[i] = tex
-        pooledSharpenW[i] = width
-        pooledSharpenH[i] = height
-        return tex
+        guard let texture = cached?.value ?? makePrivateTexture(width: width, height: height) else { return nil }
+        return LogFrameTexture(texture: texture, curve: curve) { [weak self] returned in
+            guard let self else { return }
+            let box = SendableBox(value: returned)
+            self.availableLogTextures.withLock { textures in
+                if textures.count == self.poolSlotCount { textures.removeFirst() }
+                textures.append(box)
+            }
+        }
     }
 
     private func getOrCreateCorrectedBayerTexture(width: Int, height: Int, slot: Int = 0) -> MTLTexture? {
@@ -389,17 +402,7 @@ final class MetalPipeline: @unchecked Sendable {
         pooledFusedW = Array(repeating: 0, count: poolSlotCount)
         pooledFusedH = Array(repeating: 0, count: poolSlotCount)
 
-        pooledScaleTex = Array(repeating: nil, count: poolSlotCount)
-        pooledScaleW = Array(repeating: 0, count: poolSlotCount)
-        pooledScaleH = Array(repeating: 0, count: poolSlotCount)
-
-        pooledSharpenTex = Array(repeating: nil, count: poolSlotCount)
-        pooledSharpenW = Array(repeating: 0, count: poolSlotCount)
-        pooledSharpenH = Array(repeating: 0, count: poolSlotCount)
-
-        pooledScopeTex = nil
-        pooledScopeW = 0
-        pooledScopeH = 0
+        availableLogTextures.withLock { $0.removeAll() }
 
         pixelBufferPool = nil
         pixelBufferPoolW = 0
@@ -409,18 +412,6 @@ final class MetalPipeline: @unchecked Sendable {
         if let cache = textureCache {
             CVMetalTextureCacheFlush(cache, 0)
         }
-    }
-
-    private func getOrCreateScaleTexture(width: Int, height: Int, slot: Int = 0) -> MTLTexture? {
-        let i = slot % poolSlotCount
-        if let tex = pooledScaleTex[i], pooledScaleW[i] == width, pooledScaleH[i] == height {
-            return tex
-        }
-        let tex = makePrivateTexture(width: width, height: height)
-        pooledScaleTex[i] = tex
-        pooledScaleW[i] = width
-        pooledScaleH[i] = height
-        return tex
     }
 
     private func getOrCreateScopeTexture(width: Int, height: Int) -> MTLTexture? {
@@ -498,9 +489,8 @@ final class MetalPipeline: @unchecked Sendable {
                 }
                 _ = getOrCreateFusedTexture(width: workW, height: workH, slot: s)
             }
-            _ = getOrCreateScaleTexture(width: width, height: height, slot: s)
-            _ = getOrCreateSharpenTexture(width: width, height: height, slot: s)
         }
+        _ = (0..<poolSlotCount).compactMap { _ in acquireLogTexture(width: width, height: height, curve: curveType) }
     }
 
     /// Attaches standard NCLC color primaries, matrix, and transfer function metadata to pixel buffers.
@@ -544,6 +534,7 @@ final class MetalPipeline: @unchecked Sendable {
         from sourceTexture: MTLTexture,
         encodeWidth: Int,
         encodeHeight: Int,
+        curveType: LogCurveType,
         cb: MTLCommandBuffer
     ) -> (CVPixelBuffer?, [Any]) {
         if use422Encoding {
@@ -732,29 +723,19 @@ final class MetalPipeline: @unchecked Sendable {
 
     // MARK: - Main process (single-pass fused pipeline)
 
-    /// Process RAW to log RGB using the streamlined single-pass fused pipeline.
-    /// Uses CFA-preserving 2× reduction only when the reduced frame still covers the encode size.
-    /// The completion handler is called on an internal Metal queue once the GPU work finishes.
-    func process(_ pixelBuffer: CVPixelBuffer,
-                 encodeWidth: Int = 2016,
-                 encodeHeight: Int = 1512,
-                 slot: Int = 0,
-                 completion: @escaping (MTLTexture?) -> Void) {
-        process(pixelBuffer, encodeWidth: encodeWidth, encodeHeight: encodeHeight, encodeAsBGRA: false, slot: slot) { texture, _ in
-            completion(texture)
-        }
-    }
-
     func process(_ pixelBuffer: CVPixelBuffer,
                  encodeWidth: Int = 2016,
                  encodeHeight: Int = 1512,
                  encodeAsBGRA: Bool = false,
                  slot: Int = 0,
-                 completion: @escaping (MTLTexture?, CVPixelBuffer?) -> Void) {
+                 flip180: Bool = false,
+                 preferBinnedPreview: Bool = false,
+                 completion: @escaping (LogFrameTexture?, CVPixelBuffer?) -> Void) {
         let t0 = CACurrentMediaTime()
         let fullW = CVPixelBufferGetWidth(pixelBuffer)
         let fullH = CVPixelBufferGetHeight(pixelBuffer)
-        guard fullW > 0, fullH > 0 else { completion(nil, nil); return }
+        let frameCurve = curveType
+        guard fullW > 0, fullH > 0, encodeWidth > 0, encodeHeight > 0 else { completion(nil, nil); return }
         lastRawWidth = fullW
         lastRawHeight = fullH
 
@@ -768,15 +749,16 @@ final class MetalPipeline: @unchecked Sendable {
         // Sensor Sampling & Demosaic Pipeline:
         // Full 12MP optical demosaicing + Catmull-Rom downscaling delivers pristine 2x super-sampled
         // oversampling with maximum MTF, natural micro-contrast, zero Bayer moiré, and razor-sharp edges.
-        // Pre-binning (binBayerCFA) is strictly reserved as an automatic thermal fail-safe if device thermal state
-        // elevates to .serious or .critical.
+        // The Ultra Wide viewfinder can demosaic at native preview resolution.
+        // Recording still uses full RAW unless the existing thermal fallback applies.
         var bayerIn: MTLTexture
         let bayerW: Int
         let bayerH: Int
         let halfW = (fullW / 2) & ~1
         let halfH = (fullH / 2) & ~1
         let isThermalCritical = (thermalState == .critical || thermalState == .serious)
-        let shouldBinRaw = isThermalCritical && (halfW >= encodeWidth && halfH >= encodeHeight)
+        let previewFits = !encodeAsBGRA && preferBinnedPreview && zoomFactor <= 1.001
+        let shouldBinRaw = (isThermalCritical || previewFits) && halfW >= encodeWidth && halfH >= encodeHeight
         if shouldBinRaw {
             guard let halfTex = getOrCreateBinTexture(width: halfW, height: halfH, slot: slot),
                   let enc = commandBuffer.makeComputeCommandEncoder() else { completion(nil, nil); return }
@@ -820,11 +802,12 @@ final class MetalPipeline: @unchecked Sendable {
 
         // ── Single-Pass Fused Debayer: Demosaic + LSC + WB + CCM in ONE kernel ──
         // Emits scene-linear RGB so crop/scale works cleanly in linear space;
-        // the official log OETF is applied afterwards in applyLogOETF without artificial sharpening.
-        guard let fusedOut = getOrCreateFusedTexture(width: bayerW, height: bayerH, slot: slot) else {
+        // the official log OETF is applied as part of the final crop pass.
+        guard let fusedOut = getOrCreateFusedTexture(width: bayerW, height: bayerH, slot: slot),
+              let enc = commandBuffer.makeComputeCommandEncoder() else {
             completion(nil, nil); return
         }
-        if let enc = commandBuffer.makeComputeCommandEncoder() {
+        do {
             enc.setComputePipelineState(debayerFusedPipeline)
             enc.setTexture(bayerIn, index: 0)
             enc.setTexture(fusedOut, index: 1)
@@ -832,7 +815,7 @@ final class MetalPipeline: @unchecked Sendable {
                 bayerPattern: bayerPattern,
                 blackLevel: blackLevel,
                 whiteLevel: max(whiteLevel, blackLevel + 1e-6),
-                curveType: Int32(curveType.rawValue),
+                curveType: Int32(frameCurve.rawValue),
                 wbGains: wbParams.gains,
                 lscCoefficients: lscCoefficients,
                 greenBalance: greenBalance,
@@ -846,52 +829,35 @@ final class MetalPipeline: @unchecked Sendable {
             enc.endEncoding()
         }
 
-        // Final crop and scale into target aspect ratio & resolution (inverting 180° when in Landscape Left)
-        let shouldFlip180 = (orientation == .landscapeLeft)
-        let scaledTex = cropToAspectAndScale(
-            fusedOut,
-            targetWidth: encodeWidth,
-            targetHeight: encodeHeight,
-            destinationTexture: nil,
-            slot: slot,
-            flip180: shouldFlip180,
-            cb: commandBuffer
-        ) ?? fusedOut
-
-        // ── Official log OETF only (no sharpening / artificial colour) ──
-        // The scene-linear RGB is encoded directly with the published Apple Log 2 /
-        // S-Log3 OETF. This keeps 18% gray at exactly 0.18 entering the curve
-        // (48.8% IRE for Apple Log 2) without any local-contrast or colour processing.
-        let finalTex: MTLTexture
-        if let logTex = getOrCreateSharpenTexture(width: scaledTex.width, height: scaledTex.height, slot: slot),
-           let enc = commandBuffer.makeComputeCommandEncoder() {
-            enc.setComputePipelineState(logEncodePipeline)
-            enc.setTexture(scaledTex, index: 0)
-            enc.setTexture(logTex, index: 1)
-            var cType = Int32(curveType.rawValue)
-            enc.setBytes(&cType, length: MemoryLayout<Int32>.stride, index: 0)
-            dispatch(enc, width: scaledTex.width, height: scaledTex.height, threadsPerGroup: logEncodeThreads)
-            enc.endEncoding()
-            finalTex = logTex
-        } else {
-            // Allocation failure fallback: still a valid (linear) texture for preview.
-            finalTex = scaledTex
+        guard let logFrame = acquireLogTexture(width: encodeWidth, height: encodeHeight, curve: frameCurve),
+              let logEncoder = commandBuffer.makeComputeCommandEncoder() else {
+            completion(nil, nil); return
         }
+        var crop = cropParameters(sourceWidth: bayerW, sourceHeight: bayerH,
+                                  width: encodeWidth, height: encodeHeight, flip180: flip180)
+        logEncoder.setComputePipelineState(logEncodePipeline)
+        logEncoder.setTexture(fusedOut, index: 0)
+        logEncoder.setTexture(logFrame.texture, index: 1)
+        logEncoder.setBytes(&crop, length: MemoryLayout<CropParams>.stride, index: 0)
+        var cType = Int32(logFrame.curve.rawValue)
+        logEncoder.setBytes(&cType, length: MemoryLayout<Int32>.stride, index: 1)
+        dispatch(logEncoder, width: encodeWidth, height: encodeHeight, threadsPerGroup: logEncodeThreads)
+        logEncoder.endEncoding()
 
         var outputPB: CVPixelBuffer?
         var retainedCVTextures: [Any] = []
         if encodeAsBGRA {
             let encoded = encodeOutputPixelBuffer(
-                from: finalTex,
+                from: logFrame.texture,
                 encodeWidth: encodeWidth,
                 encodeHeight: encodeHeight,
+                curveType: frameCurve,
                 cb: commandBuffer
             )
             outputPB = encoded.0
             retainedCVTextures = encoded.1
         }
 
-        let finalTexBox = SendableBox(value: finalTex)
         let outputPBBox = SendableBox(value: outputPB)
         let retainedTexturesBox = SendableBox(value: retainedCVTextures)
         let completionBox = SendableBox(value: completion)
@@ -903,7 +869,7 @@ final class MetalPipeline: @unchecked Sendable {
                 print("[MetalPipeline] ERROR: Command buffer failed: \(error.localizedDescription)")
             }
             if cb.status == .completed {
-                completionBox.value(finalTexBox.value, outputPBBox.value)
+                completionBox.value(logFrame, outputPBBox.value)
             } else {
                 completionBox.value(nil, nil)
             }
@@ -919,128 +885,79 @@ final class MetalPipeline: @unchecked Sendable {
                             encodeWidth: Int = 2016,
                             encodeHeight: Int = 1512,
                             slot: Int = 0,
-                            completion: @escaping (MTLTexture?) -> Void) {
-        process(pixelBuffer, encodeWidth: encodeWidth, encodeHeight: encodeHeight, encodeAsBGRA: false, slot: slot) { texture, _ in
+                            preferBinnedPreview: Bool = false,
+                            completion: @escaping (LogFrameTexture?) -> Void) {
+        process(pixelBuffer, encodeWidth: encodeWidth, encodeHeight: encodeHeight,
+                encodeAsBGRA: false, slot: slot, preferBinnedPreview: preferBinnedPreview) { texture, _ in
             completion(texture)
         }
     }
 
-    func scale(_ texture: MTLTexture, width: Int, height: Int, destinationTexture: MTLTexture? = nil, slot: Int = 0, flip180: Bool = false, cb: MTLCommandBuffer) -> MTLTexture? {
-        return cropToAspectAndScale(texture, targetWidth: width, targetHeight: height, destinationTexture: destinationTexture, slot: slot, flip180: flip180, cb: cb)
-    }
+    private func cropParameters(sourceWidth: Int, sourceHeight: Int, width: Int, height: Int, flip180: Bool) -> CropParams {
+        let srcW = Float(sourceWidth), srcH = Float(sourceHeight)
+        let dstW = Float(width), dstH = Float(height)
+        let srcAspect = srcW / srcH, dstAspect = dstW / dstH
 
-    func cropToAspectAndScale(_ texture: MTLTexture, targetWidth: Int, targetHeight: Int, destinationTexture: MTLTexture? = nil, slot: Int = 0, flip180: Bool = false, cb: MTLCommandBuffer) -> MTLTexture? {
-        guard targetWidth > 0, targetHeight > 0 else { return nil }
-        let srcW = texture.width
-        let srcH = texture.height
-        guard srcW > 0, srcH > 0 else { return nil }
-
-        // Exact dimension match: zero-cost bypass (or fast format conversion / blit) only if not flipping 180° and at native 1.0x (unzoomed)
-        if srcW == targetWidth && srcH == targetHeight && !flip180 && zoomFactor <= 1.001 {
-            if let dst = destinationTexture {
-                if dst.pixelFormat != texture.pixelFormat {
-                    if let enc = cb.makeComputeCommandEncoder() {
-                        enc.setComputePipelineState(convertFormatPipeline)
-                        enc.setTexture(texture, index: 0)
-                        enc.setTexture(dst, index: 1)
-                        dispatch(enc, width: targetWidth, height: targetHeight, threadsPerGroup: convertFormatThreads)
-                        enc.endEncoding()
-                    }
-                } else if let blit = cb.makeBlitCommandEncoder() {
-                    blit.copy(
-                        from: texture,
-                        sourceSlice: 0, sourceLevel: 0,
-                        sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
-                        sourceSize: MTLSize(width: targetWidth, height: targetHeight, depth: 1),
-                        to: dst,
-                        destinationSlice: 0, destinationLevel: 0,
-                        destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0)
-                    )
-                    blit.endEncoding()
-                }
-                return dst
-            }
-            return texture
-        }
-
-        let srcAspect = Float(srcW) / Float(srcH)
-        let dstAspect = Float(targetWidth) / Float(targetHeight)
-
-        var baseCropW = Float(srcW)
-        var baseCropH = Float(srcH)
-
+        var cropW = srcW
+        var cropH = srcH
         if srcAspect > dstAspect + 0.001 {
-            baseCropW = (Float(srcH) * dstAspect).rounded(.toNearestOrEven)
+            cropW = (srcH * dstAspect).rounded(.toNearestOrEven)
         } else if srcAspect < dstAspect - 0.001 {
-            baseCropH = (Float(srcW) / dstAspect).rounded(.toNearestOrEven)
+            cropH = (srcW / dstAspect).rounded(.toNearestOrEven)
         }
 
-        // Lossless 1:1 sensor-crop zoom up to 2.0x (centered on optical axis)
-        let z = max(1.0, min(2.0, zoomFactor))
-        let cropW = (baseCropW / z).rounded(.toNearestOrEven)
-        let cropH = (baseCropH / z).rounded(.toNearestOrEven)
-        let originX = max(0, (Float(srcW) - cropW) * 0.5)
-        let originY = max(0, (Float(srcH) - cropH) * 0.5)
-
-        // Direct 1-pass crop & hardware-filtered resample directly into target texture!
-        // Eliminates intermediate crop blit copies (~146 MB memory bandwidth) and heavy
-        // multi-tap Lanczos sinc separable convolutions, cutting frame time by ~20ms.
-        let dst = destinationTexture ?? getOrCreateScaleTexture(width: targetWidth, height: targetHeight, slot: slot)
-        guard let dst, let enc = cb.makeComputeCommandEncoder() else { return nil }
-
-        let scaleX = cropW / Float(targetWidth)
-        let scaleY = cropH / Float(targetHeight)
-        let startX = originX + 0.5 * scaleX
-        let startY = originY + 0.5 * scaleY
-
-        // Reconstruction policy: 4×4 Catmull-Rom. At 1:1 / zoom-in it is phase-correct and
-        // exactly reconstructing; when minifying the footprint widens with the scale factor
-        // so the full source area is integrated instead of point-sampling one texel. This
-        // removes the aliasing/moiré of the old single-tap bilinear fetch while keeping the
-        // pass cheap enough for rock-solid CFR recording.
-        let pipeline = cropAndResamplePipeline
-        let threads = cropAndResampleThreads
-
-        enc.setComputePipelineState(pipeline)
-        enc.setTexture(texture, index: 0)
-        enc.setTexture(dst, index: 1)
-        var params = CropParams(scaleX: scaleX, scaleY: scaleY, startX: startX, startY: startY, flip180: flip180 ? 1 : 0)
-        enc.setBytes(&params, length: MemoryLayout<CropParams>.stride, index: 0)
-        dispatch(enc, width: targetWidth, height: targetHeight, threadsPerGroup: threads)
-        enc.endEncoding()
-
-        return dst
+        let exactNativeSize = sourceWidth == width && sourceHeight == height && !flip180 && zoomFactor <= 1.001
+        let zoom = exactNativeSize ? 1 : max(1, min(2, zoomFactor))
+        cropW = (cropW / zoom).rounded(.toNearestOrEven)
+        cropH = (cropH / zoom).rounded(.toNearestOrEven)
+        let scaleX = cropW / dstW, scaleY = cropH / dstH
+        return CropParams(scaleX: scaleX, scaleY: scaleY,
+                          startX: (srcW - cropW) * 0.5 + 0.5 * scaleX,
+                          startY: (srcH - cropH) * 0.5 + 0.5 * scaleY,
+                          flip180: flip180 ? 1 : 0)
     }
 
-    func makeScopeData(from texture: MTLTexture,
+    func makeScopeData(from frame: LogFrameTexture,
                        sampleWidth: Int = 96,
                        sampleHeight: Int = 54,
                        completion: @escaping (ScopeData?) -> Void) {
+        let canSample = scopeInFlight.withLock { busy in
+            guard !busy else { return false }
+            busy = true
+            return true
+        }
+        guard canSample else { completion(nil); return }
         let width = max(16, sampleWidth)
         let height = max(16, sampleHeight)
         guard let output = getOrCreateScopeTexture(width: width, height: height),
-              let cb = scopeCommandQueue.makeCommandBuffer() else {
+              let cb = scopeCommandQueue.makeCommandBuffer(),
+              let enc = cb.makeComputeCommandEncoder() else {
+            scopeInFlight.withLock { $0 = false }
             completion(nil)
             return
         }
 
+        let texture = frame.texture
         let scaleX = Float(texture.width) / Float(width)
         let scaleY = Float(texture.height) / Float(height)
         let startX = 0.5 * scaleX
         let startY = 0.5 * scaleY
 
-        if let enc = cb.makeComputeCommandEncoder() {
-            enc.setComputePipelineState(cropAndResamplePipeline)
-            enc.setTexture(texture, index: 0)
-            enc.setTexture(output, index: 1)
-            var params = CropParams(scaleX: scaleX, scaleY: scaleY, startX: startX, startY: startY, flip180: 0)
-            enc.setBytes(&params, length: MemoryLayout<CropParams>.stride, index: 0)
-            dispatch(enc, width: width, height: height, threadsPerGroup: cropAndResampleThreads)
-            enc.endEncoding()
-        }
+        enc.setComputePipelineState(cropAndResamplePipeline)
+        enc.setTexture(texture, index: 0)
+        enc.setTexture(output, index: 1)
+        var params = CropParams(scaleX: scaleX, scaleY: scaleY, startX: startX, startY: startY, flip180: 0)
+        enc.setBytes(&params, length: MemoryLayout<CropParams>.stride, index: 0)
+        dispatch(enc, width: width, height: height, threadsPerGroup: cropAndResampleThreads)
+        enc.endEncoding()
         let outputBox = SendableBox(value: output)
         let completionBox = SendableBox(value: completion)
-        cb.addCompletedHandler { _ in
+        cb.addCompletedHandler { [weak self, frame] command in
+            defer {
+                self?.scopeInFlight.withLock { $0 = false }
+                withExtendedLifetime(frame) {}
+            }
+            guard command.status == .completed else { completionBox.value(nil); return }
             let componentsPerPixel = 4
             let bytesPerComponent = MemoryLayout<UInt16>.stride
             let bytesPerRow = width * componentsPerPixel * bytesPerComponent
