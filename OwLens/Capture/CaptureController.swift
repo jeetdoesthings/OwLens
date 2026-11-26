@@ -230,8 +230,10 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
         let halfWidthTangent = tan(horizontalFOV * .pi / 360)
         let cornerTangentSquared = halfWidthTangent * halfWidthTangent * (1 + height * height / (width * width))
         let coefficient = min(cornerTangentSquared, sqrt(Float(3)) - 1)
-        cachedLSC = SIMD4(repeating: coefficient)
-        cachedLSC.w = 0
+        // SIMD4 stores radial r², radial r⁴, rolloff, then a spare value.
+        // Setting rolloff to the radial coefficient would suppress the very
+        // corner lift this fallback is meant to provide.
+        cachedLSC = SIMD4(coefficient, 0, 0, 0)
         print("[CaptureController] Field-of-view LSC fallback: \(horizontalFOV)° coefficient=\(coefficient)")
     }
 
