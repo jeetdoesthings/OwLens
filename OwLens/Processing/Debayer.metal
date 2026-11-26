@@ -199,6 +199,8 @@ struct LSCParams {
     float azimuthB;
     float radialRolloff;
     float outputScale;
+    int   useGainMap;
+    float4 gainMapScaleOffset;
 };
 
 
@@ -249,8 +251,9 @@ static inline BayerNeighborhood fetchBayerNeighborhood(texture2d<float, access::
 // Log encoding happens later, after crop/scale and scene-linear sharpening.
 // ──────────────────────────────────────────────────────────────────────
 kernel void debayerFusedLog(
-    texture2d<float, access::read>  rawTexture [[texture(0)]],
-    texture2d<float, access::write> outTexture [[texture(1)]],
+    texture2d<float, access::read>   rawTexture [[texture(0)]],
+    texture2d<float, access::write>  outTexture [[texture(1)]],
+    texture2d<float, access::sample> gainMapTexture [[texture(2)]],
     constant FusedParams &params   [[buffer(0)]],
     constant LSCParams &lsc       [[buffer(1)]],
     constant float3x3 &colorMatrix [[buffer(2)]],
@@ -260,6 +263,8 @@ kernel void debayerFusedLog(
 
     int x = int(gid.x);
     int y = int(gid.y);
+    float outW = float(outTexture.get_width());
+    float outH = float(outTexture.get_height());
 
     int pattern = params.bayerPattern;
     bool xEven = ((x ^ pattern) & 1) == 0;
@@ -278,20 +283,34 @@ kernel void debayerFusedLog(
     float rawMaxDN = max(nb.c00, max(max(nb.cN1, nb.cS1), max(nb.cE1, nb.cW1)));
     float rawPeak = saturate((rawMaxDN - black) * invDenom);
 
-    // ── Pre-WB Malvar-He-Cutler Channel Scaling ──
+    // Optional factory 2D DNG GainMap (per CFA plane R, Gr, Gb, B) applied before demosaicing
+    // so both vignette falloff and per-channel color shading are equalized prior to interpolation.
+    float4 gm = float4(1.0f);
+    if (lsc.useGainMap != 0) {
+        float2 sensorUV = float2(float(x) + 0.5f, float(y) + 0.5f) / float2(outW, outH);
+        float2 gmUV = sensorUV * lsc.gainMapScaleOffset.xy + lsc.gainMapScaleOffset.zw;
+        constexpr sampler gmSampler(coord::normalized, address::clamp_to_edge, filter::linear);
+        gm = max(gainMapTexture.sample(gmSampler, gmUV), float4(0.1f));
+    }
+
+    // ── Pre-WB + LSC Malvar-He-Cutler Channel Scaling ──
     // Determine CFA channel gains for the 4 neighborhood parity groups
     float3 channelScale = float3(params.wbGains.r, params.greenBalance * params.wbGains.g, params.wbGains.b) * invDenom;
+    float gmR  = gm.r;
+    float gmGr = gm.g;
+    float gmGb = gm.b;
+    float gmB  = gm.a;
     float cGain, hGain, vGain, dGain;
     if (xEven == yEven) {
-        cGain = yEven ? channelScale.r : channelScale.b;
-        hGain = channelScale.g;
-        vGain = channelScale.g;
-        dGain = yEven ? channelScale.b : channelScale.r;
+        cGain = yEven ? (channelScale.r * gmR) : (channelScale.b * gmB);
+        hGain = channelScale.g * (yEven ? gmGr : gmGb);
+        vGain = channelScale.g * (yEven ? gmGb : gmGr);
+        dGain = yEven ? (channelScale.b * gmB) : (channelScale.r * gmR);
     } else {
-        cGain = channelScale.g;
-        hGain = yEven ? channelScale.r : channelScale.b;
-        vGain = yEven ? channelScale.b : channelScale.r;
-        dGain = channelScale.g;
+        cGain = channelScale.g * (yEven ? gmGr : gmGb);
+        hGain = yEven ? (channelScale.r * gmR) : (channelScale.b * gmB);
+        vGain = yEven ? (channelScale.b * gmB) : (channelScale.r * gmR);
+        dGain = channelScale.g * (yEven ? gmGb : gmGr);
     }
 
     nb.c00 = max((nb.c00 - black) * cGain, 0.0f);
@@ -335,27 +354,27 @@ kernel void debayerFusedLog(
     g = max(g, 0.0f);
     b = max(b, 0.0f);
 
-    // Lens shading correction in uncropped sensor coordinates.
-    float outW = float(outTexture.get_width());
-    float outH = float(outTexture.get_height());
-    float dx = float(x) + 0.5f - 0.5f * outW;
-    float dy = float(y) + 0.5f - 0.5f * outH;
-    float invCornerDistSq = 4.0f / max(outW * outW + outH * outH, 1e-4f);
-    float rNormSq = (dx * dx + dy * dy) * invCornerDistSq;
+    float3 gain = float3(1.0f);
+    if (lsc.useGainMap == 0) {
+        // Fallback polynomial lens shading correction in uncropped sensor coordinates.
+        float dx = float(x) + 0.5f - 0.5f * outW;
+        float dy = float(y) + 0.5f - 0.5f * outH;
+        float invCornerDistSq = 4.0f / max(outW * outW + outH * outH, 1e-4f);
+        float rNormSq = (dx * dx + dy * dy) * invCornerDistSq;
 
-    // Exact cos⁴θ inverse gain: (1.0 + alpha * rNormSq)^2
-    float3 alphaGain = float3(lsc.radialR, lsc.radialG, lsc.radialB);
-    float3 baseGain = float3(1.0f) + alphaGain * rNormSq;
-    float3 gain = baseGain * baseGain;
-    if (lsc.radial4R != 0.0f || lsc.radial4G != 0.0f || lsc.radial4B != 0.0f) {
-        gain += float3(lsc.radial4R, lsc.radial4G, lsc.radial4B) * (rNormSq * rNormSq);
-    }
-    if (lsc.radialRolloff > 0.0f) {
-        gain = 1.0f + (gain - 1.0f) / (1.0f + lsc.radialRolloff * rNormSq);
-    }
-    if (lsc.azimuthR != 0.0f || lsc.azimuthG != 0.0f || lsc.azimuthB != 0.0f) {
-        float cos2Theta = (dx * dx - dy * dy) / max(dx * dx + dy * dy, 1e-6f);
-        gain += float3(lsc.azimuthR, lsc.azimuthG, lsc.azimuthB) * cos2Theta;
+        float3 alphaGain = float3(lsc.radialR, lsc.radialG, lsc.radialB);
+        float3 baseGain = float3(1.0f) + alphaGain * rNormSq;
+        gain = baseGain * baseGain;
+        if (lsc.radial4R != 0.0f || lsc.radial4G != 0.0f || lsc.radial4B != 0.0f) {
+            gain += float3(lsc.radial4R, lsc.radial4G, lsc.radial4B) * (rNormSq * rNormSq);
+        }
+        if (lsc.radialRolloff > 0.0f) {
+            gain = 1.0f + (gain - 1.0f) / (1.0f + lsc.radialRolloff * rNormSq);
+        }
+        if (lsc.azimuthR != 0.0f || lsc.azimuthG != 0.0f || lsc.azimuthB != 0.0f) {
+            float cos2Theta = (dx * dx - dy * dy) / max(dx * dx + dy * dy, 1e-6f);
+            gain += float3(lsc.azimuthR, lsc.azimuthG, lsc.azimuthB) * cos2Theta;
+        }
     }
     // Cap at 16x reflectance so Apple Log 2's full 12x highlight range survives the CCM;
     // the old 8x clamp silently clipped the top ~0.6 stop of speculars.

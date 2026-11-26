@@ -841,6 +841,210 @@ extension MetalPipeline {
         }
         return allPassed
     }
+
+    /// Validates DNGGainMapParser on a synthetic little-endian DNG with SubIFD + OpcodeList2 (4 Bayer GainMap
+    /// opcodes, Big-Endian payload per DNG spec) and verifies GPU flattening of a vignetted Bayer frame.
+    func runDNGGainMapTest() -> Bool {
+        var allPassed = true
+
+        // 1. Build a synthetic DNG with IFD0 -> SubIFD -> OpcodeList2 (4 Bayer GainMaps, 5x5 grid).
+        let gridW = 5
+        let gridH = 5
+        let rawW = 32
+        let rawH = 32
+
+        func appendU16LE(_ buf: inout Data, _ v: UInt16) {
+            var le = v.littleEndian
+            withUnsafeBytes(of: &le) { buf.append(contentsOf: $0) }
+        }
+        func appendU32LE(_ buf: inout Data, _ v: UInt32) {
+            var le = v.littleEndian
+            withUnsafeBytes(of: &le) { buf.append(contentsOf: $0) }
+        }
+        func appendU32BE(_ buf: inout Data, _ v: UInt32) {
+            var be = v.bigEndian
+            withUnsafeBytes(of: &be) { buf.append(contentsOf: $0) }
+        }
+        func appendF32BE(_ buf: inout Data, _ v: Float) {
+            appendU32BE(&buf, v.bitPattern)
+        }
+        func appendF64BE(_ buf: inout Data, _ v: Double) {
+            var be = v.bitPattern.bigEndian
+            withUnsafeBytes(of: &be) { buf.append(contentsOf: $0) }
+        }
+
+        // Corner gains distinct per CFA channel to test R/Gr/Gb/B routing: R=3.0, Gr=2.5, Gb=2.5, B=2.0.
+        let cornerGainByPlane: [Float] = [3.0, 2.5, 2.5, 2.0]
+        var opcodeList = Data()
+        appendU32BE(&opcodeList, 4) // 4 Bayer GainMap opcodes
+
+        let parities: [(top: UInt32, left: UInt32, plane: Int)] = [(0, 0, 0), (0, 1, 1), (1, 0, 2), (1, 1, 3)]
+        for entry in parities {
+            var payload = Data()
+            appendU32BE(&payload, entry.top)
+            appendU32BE(&payload, entry.left)
+            appendU32BE(&payload, UInt32(rawH))
+            appendU32BE(&payload, UInt32(rawW))
+            appendU32BE(&payload, 0) // Plane
+            appendU32BE(&payload, 1) // Planes
+            appendU32BE(&payload, 2) // RowPitch
+            appendU32BE(&payload, 2) // ColPitch
+            appendU32BE(&payload, UInt32(gridH))
+            appendU32BE(&payload, UInt32(gridW))
+            appendF64BE(&payload, 1.0 / Double(gridH - 1))
+            appendF64BE(&payload, 1.0 / Double(gridW - 1))
+            appendF64BE(&payload, 0.0)
+            appendF64BE(&payload, 0.0)
+            appendU32BE(&payload, 1) // MapPlanes
+            let cGain = cornerGainByPlane[entry.plane]
+            for v in 0..<gridH {
+                let dy = Float(v) / Float(gridH - 1) * 2.0 - 1.0
+                for h in 0..<gridW {
+                    let dx = Float(h) / Float(gridW - 1) * 2.0 - 1.0
+                    let rSq = min(1.0, 0.5 * (dx * dx + dy * dy))
+                    let g = 1.0 + (cGain - 1.0) * rSq
+                    appendF32BE(&payload, g)
+                }
+            }
+            appendU32BE(&opcodeList, 9) // GainMap
+            appendU32BE(&opcodeList, 0x01030000)
+            appendU32BE(&opcodeList, 0)
+            appendU32BE(&opcodeList, UInt32(payload.count))
+            opcodeList.append(payload)
+        }
+
+        // Assemble minimal TIFF with IFD0 (SubIFDs=0x014A -> SubIFD0) and SubIFD0 (OpcodeList2=0xC741)
+        var dng = Data()
+        dng.append(contentsOf: [0x49, 0x49]) // "II"
+        appendU16LE(&dng, 42)
+        appendU32LE(&dng, 8) // IFD0 at 8
+
+        let subIFDOffset: UInt32 = 8 + 2 + 12 + 4 // 26
+        appendU16LE(&dng, 1) // IFD0 count
+        appendU16LE(&dng, 0x014A); appendU16LE(&dng, 4); appendU32LE(&dng, 1); appendU32LE(&dng, subIFDOffset)
+        appendU32LE(&dng, 0) // next IFD
+
+        let opcodeListOffset = subIFDOffset + 2 + 12 + 4 // 44
+        appendU16LE(&dng, 1) // SubIFD0 count
+        appendU16LE(&dng, 0xC741); appendU16LE(&dng, 7); appendU32LE(&dng, UInt32(opcodeList.count)); appendU32LE(&dng, opcodeListOffset)
+        appendU32LE(&dng, 0) // next IFD
+        dng.append(opcodeList)
+
+        guard let parsed = DNGGainMapParser.extract(
+            fromDNGData: dng,
+            cfaPattern: 0, // RGGB
+            rawWidth: rawW,
+            rawHeight: rawH,
+            cacheID: "synthetic_test"
+        ) else {
+            print("[GainMapTest] FAIL: parser returned nil")
+            return false
+        }
+
+        let centerIdx = (gridH / 2) * gridW + (gridW / 2)
+        if abs(parsed.rgbaGains[centerIdx * 4 + 0] - 1.0) > 0.001 ||
+           abs(parsed.rgbaGains[0] - 3.0) > 0.001 ||
+           abs(parsed.rgbaGains[1] - 2.5) > 0.001 ||
+           abs(parsed.rgbaGains[3] - 2.0) > 0.001 {
+            print("[GainMapTest] FAIL: parsed GainMap corner/center mismatch")
+            allPassed = false
+        }
+
+        // 2. Run MetalPipeline on a synthetic vignetted RGGB frame matching the inverse of parsed GainMap.
+        var buffer: CVPixelBuffer?
+        let attributes = [kCVPixelBufferIOSurfacePropertiesKey: [:], kCVPixelBufferMetalCompatibilityKey: true] as CFDictionary
+        guard CVPixelBufferCreate(nil, rawW, rawH, kCVPixelFormatType_14Bayer_RGGB, attributes, &buffer) == kCVReturnSuccess,
+              let buffer, CVPixelBufferLockBaseAddress(buffer, []) == kCVReturnSuccess else {
+            return false
+        }
+        let targetLinear: Float = 0.40
+        if let base = CVPixelBufferGetBaseAddress(buffer) {
+            let stride = CVPixelBufferGetBytesPerRow(buffer)
+            for y in 0..<rawH {
+                let row = base.advanced(by: y * stride).assumingMemoryBound(to: UInt16.self)
+                let ny = Float(y) / Float(rawH - 1) * 2.0 - 1.0
+                for x in 0..<rawW {
+                    let nx = Float(x) / Float(rawW - 1) * 2.0 - 1.0
+                    let rSq = min(1.0, 0.5 * (nx * nx + ny * ny))
+                    let planeIdx = ((y & 1) << 1) | (x & 1)
+                    let cGain = cornerGainByPlane[planeIdx]
+                    let vigGain = 1.0 + (cGain - 1.0) * rSq
+                    let val = min(65535.0, max(0.0, (targetLinear / vigGain) * 65535.0))
+                    row[x] = UInt16(val.rounded())
+                }
+            }
+        }
+        CVPixelBufferUnlockBaseAddress(buffer, [])
+
+        let prevLevels = (blackLevel, whiteLevel, bayerPattern)
+        let prevNoise = (noiseShotCoeff, noiseReadCoeff, denoiseStrength)
+        let prevColor = (curveType, wbParams, lscParams, greenBalance, zoomFactor)
+        (blackLevel, whiteLevel, bayerPattern) = (0, 1, 0)
+        (noiseShotCoeff, noiseReadCoeff, denoiseStrength) = (0.0001, 0.0001, 0)
+        (curveType, wbParams, greenBalance, zoomFactor) = (.linear, .identity, 1, 1)
+        updateGainMap(parsed)
+        lscParams = LSCParams(
+            radialR: 0, radialG: 0, radialB: 0,
+            radial4R: 0, radial4G: 0, radial4B: 0,
+            azimuthR: 0, azimuthG: 0, azimuthB: 0,
+            radialRolloff: 0, outputScale: 1,
+            useGainMap: 1,
+            gainMapScaleOffset: SIMD4<Float>(parsed.uvScaleX, parsed.uvScaleY, parsed.uvOffsetX, parsed.uvOffsetY)
+        )
+        defer {
+            updateGainMap(nil)
+            (blackLevel, whiteLevel, bayerPattern) = prevLevels
+            (noiseShotCoeff, noiseReadCoeff, denoiseStrength) = prevNoise
+            (curveType, wbParams, lscParams, greenBalance, zoomFactor) = prevColor
+        }
+
+        var frame: LogFrameTexture?
+        let sem = DispatchSemaphore(value: 0)
+        processPreviewOnly(buffer, encodeWidth: rawW, encodeHeight: rawH) { result in
+            frame = result
+            sem.signal()
+        }
+        sem.wait()
+        guard let frame else { return false }
+        defer { withExtendedLifetime(frame) {} }
+
+        let out = frame.texture
+        let readbackDesc = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: out.pixelFormat, width: out.width, height: out.height, mipmapped: false)
+        readbackDesc.usage = [.shaderRead]
+        readbackDesc.storageMode = .shared
+        guard let readbackTex = device.makeTexture(descriptor: readbackDesc),
+              let cb = commandQueue.makeCommandBuffer(),
+              let blit = cb.makeBlitCommandEncoder() else { return false }
+        blit.copy(from: out, sourceSlice: 0, sourceLevel: 0, sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
+                  sourceSize: MTLSize(width: out.width, height: out.height, depth: 1),
+                  to: readbackTex, destinationSlice: 0, destinationLevel: 0, destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0))
+        blit.endEncoding()
+        cb.commit()
+        cb.waitUntilCompleted()
+
+        var bytes = [UInt16](repeating: 0, count: out.width * out.height * 4)
+        bytes.withUnsafeMutableBytes { raw in
+            readbackTex.getBytes(raw.baseAddress!, bytesPerRow: out.width * 8,
+                                 from: MTLRegionMake2D(0, 0, out.width, out.height), mipmapLevel: 0)
+        }
+        // Check corner-region (2,2) vs center (16,16) uniformity
+        for (px, py) in [(16, 16), (2, 2), (29, 29)] {
+            let i = (py * out.width + px) * 4
+            let r = Float(Float16(bitPattern: bytes[i]))
+            let g = Float(Float16(bitPattern: bytes[i + 1]))
+            let b = Float(Float16(bitPattern: bytes[i + 2]))
+            if abs(r - targetLinear) > 0.02 || abs(g - targetLinear) > 0.02 || abs(b - targetLinear) > 0.02 {
+                print("[GainMapTest] FAIL at (\(px),\(py)): got (\(r), \(g), \(b)), expected ~\(targetLinear)")
+                allPassed = false
+            }
+        }
+
+        if allPassed {
+            print("[GainMapTest] PASS: DNG OpcodeList2 parser + GPU GainMap flat-field uniformity verified")
+        }
+        return allPassed
+    }
 }
 
 #endif

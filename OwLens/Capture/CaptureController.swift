@@ -25,6 +25,7 @@ struct RawFrameData {
     let whiteLevel: Float
     let pixelFormat: OSType
     let lscCoefficients: SIMD4<Float>
+    let gainMap: DNGGainMap?
     let iso: Float
     let exposureDurationSeconds: Double
     let colorMatrix: simd_float3x3?
@@ -122,26 +123,116 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
         hardwareModel == "iPhone13,3" && camera?.deviceType == .builtInUltraWideCamera
     }
     private var cachedLSC: SIMD4<Float> = .zero
+    private let gainMapLock = OSAllocatedUnfairLock()
+    private var cachedGainMapsByLens: [String: DNGGainMap] = [:]
+    private var attemptedGainMapLenses: Set<String> = []
     private var lastWBGains: AVCaptureDevice.WhiteBalanceGains?
 
-    private func updateCachedLSC(for camera: AVCaptureDevice) {
-        // Fit to the inverse-S-Log3 luma of the supplied Open Gate stills.
-        // Use patch medians, allow a lighting gradient in the fit, and treat
-        // flat-topped patches as lower bounds. Limit the fitted gain in stops
-        // because the exports include target lighting and highlight clipping.
-        // Gain = 1 + ((1 + x*r²)² - 1 + y*r⁴) / (1 + z*r²).
-        cachedLSC = .zero
-        guard hardwareModel == "iPhone13,3", camera.position == .back else { return }
-        switch camera.deviceType {
-        case .builtInUltraWideCamera:
-            cachedLSC = SIMD4(1.545, -0.7170, 1.7668, 0) // 2.72× at the corner
-        case .builtInWideAngleCamera:
-            cachedLSC = SIMD4(0.2002, 1.0094, 0, 0) // 2.45× at the corner
-        case .builtInTelephotoCamera:
-            cachedLSC = SIMD4(0.0377, 0.3732, 0, 0) // 1.45× at the corner
-        default:
-            break
+    private static let gainMapDefaultsPrefix = "OwLens.FactoryGainMap.v1."
+
+    private func loadSavedGainMapIfNeeded(for lensID: String) {
+        guard !lensID.isEmpty else { return }
+        let shouldLoad = gainMapLock.withLock { cachedGainMapsByLens[lensID] == nil }
+        guard shouldLoad else { return }
+        let key = Self.gainMapDefaultsPrefix + hardwareModel + "." + lensID
+        guard let data = UserDefaults.standard.data(forKey: key),
+              let saved = try? JSONDecoder().decode(DNGGainMap.self, from: data) else {
+            return
         }
+        gainMapLock.withLock {
+            if cachedGainMapsByLens[lensID] == nil {
+                cachedGainMapsByLens[lensID] = saved
+            }
+        }
+        print("[CaptureController] Loaded cached factory DNG GainMap for \(lensID): \(saved.summary)")
+    }
+
+    private func extractGainMapIfNeeded(
+        from photo: AVCapturePhoto,
+        lensID: String,
+        cfaPattern: Int32,
+        rawWidth: Int,
+        rawHeight: Int
+    ) -> DNGGainMap? {
+        guard !lensID.isEmpty else { return nil }
+        let (existing, alreadyAttempted) = gainMapLock.withLock {
+            (cachedGainMapsByLens[lensID], attemptedGainMapLenses.contains(lensID))
+        }
+        if alreadyAttempted {
+            return existing
+        }
+        let recordingActive = captureLock.withLock { isRecordingMode }
+        if recordingActive {
+            return existing
+        }
+
+        gainMapLock.withLock {
+            _ = attemptedGainMapLenses.insert(lensID)
+        }
+
+        let cacheID = "\(lensID)_\(rawWidth)x\(rawHeight)"
+        let extracted: DNGGainMap? = autoreleasepool {
+            if let dng = photo.metadata["{DNG}"] as? [String: Any],
+               let opcodeData = dng["OpcodeList2"] as? Data,
+               let parsed = DNGGainMapParser.parseOpcodeList(
+                   opcodeData,
+                   cfaPattern: cfaPattern,
+                   rawWidth: rawWidth,
+                   rawHeight: rawHeight,
+                   cacheID: cacheID
+               ) {
+                return parsed
+            }
+            if let dngBytes = photo.fileDataRepresentation(),
+               let parsed = DNGGainMapParser.extract(
+                   fromDNGData: dngBytes,
+                   cfaPattern: cfaPattern,
+                   rawWidth: rawWidth,
+                   rawHeight: rawHeight,
+                   cacheID: cacheID
+               ) {
+                return parsed
+            }
+            return nil
+        }
+
+        if let extracted {
+            gainMapLock.withLock {
+                cachedGainMapsByLens[lensID] = extracted
+            }
+            let key = Self.gainMapDefaultsPrefix + hardwareModel + "." + lensID
+            if let encoded = try? JSONEncoder().encode(extracted) {
+                UserDefaults.standard.set(encoded, forKey: key)
+            }
+            print("[CaptureController] Extracted factory DNG GainMap for \(device?.localizedName ?? lensID): \(extracted.summary)")
+            return extracted
+        } else {
+            print("[CaptureController] No DNG GainMap in OpcodeList2 for \(device?.localizedName ?? lensID) — using LSC fallback")
+            return existing
+        }
+    }
+
+    private func updateCachedLSC(for camera: AVCaptureDevice) {
+        loadSavedGainMapIfNeeded(for: camera.uniqueID)
+        // Fallback for a lens whose DNG has no factory GainMap. For a rectilinear
+        // lens, cos^-4(theta) = (1 + tan^2(theta))^2. The shader's radial
+        // coefficient is tan^2(theta) at the sensor corner. Bound the estimate
+        // because field of view alone cannot describe mechanical vignetting or
+        // in-camera shading already applied to the Bayer buffer.
+        cachedLSC = .zero
+        guard camera.position == .back else { return }
+        let dimensions = CMVideoFormatDescriptionGetDimensions(camera.activeFormat.formatDescription)
+        let width = Float(dimensions.width)
+        let height = Float(dimensions.height)
+        let horizontalFOV = Float(camera.activeFormat.videoFieldOfView)
+        guard width > 0, height > 0, horizontalFOV.isFinite,
+              horizontalFOV > 0, horizontalFOV < 180 else { return }
+        let halfWidthTangent = tan(horizontalFOV * .pi / 360)
+        let cornerTangentSquared = halfWidthTangent * halfWidthTangent * (1 + height * height / (width * width))
+        let coefficient = min(cornerTangentSquared, sqrt(Float(3)) - 1)
+        cachedLSC = SIMD4(repeating: coefficient)
+        cachedLSC.w = 0
+        print("[CaptureController] Field-of-view LSC fallback: \(horizontalFOV)° coefficient=\(coefficient)")
     }
 
     // MARK: - Session Configuration
@@ -1489,6 +1580,15 @@ extension CaptureController: AVCapturePhotoCaptureDelegate {
         let white = levels.1
 
         let lsc = cachedLSC
+        let rawW = CVPixelBufferGetWidth(owned)
+        let rawH = CVPixelBufferGetHeight(owned)
+        let activeGainMap = extractGainMapIfNeeded(
+            from: photo,
+            lensID: lensID,
+            cfaPattern: cfa,
+            rawWidth: rawW,
+            rawHeight: rawH
+        )
 
         let activeGains = device?.deviceWhiteBalanceGains
         let smoothedKelvin: Float?
@@ -1552,6 +1652,7 @@ extension CaptureController: AVCapturePhotoCaptureDelegate {
             whiteLevel: white,
             pixelFormat: bufferFormat,
             lscCoefficients: lsc,
+            gainMap: activeGainMap,
             iso: currentISO,
             exposureDurationSeconds: device?.exposureDuration.seconds ?? 0,
             colorMatrix: colorMatrices.bt2020 ?? cachedColorMatrices?.bt2020,

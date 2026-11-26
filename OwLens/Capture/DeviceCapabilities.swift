@@ -127,6 +127,519 @@ struct LSCCoefficients: Sendable {
 
 extension LSCCoefficients: Codable {}
 
+// MARK: - DNGGainMap
+
+/// Factory 2D per-CFA-plane lens shading correction map parsed from Apple DNG `OpcodeList2` (`GainMap`).
+/// Channels per grid point are interleaved in `(R, Gr, Gb, B)` order.
+struct DNGGainMap: Sendable, Codable, Equatable {
+    let width: Int
+    let height: Int
+    /// Interleaved `(R, Gr, Gb, B)` gains; count == width * height * 4.
+    let rgbaGains: [Float]
+    /// Affine transform mapping normalized sensor UV `(0..1, 0..1)` to GainMap texture UV:
+    /// `texUV = sensorUV * SIMD2(uvScaleX, uvScaleY) + SIMD2(uvOffsetX, uvOffsetY)`.
+    let uvScaleX: Float
+    let uvScaleY: Float
+    let uvOffsetX: Float
+    let uvOffsetY: Float
+    /// Stable identifier for GPU texture caching.
+    let cacheID: String
+    /// Diagnostic summary (grid dims and corner gains).
+    let summary: String
+}
+
+/// Pure-Swift Adobe DNG TIFF / `OpcodeList2` (`GainMap`, Opcode ID 9) parser.
+enum DNGGainMapParser {
+    private struct ParsedGainMapOpcode {
+        let top: UInt32
+        let left: UInt32
+        let bottom: UInt32
+        let right: UInt32
+        let plane: UInt32
+        let planes: UInt32
+        let rowPitch: UInt32
+        let colPitch: UInt32
+        let mapPointsV: Int
+        let mapPointsH: Int
+        let mapSpacingV: Double
+        let mapSpacingH: Double
+        let mapOriginV: Double
+        let mapOriginH: Double
+        let mapPlanes: Int
+        let gains: [Float] // row-major [v][h][p]
+    }
+
+    private struct IFDScanResult {
+        var imageWidth: UInt32?
+        var imageHeight: UInt32?
+        var activeArea: [UInt32]?
+        var cfaPattern4: [UInt8]?
+        var opcodeList1: Data?
+        var opcodeList2: Data?
+        var opcodeList3: Data?
+        var subIFDOffsets: [UInt32] = []
+        var nextIFDOffset: UInt32 = 0
+    }
+
+    /// Extract a factory `GainMap` from raw DNG file bytes (`AVCapturePhoto.fileDataRepresentation()`).
+    static func extract(
+        fromDNGData data: Data,
+        cfaPattern: Int32,
+        rawWidth: Int,
+        rawHeight: Int,
+        cacheID: String
+    ) -> DNGGainMap? {
+        guard data.count >= 8 else { return nil }
+        let b0 = data[data.startIndex]
+        let b1 = data[data.startIndex + 1]
+        let littleEndian: Bool
+        if b0 == 0x49 && b1 == 0x49 {
+            littleEndian = true
+        } else if b0 == 0x4D && b1 == 0x4D {
+            littleEndian = false
+        } else {
+            return nil
+        }
+
+        let magic = readUInt16(data, offset: 2, littleEndian: littleEndian)
+        guard magic == 42 else { return nil }
+        let ifd0 = readUInt32(data, offset: 4, littleEndian: littleEndian)
+        guard ifd0 > 0 else { return nil }
+
+        var queue: [UInt32] = [ifd0]
+        var visited = Set<UInt32>()
+
+        while !queue.isEmpty && visited.count < 16 {
+            let offset = queue.removeFirst()
+            guard offset >= 8, !visited.contains(offset) else { continue }
+            visited.insert(offset)
+
+            guard let ifd = parseIFD(data, offset: Int(offset), littleEndian: littleEndian) else {
+                continue
+            }
+            for sub in ifd.subIFDOffsets where sub > 0 && !visited.contains(sub) {
+                queue.append(sub)
+            }
+            if ifd.nextIFDOffset > 0 && !visited.contains(ifd.nextIFDOffset) {
+                queue.append(ifd.nextIFDOffset)
+            }
+
+            let resolvedCFA = resolveCFAPattern(ifd.cfaPattern4) ?? cfaPattern
+            let resolvedW = rawWidth > 0 ? rawWidth : Int(ifd.imageWidth ?? 0)
+            let resolvedH = rawHeight > 0 ? rawHeight : Int(ifd.imageHeight ?? 0)
+
+            for listData in [ifd.opcodeList2, ifd.opcodeList1, ifd.opcodeList3].compactMap({ $0 }) {
+                if let map = parseOpcodeList(
+                    listData,
+                    cfaPattern: resolvedCFA,
+                    rawWidth: resolvedW,
+                    rawHeight: resolvedH,
+                    activeArea: ifd.activeArea,
+                    cacheID: cacheID
+                ) {
+                    return map
+                }
+            }
+        }
+        return nil
+    }
+
+    /// Parse an Adobe DNG `OpcodeList` binary blob (always Big-Endian per DNG spec) for `GainMap` opcodes (ID 9).
+    static func parseOpcodeList(
+        _ opcodeData: Data,
+        cfaPattern: Int32,
+        rawWidth: Int,
+        rawHeight: Int,
+        activeArea: [UInt32]? = nil,
+        cacheID: String
+    ) -> DNGGainMap? {
+        guard opcodeData.count >= 4 else { return nil }
+        let opcodeCount = Int(readUInt32BE(opcodeData, offset: 0))
+        guard opcodeCount > 0, opcodeCount <= 64 else { return nil }
+
+        var cursor = 4
+        var gainMaps: [ParsedGainMapOpcode] = []
+
+        for _ in 0..<opcodeCount {
+            guard cursor + 16 <= opcodeData.count else { break }
+            let opcodeID = readUInt32BE(opcodeData, offset: cursor)
+            // skip dngVersion (+4) and flags (+8)
+            let paramBytes = Int(readUInt32BE(opcodeData, offset: cursor + 12))
+            cursor += 16
+            guard paramBytes >= 0, cursor + paramBytes <= opcodeData.count else { break }
+            let payload = opcodeData.subdata(in: (opcodeData.startIndex + cursor)..<(opcodeData.startIndex + cursor + paramBytes))
+            cursor += paramBytes
+
+            if opcodeID == 9, let gm = parseGainMapOpcode(payload) {
+                gainMaps.append(gm)
+            }
+        }
+
+        guard !gainMaps.isEmpty else { return nil }
+        return assembleGainMap(
+            opcodes: gainMaps,
+            cfaPattern: cfaPattern,
+            rawWidth: rawWidth,
+            rawHeight: rawHeight,
+            activeArea: activeArea,
+            cacheID: cacheID
+        )
+    }
+
+    private static func parseGainMapOpcode(_ payload: Data) -> ParsedGainMapOpcode? {
+        guard payload.count >= 76 else { return nil }
+        let top = readUInt32BE(payload, offset: 0)
+        let left = readUInt32BE(payload, offset: 4)
+        let bottom = readUInt32BE(payload, offset: 8)
+        let right = readUInt32BE(payload, offset: 12)
+        let plane = readUInt32BE(payload, offset: 16)
+        let planes = readUInt32BE(payload, offset: 20)
+        let rowPitch = max(1, readUInt32BE(payload, offset: 24))
+        let colPitch = max(1, readUInt32BE(payload, offset: 28))
+        let mapPointsV = Int(readUInt32BE(payload, offset: 32))
+        let mapPointsH = Int(readUInt32BE(payload, offset: 36))
+        let mapSpacingV = readDoubleBE(payload, offset: 40)
+        let mapSpacingH = readDoubleBE(payload, offset: 48)
+        let mapOriginV = readDoubleBE(payload, offset: 56)
+        let mapOriginH = readDoubleBE(payload, offset: 64)
+        let mapPlanes = Int(readUInt32BE(payload, offset: 72))
+
+        guard mapPointsV >= 2, mapPointsH >= 2, mapPointsV <= 256, mapPointsH <= 256,
+              mapPlanes >= 1, mapPlanes <= 4,
+              bottom > top, right > left else {
+            return nil
+        }
+
+        let floatCount = mapPointsV * mapPointsH * mapPlanes
+        guard payload.count >= 76 + floatCount * 4 else { return nil }
+
+        var gains = [Float]()
+        gains.reserveCapacity(floatCount)
+        for i in 0..<floatCount {
+            let val = readFloatBE(payload, offset: 76 + i * 4)
+            guard val.isFinite, val >= 0.25, val <= 32.0 else { return nil }
+            gains.append(val)
+        }
+
+        return ParsedGainMapOpcode(
+            top: top, left: left, bottom: bottom, right: right,
+            plane: plane, planes: planes, rowPitch: rowPitch, colPitch: colPitch,
+            mapPointsV: mapPointsV, mapPointsH: mapPointsH,
+            mapSpacingV: mapSpacingV, mapSpacingH: mapSpacingH,
+            mapOriginV: mapOriginV, mapOriginH: mapOriginH,
+            mapPlanes: mapPlanes, gains: gains
+        )
+    }
+
+    private static func assembleGainMap(
+        opcodes: [ParsedGainMapOpcode],
+        cfaPattern: Int32,
+        rawWidth: Int,
+        rawHeight: Int,
+        activeArea: [UInt32]?,
+        cacheID: String
+    ) -> DNGGainMap? {
+        guard let base = opcodes.first else { return nil }
+        let width = base.mapPointsH
+        let height = base.mapPointsV
+        let count = width * height
+
+        let activeTop = (activeArea?.count ?? 0) >= 4 ? activeArea![0] : 0
+        let activeLeft = (activeArea?.count ?? 0) >= 4 ? activeArea![1] : 0
+
+        var planeR: [Float]?
+        var planeGr: [Float]?
+        var planeGb: [Float]?
+        var planeB: [Float]?
+
+        func extractPlane(_ op: ParsedGainMapOpcode, planeIdx: Int) -> [Float] {
+            if op.mapPointsH == width && op.mapPointsV == height {
+                var out = [Float](repeating: 1.0, count: count)
+                for v in 0..<height {
+                    for h in 0..<width {
+                        out[v * width + h] = op.gains[(v * op.mapPointsH + h) * op.mapPlanes + planeIdx]
+                    }
+                }
+                return out
+            }
+            var out = [Float](repeating: 1.0, count: count)
+            for v in 0..<height {
+                let fv = Float(v) / Float(max(1, height - 1)) * Float(op.mapPointsV - 1)
+                let v0 = min(op.mapPointsV - 1, max(0, Int(fv)))
+                let v1 = min(op.mapPointsV - 1, v0 + 1)
+                let tv = fv - Float(v0)
+                for h in 0..<width {
+                    let fh = Float(h) / Float(max(1, width - 1)) * Float(op.mapPointsH - 1)
+                    let h0 = min(op.mapPointsH - 1, max(0, Int(fh)))
+                    let h1 = min(op.mapPointsH - 1, h0 + 1)
+                    let th = fh - Float(h0)
+                    let g00 = op.gains[(v0 * op.mapPointsH + h0) * op.mapPlanes + planeIdx]
+                    let g10 = op.gains[(v0 * op.mapPointsH + h1) * op.mapPlanes + planeIdx]
+                    let g01 = op.gains[(v1 * op.mapPointsH + h0) * op.mapPlanes + planeIdx]
+                    let g11 = op.gains[(v1 * op.mapPointsH + h1) * op.mapPlanes + planeIdx]
+                    let topVal = g00 + (g10 - g00) * th
+                    let botVal = g01 + (g11 - g01) * th
+                    out[v * width + h] = topVal + (botVal - topVal) * tv
+                }
+            }
+            return out
+        }
+
+        for op in opcodes {
+            if op.rowPitch == 2 && op.colPitch == 2 && op.mapPlanes == 1 {
+                let x = Int(activeLeft + op.left)
+                let y = Int(activeTop + op.top)
+                let xEven = ((x ^ Int(cfaPattern)) & 1) == 0
+                let yEven = ((y ^ Int(cfaPattern >> 1)) & 1) == 0
+                let extracted = extractPlane(op, planeIdx: 0)
+                if xEven && yEven {
+                    planeR = extracted
+                } else if !xEven && yEven {
+                    planeGr = extracted
+                } else if xEven && !yEven {
+                    planeGb = extracted
+                } else {
+                    planeB = extracted
+                }
+            } else if op.mapPlanes == 1 {
+                let extracted = extractPlane(op, planeIdx: 0)
+                if op.planes == 1 && op.plane < 4 {
+                    switch op.plane {
+                    case 0: if planeR == nil { planeR = extracted }
+                    case 1: if planeGr == nil { planeGr = extracted }
+                    case 2: if planeGb == nil { planeGb = extracted }
+                    default: if planeB == nil { planeB = extracted }
+                    }
+                } else {
+                    if planeR == nil { planeR = extracted }
+                    if planeGr == nil { planeGr = extracted }
+                    if planeGb == nil { planeGb = extracted }
+                    if planeB == nil { planeB = extracted }
+                }
+            } else if op.mapPlanes == 3 {
+                planeR = extractPlane(op, planeIdx: 0)
+                let g = extractPlane(op, planeIdx: 1)
+                planeGr = g
+                planeGb = g
+                planeB = extractPlane(op, planeIdx: 2)
+            } else if op.mapPlanes >= 4 {
+                planeR = extractPlane(op, planeIdx: 0)
+                planeGr = extractPlane(op, planeIdx: 1)
+                planeGb = extractPlane(op, planeIdx: 2)
+                planeB = extractPlane(op, planeIdx: 3)
+            }
+        }
+
+        // Fill any missing Bayer green/color planes safely.
+        let fallbackG = planeGr ?? planeGb ?? planeR ?? planeB
+        guard let gAnchor = fallbackG else { return nil }
+        let finalGr = planeGr ?? planeGb ?? gAnchor
+        let finalGb = planeGb ?? planeGr ?? gAnchor
+        let finalR = planeR ?? gAnchor
+        let finalB = planeB ?? gAnchor
+
+        var rgba = [Float](repeating: 1.0, count: count * 4)
+        for i in 0..<count {
+            rgba[i * 4 + 0] = finalR[i]
+            rgba[i * 4 + 1] = finalGr[i]
+            rgba[i * 4 + 2] = finalGb[i]
+            rgba[i * 4 + 3] = finalB[i]
+        }
+
+        // Compute affine UV transform mapping sensor UV [0, 1] -> GainMap texel center UV.
+        let macroLeft = Double(activeLeft + (base.left & ~1))
+        let macroTop = Double(activeTop + (base.top & ~1))
+        let macroRight = Double(activeLeft + base.right)
+        let macroBottom = Double(activeTop + base.bottom)
+        let boxW = max(1.0, macroRight - macroLeft)
+        let boxH = max(1.0, macroBottom - macroTop)
+        let rW = rawWidth > 0 ? Double(rawWidth) : boxW
+        let rH = rawHeight > 0 ? Double(rawHeight) : boxH
+        let spacingH = base.mapSpacingH > 1e-9 ? base.mapSpacingH : (1.0 / Double(width - 1))
+        let spacingV = base.mapSpacingV > 1e-9 ? base.mapSpacingV : (1.0 / Double(height - 1))
+
+        let scaleX = Float((rW / boxW) / (spacingH * Double(width)))
+        let scaleY = Float((rH / boxH) / (spacingV * Double(height)))
+        let offsetX = Float((0.5 + (-macroLeft / boxW - base.mapOriginH) / spacingH) / Double(width))
+        let offsetY = Float((0.5 + (-macroTop / boxH - base.mapOriginV) / spacingV) / Double(height))
+
+        let centerIdx = (height / 2) * width + (width / 2)
+        let cornerIndices = [0, width - 1, (height - 1) * width, height * width - 1]
+        var maxCornerR: Float = 1.0
+        var maxCornerG: Float = 1.0
+        var maxCornerB: Float = 1.0
+        for ci in cornerIndices {
+            maxCornerR = max(maxCornerR, finalR[ci])
+            maxCornerG = max(maxCornerG, 0.5 * (finalGr[ci] + finalGb[ci]))
+            maxCornerB = max(maxCornerB, finalB[ci])
+        }
+        let cR = finalR[centerIdx]
+        let cG = 0.5 * (finalGr[centerIdx] + finalGb[centerIdx])
+        let cB = finalB[centerIdx]
+        let summary = String(
+            format: "%dx%d (%d op) center=(%.2f,%.2f,%.2f) cornerMax=(%.2f,%.2f,%.2f)",
+            width, height, opcodes.count, cR, cG, cB, maxCornerR, maxCornerG, maxCornerB
+        )
+
+        return DNGGainMap(
+            width: width,
+            height: height,
+            rgbaGains: rgba,
+            uvScaleX: scaleX,
+            uvScaleY: scaleY,
+            uvOffsetX: offsetX,
+            uvOffsetY: offsetY,
+            cacheID: cacheID,
+            summary: summary
+        )
+    }
+
+    private static func parseIFD(_ data: Data, offset: Int, littleEndian: Bool) -> IFDScanResult? {
+        guard offset + 2 <= data.count else { return nil }
+        let entryCount = Int(readUInt16(data, offset: offset, littleEndian: littleEndian))
+        guard entryCount > 0, entryCount <= 256, offset + 2 + entryCount * 12 + 4 <= data.count else {
+            return nil
+        }
+
+        var result = IFDScanResult()
+        for i in 0..<entryCount {
+            let entryOff = offset + 2 + i * 12
+            let tag = readUInt16(data, offset: entryOff, littleEndian: littleEndian)
+            let type = readUInt16(data, offset: entryOff + 2, littleEndian: littleEndian)
+            let count = Int(readUInt32(data, offset: entryOff + 4, littleEndian: littleEndian))
+            let valFieldOff = entryOff + 8
+
+            switch tag {
+            case 0x0100: // ImageWidth
+                result.imageWidth = readFirstIntTag(data, type: type, count: count, valFieldOff: valFieldOff, littleEndian: littleEndian)
+            case 0x0101: // ImageLength
+                result.imageHeight = readFirstIntTag(data, type: type, count: count, valFieldOff: valFieldOff, littleEndian: littleEndian)
+            case 0x014A: // SubIFDs
+                if count > 0 && count <= 16 {
+                    result.subIFDOffsets = readUInt32Array(data, type: type, count: count, valFieldOff: valFieldOff, littleEndian: littleEndian)
+                }
+            case 0xC68D: // ActiveArea
+                if count == 4 {
+                    result.activeArea = readUInt32Array(data, type: type, count: 4, valFieldOff: valFieldOff, littleEndian: littleEndian)
+                }
+            case 0x828E: // CFAPattern
+                if let bytes = readTagBytes(data, type: type, count: count, valFieldOff: valFieldOff, littleEndian: littleEndian), bytes.count >= 4 {
+                    result.cfaPattern4 = Array(bytes.prefix(4))
+                }
+            case 0xC740: // OpcodeList1
+                result.opcodeList1 = readTagBytes(data, type: type, count: count, valFieldOff: valFieldOff, littleEndian: littleEndian)
+            case 0xC741: // OpcodeList2
+                result.opcodeList2 = readTagBytes(data, type: type, count: count, valFieldOff: valFieldOff, littleEndian: littleEndian)
+            case 0xC742: // OpcodeList3
+                result.opcodeList3 = readTagBytes(data, type: type, count: count, valFieldOff: valFieldOff, littleEndian: littleEndian)
+            default:
+                break
+            }
+        }
+        result.nextIFDOffset = readUInt32(data, offset: offset + 2 + entryCount * 12, littleEndian: littleEndian)
+        return result
+    }
+
+    private static func resolveCFAPattern(_ bytes: [UInt8]?) -> Int32? {
+        guard let bytes, bytes.count >= 4 else { return nil }
+        if bytes == [0, 1, 1, 2] { return 0 } // RGGB
+        if bytes == [1, 0, 2, 1] { return 1 } // GRBG
+        if bytes == [1, 2, 0, 1] { return 2 } // GBRG
+        if bytes == [2, 1, 1, 0] { return 3 } // BGGR
+        return nil
+    }
+
+    private static func tiffTypeSize(_ type: UInt16) -> Int {
+        switch type {
+        case 1, 2, 6, 7: return 1
+        case 3, 8: return 2
+        case 4, 9, 11, 13: return 4
+        case 5, 10, 12: return 8
+        default: return 0
+        }
+    }
+
+    private static func tagDataOffset(_ data: Data, type: UInt16, count: Int, valFieldOff: Int, littleEndian: Bool) -> (offset: Int, byteCount: Int)? {
+        let unit = tiffTypeSize(type)
+        guard unit > 0, count > 0 else { return nil }
+        let byteCount = unit * count
+        guard byteCount <= 1_048_576 else { return nil }
+        if byteCount <= 4 {
+            return (valFieldOff, byteCount)
+        }
+        let ptr = Int(readUInt32(data, offset: valFieldOff, littleEndian: littleEndian))
+        guard ptr >= 0, ptr + byteCount <= data.count else { return nil }
+        return (ptr, byteCount)
+    }
+
+    private static func readTagBytes(_ data: Data, type: UInt16, count: Int, valFieldOff: Int, littleEndian: Bool) -> Data? {
+        guard let loc = tagDataOffset(data, type: type, count: count, valFieldOff: valFieldOff, littleEndian: littleEndian) else {
+            return nil
+        }
+        return data.subdata(in: (data.startIndex + loc.offset)..<(data.startIndex + loc.offset + loc.byteCount))
+    }
+
+    private static func readFirstIntTag(_ data: Data, type: UInt16, count: Int, valFieldOff: Int, littleEndian: Bool) -> UInt32? {
+        guard let loc = tagDataOffset(data, type: type, count: count, valFieldOff: valFieldOff, littleEndian: littleEndian) else {
+            return nil
+        }
+        if type == 3 {
+            return UInt32(readUInt16(data, offset: loc.offset, littleEndian: littleEndian))
+        } else if type == 4 || type == 13 {
+            return readUInt32(data, offset: loc.offset, littleEndian: littleEndian)
+        }
+        return nil
+    }
+
+    private static func readUInt32Array(_ data: Data, type: UInt16, count: Int, valFieldOff: Int, littleEndian: Bool) -> [UInt32] {
+        guard let loc = tagDataOffset(data, type: type, count: count, valFieldOff: valFieldOff, littleEndian: littleEndian) else {
+            return []
+        }
+        var out = [UInt32]()
+        out.reserveCapacity(count)
+        if type == 3 {
+            for i in 0..<count {
+                out.append(UInt32(readUInt16(data, offset: loc.offset + i * 2, littleEndian: littleEndian)))
+            }
+        } else if type == 4 || type == 13 {
+            for i in 0..<count {
+                out.append(readUInt32(data, offset: loc.offset + i * 4, littleEndian: littleEndian))
+            }
+        }
+        return out
+    }
+
+    private static func readUInt16(_ data: Data, offset: Int, littleEndian: Bool) -> UInt16 {
+        let idx = data.startIndex + offset
+        let b0 = UInt16(data[idx])
+        let b1 = UInt16(data[idx + 1])
+        return littleEndian ? (b0 | (b1 << 8)) : ((b0 << 8) | b1)
+    }
+
+    private static func readUInt32(_ data: Data, offset: Int, littleEndian: Bool) -> UInt32 {
+        let idx = data.startIndex + offset
+        let b0 = UInt32(data[idx])
+        let b1 = UInt32(data[idx + 1])
+        let b2 = UInt32(data[idx + 2])
+        let b3 = UInt32(data[idx + 3])
+        return littleEndian ? (b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)) : ((b0 << 24) | (b1 << 16) | (b2 << 8) | b3)
+    }
+
+    private static func readUInt32BE(_ data: Data, offset: Int) -> UInt32 {
+        readUInt32(data, offset: offset, littleEndian: false)
+    }
+
+    private static func readFloatBE(_ data: Data, offset: Int) -> Float {
+        Float(bitPattern: readUInt32BE(data, offset: offset))
+    }
+
+    private static func readDoubleBE(_ data: Data, offset: Int) -> Double {
+        let hi = UInt64(readUInt32BE(data, offset: offset))
+        let lo = UInt64(readUInt32BE(data, offset: offset + 4))
+        return Double(bitPattern: (hi << 32) | lo)
+    }
+}
+
 // MARK: - NoiseProfile
 
 /// Measured per-device noise model (shot + read coefficients) from dark-frame calibration.

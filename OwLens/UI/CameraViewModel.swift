@@ -2348,7 +2348,18 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
         pipeline.whiteLevel = frameData.whiteLevel
         pipeline.zoomFactor = activeZoomFactorUnsafe
 
-        pipeline.lscParams = lscOverride?.asLSCParams ?? Self.simd4ToLSCParams(frameData.lscCoefficients)
+        pipeline.updateGainMap(lscOverride == nil ? frameData.gainMap : nil)
+        if let override = lscOverride {
+            pipeline.lscParams = override.asLSCParams
+        } else if let gm = frameData.gainMap {
+            var gmParams = Self.simd4ToLSCParams(frameData.lscCoefficients)
+            gmParams.useGainMap = 1
+            gmParams.gainMapScaleOffset = SIMD4<Float>(gm.uvScaleX, gm.uvScaleY, gm.uvOffsetX, gm.uvOffsetY)
+            gmParams.outputScale = 1.0
+            pipeline.lscParams = gmParams
+        } else {
+            pipeline.lscParams = Self.simd4ToLSCParams(frameData.lscCoefficients)
+        }
         pipeline.greenBalance = 1.0
         pipeline.iso = frameData.iso
 
@@ -2435,7 +2446,10 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
                 prevW = w
                 prevH = h
             }
-            let fastPreview = frameData.isLowLatencyUltraWide && !clippingPreviewEnabled.withLock { $0 }
+            // The sensor is 4032×3024, while the viewfinder is at most 1920×1440.
+            // Reduce Bayer data before demosaicing on every lens. Keep the native
+            // sensor path when the clipping overlay needs individual sensel peaks.
+            let fastPreview = !clippingPreviewEnabled.withLock { $0 }
             pipeline.processPreviewOnly(frameData.pixelBuffer, encodeWidth: prevW, encodeHeight: prevH,
                                         slot: slot, preferBinnedPreview: fastPreview) { [weak self] log in
                 defer { completion() }

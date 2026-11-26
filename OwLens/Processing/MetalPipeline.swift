@@ -101,6 +101,8 @@ struct LSCParams {
     var azimuthB: Float
     var radialRolloff: Float = 0
     var outputScale: Float = 1
+    var useGainMap: Int32 = 0
+    var gainMapScaleOffset: SIMD4<Float> = SIMD4<Float>(1, 1, 0, 0)
 }
 
 struct CropParams {
@@ -251,6 +253,9 @@ final class MetalPipeline: @unchecked Sendable {
         radialR: 0, radialG: 0, radialB: 0,
         radial4R: 0, radial4G: 0, radial4B: 0,
         azimuthR: 0, azimuthG: 0, azimuthB: 0)
+    private let neutralGainMapTexture: MTLTexture?
+    private var cachedGainMapTexture: MTLTexture?
+    private var cachedGainMapID: String?
     var greenBalance: Float = 1.0
     var iso: Float = 0
     var noiseShotCoeff: Float = 0.012
@@ -323,6 +328,54 @@ final class MetalPipeline: @unchecked Sendable {
             return nil
         }
         CVMetalTextureCacheCreate(nil, nil, device, nil, &textureCache)
+
+        let neutralDesc = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .rgba16Float, width: 1, height: 1, mipmapped: false)
+        neutralDesc.usage = [.shaderRead]
+        neutralDesc.storageMode = .shared
+        if let neutralTex = device.makeTexture(descriptor: neutralDesc) {
+            let one = Float16(1.0).bitPattern
+            var pixel: [UInt16] = [one, one, one, one]
+            neutralTex.replace(region: MTLRegionMake2D(0, 0, 1, 1), mipmapLevel: 0, withBytes: &pixel, bytesPerRow: 8)
+            self.neutralGainMapTexture = neutralTex
+        } else {
+            self.neutralGainMapTexture = nil
+        }
+    }
+
+    func updateGainMap(_ map: DNGGainMap?) {
+        guard let map else {
+            cachedGainMapTexture = nil
+            cachedGainMapID = nil
+            return
+        }
+        if map.cacheID == cachedGainMapID, cachedGainMapTexture != nil {
+            return
+        }
+        guard map.width >= 2, map.height >= 2, map.rgbaGains.count == map.width * map.height * 4 else {
+            return
+        }
+        let desc = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .rgba16Float, width: map.width, height: map.height, mipmapped: false)
+        desc.usage = [.shaderRead]
+        desc.storageMode = .shared
+        guard let tex = device.makeTexture(descriptor: desc) else { return }
+        var packed = [UInt16](repeating: Float16(1.0).bitPattern, count: map.rgbaGains.count)
+        for i in 0..<map.rgbaGains.count {
+            packed[i] = Float16(map.rgbaGains[i]).bitPattern
+        }
+        packed.withUnsafeBytes { raw in
+            if let base = raw.baseAddress {
+                tex.replace(
+                    region: MTLRegionMake2D(0, 0, map.width, map.height),
+                    mipmapLevel: 0,
+                    withBytes: base,
+                    bytesPerRow: map.width * 8
+                )
+            }
+        }
+        cachedGainMapTexture = tex
+        cachedGainMapID = map.cacheID
     }
 
     // MARK: - Texture pool helpers
@@ -811,6 +864,7 @@ final class MetalPipeline: @unchecked Sendable {
             enc.setComputePipelineState(debayerFusedPipeline)
             enc.setTexture(bayerIn, index: 0)
             enc.setTexture(fusedOut, index: 1)
+            enc.setTexture(cachedGainMapTexture ?? neutralGainMapTexture, index: 2)
             var params = FusedParams(
                 bayerPattern: bayerPattern,
                 blackLevel: blackLevel,
