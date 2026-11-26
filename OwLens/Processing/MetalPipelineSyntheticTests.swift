@@ -7,52 +7,47 @@ import simd
 #if DEBUG
 
 extension MetalPipeline {
-    /// Creates a small Bayer RAW buffer with a single saturated pixel, runs the full
+    /// Creates a small Bayer RAW buffer with a single hot pixel below the highlight gate, runs the full
     /// pipeline, and asserts the hot pixel is corrected by the Bayer-domain defect-pixel pass.
     /// Returns true if the defect is suppressed; prints diagnostics on failure.
     func runSyntheticHotPixelTest() -> Bool {
         let width = 32
         let height = 32
-        let bytesPerRow = width * 2
-
-        var rawBytes = [UInt16](repeating: 4096, count: width * height)
-        // Inject a single saturated pixel near the center.
         let hotX = width / 2
         let hotY = height / 2
-        rawBytes[hotY * width + hotX] = 65535
-
-        let pixelBuffer: CVPixelBuffer? = rawBytes.withUnsafeBytes { ptr in
-            var pixelBuffer: CVPixelBuffer?
-            let status = CVPixelBufferCreateWithBytes(
-                kCFAllocatorDefault,
-                width, height,
-                kCVPixelFormatType_14Bayer_RGGB,
-                UnsafeMutableRawPointer(mutating: ptr.baseAddress!),
-                bytesPerRow,
-                nil, nil,
-                nil,
-                &pixelBuffer
-            )
-            return status == kCVReturnSuccess ? pixelBuffer : nil
-        }
-
-        guard let buffer = pixelBuffer else {
+        let background: UInt16 = 4096
+        guard let buffer = makeSyntheticBayerBuffer(width: width, height: height, background: background,
+                                                    hotPixel: (hotX, hotY, 26_214)) else {
             print("[SyntheticTest] failed to create pixel buffer")
             return false
         }
 
-        // Run through the production pipeline at native resolution.
-        var output: MTLTexture?
+        let previousLevels = (blackLevel, whiteLevel, bayerPattern)
+        let previousNoise = (noiseShotCoeff, noiseReadCoeff, denoiseStrength)
+        let previousColor = (curveType, wbParams, lscParams, greenBalance, zoomFactor)
+        (blackLevel, whiteLevel, bayerPattern) = (0, 1, 0)
+        (noiseShotCoeff, noiseReadCoeff, denoiseStrength) = (0.0001, 0.0001, 1)
+        (curveType, wbParams, greenBalance, zoomFactor) = (.linear, .identity, 1, 1)
+        lscParams = LSCParams(radialR: 0, radialG: 0, radialB: 0, radial4R: 0, radial4G: 0, radial4B: 0,
+                            azimuthR: 0, azimuthG: 0, azimuthB: 0)
+        defer {
+            (blackLevel, whiteLevel, bayerPattern) = previousLevels
+            (noiseShotCoeff, noiseReadCoeff, denoiseStrength) = previousNoise
+            (curveType, wbParams, lscParams, greenBalance, zoomFactor) = previousColor
+        }
+        var frame: LogFrameTexture?
         let sem = DispatchSemaphore(value: 0)
-        process(buffer, encodeWidth: width, encodeHeight: height) { result in
-            output = result
+        processPreviewOnly(buffer, encodeWidth: width, encodeHeight: height) { result in
+            frame = result
             sem.signal()
         }
         sem.wait()
-        guard let output else {
+        guard let frame else {
             print("[SyntheticTest] process returned nil")
             return false
         }
+        defer { withExtendedLifetime(frame) {} }
+        let output = frame.texture
 
         // Read back the center region and the hot pixel location.
         // The production pipeline returns a private texture; blit to a shared staging texture
@@ -85,6 +80,7 @@ extension MetalPipeline {
         blit.endEncoding()
         readbackCB.commit()
         readbackCB.waitUntilCompleted()
+        guard readbackCB.status == .completed else { return false }
 
         outputBytes.withUnsafeMutableBytes { raw in
             readbackTex.getBytes(raw.baseAddress!,
@@ -93,8 +89,7 @@ extension MetalPipeline {
                            mipmapLevel: 0)
         }
 
-        // The hot pixel in Bayer space maps to a small block in the output; ensure no
-        // channel is clipped near 1.0 in the center region.
+        // Inspect the full region affected by the demosaic neighborhood.
         let regionHalf = 2
         var maxValue: Float = 0
         var minValue: Float = Float.infinity
@@ -109,9 +104,8 @@ extension MetalPipeline {
             }
         }
 
-        // Background was 4096/65535 ≈ 0.0625; a 65535 hot pixel should be suppressed
-        // from 1.0 to residual energy below 0.6 after DPC correction + demosaic.
-        let passed = maxValue < 0.6
+        let expected = Float(background) / 65_535
+        let passed = abs(maxValue - expected) < 0.005 && abs(minValue - expected) < 0.005
         if !passed {
             // Find the exact pixel with the max value for debugging
             for y in max(0, hotY - regionHalf)..<min(readH, hotY + regionHalf + 1) {
@@ -120,7 +114,7 @@ extension MetalPipeline {
                     let r = Float(Float16(bitPattern: outputBytes[idx]))
                     let g = Float(Float16(bitPattern: outputBytes[idx + 1]))
                     let b = Float(Float16(bitPattern: outputBytes[idx + 2]))
-                    if max(r, max(g, b)) > 0.5 {
+                    if max(abs(r - expected), max(abs(g - expected), abs(b - expected))) > 0.005 {
                         print("[SyntheticTest]   pixel (\(x),\(y)) r=\(r) g=\(g) b=\(b)")
                     }
                 }
@@ -128,6 +122,26 @@ extension MetalPipeline {
         }
         print("[SyntheticTest] hot pixel region min=\(minValue) max=\(maxValue) — \(passed ? "PASS" : "FAIL")")
         return passed
+    }
+
+    private func makeSyntheticBayerBuffer(width: Int, height: Int, background: UInt16,
+                                          hotPixel: (x: Int, y: Int, value: UInt16)? = nil) -> CVPixelBuffer? {
+        var buffer: CVPixelBuffer?
+        let attributes = [kCVPixelBufferIOSurfacePropertiesKey: [:], kCVPixelBufferMetalCompatibilityKey: true] as CFDictionary
+        guard CVPixelBufferCreate(nil, width, height, kCVPixelFormatType_14Bayer_RGGB, attributes, &buffer) == kCVReturnSuccess,
+              let buffer, CVPixelBufferLockBaseAddress(buffer, []) == kCVReturnSuccess else { return nil }
+        defer { CVPixelBufferUnlockBaseAddress(buffer, []) }
+        guard let base = CVPixelBufferGetBaseAddress(buffer) else { return nil }
+        let stride = CVPixelBufferGetBytesPerRow(buffer)
+        for y in 0..<height {
+            let row = base.advanced(by: y * stride).assumingMemoryBound(to: UInt16.self)
+            for x in 0..<width { row[x] = background }
+        }
+        if let hotPixel {
+            let row = base.advanced(by: hotPixel.y * stride).assumingMemoryBound(to: UInt16.self)
+            row[hotPixel.x] = hotPixel.value
+        }
+        return buffer
     }
 
     /// Verifies Apple Log 2 transfer function accuracy against the published Apple Log White Paper reference values.
@@ -526,24 +540,7 @@ extension MetalPipeline {
     func runPipelineThroughputBenchmark() -> Bool {
         let width = 1920
         let height = 1080
-        let bytesPerRow = width * 2
-        let rawBytes = [UInt16](repeating: 4096, count: width * height)
-
-        let pixelBuffer: CVPixelBuffer? = rawBytes.withUnsafeBytes { ptr in
-            var pb: CVPixelBuffer?
-            let status = CVPixelBufferCreateWithBytes(
-                kCFAllocatorDefault,
-                width, height,
-                kCVPixelFormatType_14Bayer_RGGB,
-                UnsafeMutableRawPointer(mutating: ptr.baseAddress!),
-                bytesPerRow,
-                nil, nil, nil,
-                &pb
-            )
-            return status == kCVReturnSuccess ? pb : nil
-        }
-
-        guard let buffer = pixelBuffer else {
+        guard let buffer = makeSyntheticBayerBuffer(width: width, height: height, background: 4096) else {
             print("[ThroughputBenchmark] Failed to create synthetic pixel buffer")
             return false
         }
@@ -578,16 +575,26 @@ extension MetalPipeline {
         let verifySem = DispatchSemaphore(value: 0)
         let oldCurve = self.curveType
         self.curveType = .appleLog2
-        process(buffer, encodeWidth: width, encodeHeight: height, encodeAsBGRA: true) { _, pb in
-            if let pb = pb {
+        process(buffer, encodeWidth: width, encodeHeight: height, encodeAsBGRA: true) { frame, pb in
+            if let pb {
                 let fmt = CVPixelBufferGetPixelFormatType(pb)
                 let is10Bit = (fmt == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange)
                 let planeCount = CVPixelBufferGetPlaneCount(pb)
-                let hasBT2020 = CVBufferCopyAttachment(pb, kCVImageBufferColorPrimariesKey, nil) != nil
-                if is10Bit && planeCount == 2 && hasBT2020 {
-                    print("[ThroughputBenchmark] PASS: Pipeline correctly produced 10-bit YCbCr 4:2:0 CVPixelBuffer with BT.2020 metadata")
+                let hasBT2020Matrix = CVBufferCopyAttachment(pb, kCVImageBufferYCbCrMatrixKey, nil)
+                    .map { CFEqual($0, kCVImageBufferYCbCrMatrix_ITU_R_2020) } ?? false
+                let primaries = CVBufferCopyAttachment(pb, kCVImageBufferColorPrimariesKey, nil)
+                let hasCorrectLogTag: Bool
+                if #available(iOS 26.0, macOS 26.0, *) {
+                    hasCorrectLogTag = CVBufferCopyAttachment(pb, kCVImageBufferLogTransferFunctionKey, nil)
+                        .map { CFEqual($0, kCVImageBufferLogTransferFunction_AppleLog2) } ?? false
                 } else {
-                    print("[ThroughputBenchmark] FAIL: Expected 10-bit bi-planar YCbCr, got fmt=\(fmt) planes=\(planeCount)")
+                    hasCorrectLogTag = CVBufferCopyAttachment(pb, "LogTransferFunction" as CFString, nil) == nil
+                }
+                if is10Bit && planeCount == 2 && frame?.curve == .appleLog2 &&
+                   hasBT2020Matrix && primaries == nil && hasCorrectLogTag {
+                    print("[ThroughputBenchmark] PASS: Apple Log 2 10-bit YCbCr 4:2:0 format and metadata")
+                } else {
+                    print("[ThroughputBenchmark] FAIL: Unexpected Apple Log 2 format or metadata, fmt=\(fmt) planes=\(planeCount)")
                     pass = false
                 }
             } else {
