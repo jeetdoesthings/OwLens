@@ -2360,6 +2360,10 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
         } else {
             pipeline.lscParams = Self.simd4ToLSCParams(frameData.lscCoefficients)
         }
+        // Apple RAW can keep sensor DN nearly constant as ISO rises and express
+        // the remaining exposure in DNG BaselineExposure (EV). Apply that
+        // per-frame rendering instruction in scene-linear light before the log OETF.
+        pipeline.lscParams.outputScale *= exp2(frameData.baselineExposureStops)
         pipeline.greenBalance = 1.0
         pipeline.iso = frameData.iso
 

@@ -27,6 +27,7 @@ struct RawFrameData {
     let lscCoefficients: SIMD4<Float>
     let gainMap: DNGGainMap?
     let iso: Float
+    let baselineExposureStops: Float
     let exposureDurationSeconds: Double
     let colorMatrix: simd_float3x3?
     let sgamutMatrix: simd_float3x3?
@@ -1580,6 +1581,11 @@ extension CaptureController: AVCapturePhotoCaptureDelegate {
         
         let black = levels.0
         let white = levels.1
+        let dngMetadata = photo.metadata["{DNG}"] as? [String: Any]
+        let baselineExposure = Self.floatFromMetadata(dngMetadata?["BaselineExposure"]) ?? 0
+        let baselineOffset = Self.floatFromMetadata(dngMetadata?["BaselineExposureOffset"]) ?? 0
+        let exposureStops = baselineExposure + baselineOffset
+        let baselineExposureStops = exposureStops.isFinite ? exposureStops : 0
 
         let lsc = cachedLSC
         let rawW = CVPixelBufferGetWidth(owned)
@@ -1656,6 +1662,7 @@ extension CaptureController: AVCapturePhotoCaptureDelegate {
             lscCoefficients: lsc,
             gainMap: activeGainMap,
             iso: currentISO,
+            baselineExposureStops: baselineExposureStops,
             exposureDurationSeconds: device?.exposureDuration.seconds ?? 0,
             colorMatrix: colorMatrices.bt2020 ?? cachedColorMatrices?.bt2020,
             sgamutMatrix: colorMatrices.sgamut ?? cachedColorMatrices?.sgamut,
