@@ -217,9 +217,9 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
         loadSavedGainMapIfNeeded(for: camera.uniqueID)
         // Fallback for a lens whose DNG has no factory GainMap. For a rectilinear
         // lens, cos^-4(theta) = (1 + tan^2(theta))^2. The shader's radial
-        // coefficient is tan^2(theta) at the sensor corner. Bound the estimate
-        // because field of view alone cannot describe mechanical vignetting or
-        // in-camera shading already applied to the Bayer buffer.
+        // coefficient is tan^2(theta) at the sensor corner. In particular,
+        // capping this at a 3x corner gain leaves ultra-wide RAW severely
+        // under-corrected: its optical cos^4 falloff can be much larger.
         cachedLSC = .zero
         guard camera.position == .back else { return }
         let dimensions = CMVideoFormatDescriptionGetDimensions(camera.activeFormat.formatDescription)
@@ -230,7 +230,9 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
               horizontalFOV > 0, horizontalFOV < 180 else { return }
         let halfWidthTangent = tan(horizontalFOV * .pi / 360)
         let cornerTangentSquared = halfWidthTangent * halfWidthTangent * (1 + height * height / (width * width))
-        let coefficient = min(cornerTangentSquared, sqrt(Float(3)) - 1)
+        // Keep the estimate finite for fisheye-like formats where a
+        // rectilinear field-of-view model stops being physically meaningful.
+        let coefficient = min(cornerTangentSquared, 3.0)
         // SIMD4 stores radial r², radial r⁴, rolloff, then a spare value.
         // Setting rolloff to the radial coefficient would suppress the very
         // corner lift this fallback is meant to provide.
