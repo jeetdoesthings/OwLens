@@ -291,12 +291,29 @@ final class VideoWriter: @unchecked Sendable {
         print("[VideoWriter] CFR \(Int(fps))fps \(width)x\(height) codec=\(resolvedCodec.displayName) bitrate=\(bitrate) orientation=\(orientation.rawValue)")
     }
 
-    private func drainPendingAudioBuffersLocked(upTo maxPTS: CMTime? = nil) {
-        guard let input = audioInput else { return }
+    private func drainPendingAudioBuffersLocked(trimFinalBuffer: Bool = false) {
+        guard let input = audioInput, lastVideoPTS.isNumeric else { return }
+        let videoEnd = CMTimeAdd(lastVideoPTS, frameDuration)
         var drainedCount = 0
         for buffer in pendingAudioBuffers {
             let pts = CMSampleBufferGetPresentationTimeStamp(buffer)
-            if let maxPTS, maxPTS.isNumeric, pts >= maxPTS {
+            let duration = CMSampleBufferGetDuration(buffer)
+            let end = duration.isNumeric ? CMTimeAdd(pts, duration) : pts
+            if pts >= videoEnd { break }
+            if end > videoEnd {
+                guard trimFinalBuffer, input.isReadyForMoreMediaData else { break }
+                let count = CMSampleBufferGetNumSamples(buffer)
+                let remaining = CMTimeSubtract(videoEnd, pts)
+                let keep = Int((remaining.seconds / duration.seconds * Double(count)).rounded(.down))
+                if keep > 0, keep < count {
+                    var trimmed: CMSampleBuffer?
+                    if CMSampleBufferCopySampleBufferForRange(
+                        allocator: kCFAllocatorDefault, sampleBuffer: buffer,
+                        sampleRange: CFRange(location: 0, length: keep), sampleBufferOut: &trimmed
+                    ) == noErr, let trimmed {
+                        _ = input.append(trimmed)
+                    }
+                }
                 break
             }
             guard input.isReadyForMoreMediaData, input.append(buffer) else { break }
@@ -595,7 +612,7 @@ final class VideoWriter: @unchecked Sendable {
     }
 
     private func enqueueRetimedAudioLocked(_ source: CMSampleBuffer) -> Bool {
-        guard let input = audioInput, sessionStartTime.isNumeric else { return false }
+        guard audioInput != nil, sessionStartTime.isNumeric else { return false }
         var buffer = source
         let sourcePTS = CMSampleBufferGetPresentationTimeStamp(buffer)
         guard sourcePTS.isNumeric else { return false }
@@ -643,13 +660,10 @@ final class VideoWriter: @unchecked Sendable {
             sampleTimingEntryCount: count, sampleTimingArray: &timings, sampleBufferOut: &retimed
         ) == noErr, let retimed else { return false }
 
-        if pendingAudioBuffers.isEmpty, input.isReadyForMoreMediaData {
-            guard input.append(retimed) else { return false }
-        } else {
-            guard pendingAudioBuffers.count < maxPendingAudioBuffers else { return false }
-            pendingAudioBuffers.append(retimed)
-        }
+        guard pendingAudioBuffers.count < maxPendingAudioBuffers else { return false }
+        pendingAudioBuffers.append(retimed)
         lastAudioPTS = previousPTS
+        drainPendingAudioBuffersLocked()
         return true
     }
 
@@ -675,8 +689,8 @@ final class VideoWriter: @unchecked Sendable {
             videoEndTime = .invalid
         }
 
-        if let _ = audioInput, videoEndTime.isValid {
-            drainPendingAudioBuffersLocked(upTo: videoEndTime)
+        if videoEndTime.isNumeric {
+            drainPendingAudioBuffersLocked(trimFinalBuffer: true)
         }
         pendingAudioBuffers.removeAll()
         prerollAudioBuffers.removeAll()

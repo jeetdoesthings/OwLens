@@ -208,6 +208,7 @@ enum DNGGainMapParser {
 
         var queue: [UInt32] = [ifd0]
         var visited = Set<UInt32>()
+        var radialFallback: DNGGainMap?
 
         while !queue.isEmpty && visited.count < 16 {
             let offset = queue.removeFirst()
@@ -240,8 +241,79 @@ enum DNGGainMapParser {
                     return map
                 }
             }
+            if radialFallback == nil, let list = ifd.opcodeList3,
+               let width = ifd.imageWidth, let height = ifd.imageHeight {
+                radialFallback = radialVignetteMap(list, storedWidth: Int(width), storedHeight: Int(height),
+                                                   rawWidth: resolvedW, rawHeight: resolvedH,
+                                                   activeArea: ifd.activeArea, cacheID: cacheID)
+            }
         }
-        return nil
+        return radialFallback
+    }
+
+    // OpcodeList3 operates on the demosaiced active image. Represent the radial
+    // brightness function on the same sensor-space grid used by the Metal path.
+    private static func radialVignetteMap(
+        _ list: Data, storedWidth: Int, storedHeight: Int,
+        rawWidth: Int, rawHeight: Int, activeArea: [UInt32]?, cacheID: String
+    ) -> DNGGainMap? {
+        guard list.count >= 4, storedWidth > 0, storedHeight > 0 else { return nil }
+        let count = Int(readUInt32BE(list, offset: 0))
+        guard (1...64).contains(count) else { return nil }
+        var cursor = 4
+        var parameters: [Double]?
+        for _ in 0..<count {
+            guard cursor + 16 <= list.count else { return nil }
+            let id = readUInt32BE(list, offset: cursor)
+            let size = Int(readUInt32BE(list, offset: cursor + 12))
+            cursor += 16
+            guard size <= list.count - cursor else { return nil }
+            if id == 3 {
+                guard size == 56, parameters == nil else { return nil }
+                parameters = (0..<7).map { readDoubleBE(list, offset: cursor + $0 * 8) }
+            }
+            cursor += size
+        }
+        guard let coefficients = parameters, coefficients.allSatisfy(\.isFinite),
+              (0...1).contains(coefficients[5]), (0...1).contains(coefficients[6]) else { return nil }
+
+        let area = activeArea?.map(Int.init) ?? [0, 0, storedHeight, storedWidth]
+        guard area.count == 4, area[0] < area[2], area[1] < area[3],
+              area[2] <= storedHeight, area[3] <= storedWidth else { return nil }
+        let width = area[3] - area[1], height = area[2] - area[0]
+        let originX: Int, originY: Int
+        if rawWidth == width, rawHeight == height {
+            originX = 0
+            originY = 0
+        } else if rawWidth == storedWidth, rawHeight == storedHeight {
+            originX = area[1]
+            originY = area[0]
+        } else {
+            return nil
+        }
+
+        let centerX = Double(width) * coefficients[5]
+        let centerY = Double(height) * coefficients[6]
+        let radius = hypot(max(centerX, Double(width) - centerX), max(centerY, Double(height) - centerY))
+        let side = 65
+        var gains = [Float]()
+        gains.reserveCapacity(side * side * 4)
+        for row in 0..<side {
+            for column in 0..<side {
+                let x = min(Double(width), max(0, Double(column * rawWidth) / Double(side - 1) - Double(originX)))
+                let y = min(Double(height), max(0, Double(row * rawHeight) / Double(side - 1) - Double(originY)))
+                let r = hypot(x - centerX, y - centerY) / radius
+                let r2 = r * r
+                let gain = 1 + coefficients.prefix(5).reversed().reduce(0.0) { r2 * ($0 + $1) }
+                guard gain.isFinite, gain >= 0.1, gain <= 16 else { return nil }
+                for _ in 0..<4 { gains.append(Float(gain)) }
+            }
+        }
+        let scale = Float(side - 1) / Float(side)
+        let offset = 0.5 / Float(side)
+        return DNGGainMap(width: side, height: side, rgbaGains: gains,
+                          uvScaleX: scale, uvScaleY: scale, uvOffsetX: offset, uvOffsetY: offset,
+                          cacheID: cacheID, summary: "DNG FixVignetteRadial • peak \(gains.max() ?? 1)×")
     }
 
     /// Parse an Adobe DNG `OpcodeList` binary blob (always Big-Endian per DNG spec) for `GainMap` opcodes (ID 9).
@@ -530,7 +602,7 @@ enum DNGGainMapParser {
                 result.opcodeList1 = readTagBytes(data, type: type, count: count, valFieldOff: valFieldOff, littleEndian: littleEndian)
             case 0xC741: // OpcodeList2
                 result.opcodeList2 = readTagBytes(data, type: type, count: count, valFieldOff: valFieldOff, littleEndian: littleEndian)
-            case 0xC742: // OpcodeList3
+            case 0xC74E: // OpcodeList3 (51022)
                 result.opcodeList3 = readTagBytes(data, type: type, count: count, valFieldOff: valFieldOff, littleEndian: littleEndian)
             default:
                 break

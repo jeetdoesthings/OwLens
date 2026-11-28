@@ -686,9 +686,6 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
         }
         captureController.sharedCommandQueue = pipeline?.commandQueue
         startClockAndBatteryMonitoring()
-#if DEBUG
-        // Automated unit tests and benchmarks are invoked via test suites rather than on camera startup.
-#endif
         loadFilesFolderBookmark()
         if let savedDenoise = UserDefaults.standard.object(forKey: "OwLens.DenoiseStrength") as? Float {
             denoiseStrength = savedDenoise
@@ -2348,10 +2345,10 @@ final class CameraViewModel: NSObject, ObservableObject, UIDocumentPickerDelegat
         pipeline.whiteLevel = frameData.whiteLevel
         pipeline.zoomFactor = activeZoomFactorUnsafe
 
-        pipeline.updateGainMap(lscOverride == nil ? frameData.gainMap : nil)
+        let hasGainMapTexture = pipeline.updateGainMap(lscOverride == nil ? frameData.gainMap : nil)
         if let override = lscOverride {
             pipeline.lscParams = override.asLSCParams
-        } else if let gm = frameData.gainMap {
+        } else if hasGainMapTexture, let gm = frameData.gainMap {
             var gmParams = Self.simd4ToLSCParams(frameData.lscCoefficients)
             gmParams.useGainMap = 1
             gmParams.gainMapScaleOffset = SIMD4<Float>(gm.uvScaleX, gm.uvScaleY, gm.uvOffsetX, gm.uvOffsetY)

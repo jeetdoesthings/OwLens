@@ -222,10 +222,6 @@ final class MetalPipeline: @unchecked Sendable {
             return (avg, minVal, maxVal, log)
         }
 
-        #if DEBUG
-        print(String(format: "[MetalPipeline] frame time: %.2f ms", ms))
-        #endif
-
         if shouldLog {
             let effectiveFPS = avg > 0 ? (1000.0 / avg) : 0.0
             let headroom30 = 33.33 - avg
@@ -343,23 +339,26 @@ final class MetalPipeline: @unchecked Sendable {
         }
     }
 
-    func updateGainMap(_ map: DNGGainMap?) {
+    @discardableResult
+    func updateGainMap(_ map: DNGGainMap?) -> Bool {
         guard let map else {
             cachedGainMapTexture = nil
             cachedGainMapID = nil
-            return
+            return false
         }
         if map.cacheID == cachedGainMapID, cachedGainMapTexture != nil {
-            return
+            return true
         }
+        cachedGainMapTexture = nil
+        cachedGainMapID = nil
         guard map.width >= 2, map.height >= 2, map.rgbaGains.count == map.width * map.height * 4 else {
-            return
+            return false
         }
         let desc = MTLTextureDescriptor.texture2DDescriptor(
             pixelFormat: .rgba16Float, width: map.width, height: map.height, mipmapped: false)
         desc.usage = [.shaderRead]
         desc.storageMode = .shared
-        guard let tex = device.makeTexture(descriptor: desc) else { return }
+        guard let tex = device.makeTexture(descriptor: desc) else { return false }
         var packed = [UInt16](repeating: Float16(1.0).bitPattern, count: map.rgbaGains.count)
         for i in 0..<map.rgbaGains.count {
             packed[i] = Float16(map.rgbaGains[i]).bitPattern
@@ -376,6 +375,7 @@ final class MetalPipeline: @unchecked Sendable {
         }
         cachedGainMapTexture = tex
         cachedGainMapID = map.cacheID
+        return true
     }
 
     // MARK: - Texture pool helpers

@@ -828,7 +828,10 @@ static inline float4 sampleCrop(
     float srcY = metal::fma(effectiveY, crop.scaleY, crop.startY);
 
     float4 result;
-    if (crop.scaleX > 1.05f || crop.scaleY > 1.05f) {
+    // An aligned 2:1 reduction is an exact 2x2 box average with one bilinear tap.
+    bool alignedBox = crop.scaleX == 2.0f && crop.scaleY == 2.0f &&
+                      fract(crop.startX) == 0.0f && fract(crop.startY) == 0.0f;
+    if (!alignedBox && (crop.scaleX > 1.05f || crop.scaleY > 1.05f)) {
         // Anti-aliased area integration over 4 quadrants with positive weights (+0.25 each):
         // Each bilinear tap averages a 2x2 texel block; 4 symmetrically spaced taps cover
         // the entire footprint smoothly without negative lobes or checkerboard moiré.

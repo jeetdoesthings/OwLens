@@ -145,7 +145,7 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
                 cachedGainMapsByLens[lensID] = saved
             }
         }
-        print("[CaptureController] Loaded cached factory DNG GainMap for \(lensID): \(saved.summary)")
+        print("[CaptureController] Loaded cached DNG shading correction for \(lensID): \(saved.summary)")
     }
 
     private func extractGainMapIfNeeded(
@@ -156,22 +156,15 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
         rawHeight: Int
     ) -> DNGGainMap? {
         guard !lensID.isEmpty else { return nil }
-        let (existing, alreadyAttempted) = gainMapLock.withLock {
-            (cachedGainMapsByLens[lensID], attemptedGainMapLenses.contains(lensID))
-        }
-        if alreadyAttempted {
-            return existing
-        }
-        let recordingActive = captureLock.withLock { isRecordingMode }
-        if recordingActive {
-            return existing
-        }
-
-        gainMapLock.withLock {
-            _ = attemptedGainMapLenses.insert(lensID)
-        }
-
         let cacheID = "\(lensID)_\(rawWidth)x\(rawHeight)"
+        let recordingActive = captureLock.withLock { isRecordingMode }
+        let (existing, shouldExtract) = gainMapLock.withLock { () -> (DNGGainMap?, Bool) in
+            let cached = cachedGainMapsByLens[lensID].flatMap { $0.cacheID == cacheID ? $0 : nil }
+            guard !recordingActive, cached == nil else { return (cached, false) }
+            return (nil, attemptedGainMapLenses.insert(cacheID).inserted)
+        }
+        guard shouldExtract else { return existing }
+
         let extracted: DNGGainMap? = autoreleasepool {
             if let dng = photo.metadata["{DNG}"] as? [String: Any],
                let opcodeData = dng["OpcodeList2"] as? Data,
@@ -205,10 +198,10 @@ final class CaptureController: NSObject, ObservableObject, @unchecked Sendable {
             if let encoded = try? JSONEncoder().encode(extracted) {
                 UserDefaults.standard.set(encoded, forKey: key)
             }
-            print("[CaptureController] Extracted factory DNG GainMap for \(device?.localizedName ?? lensID): \(extracted.summary)")
+            print("[CaptureController] Extracted DNG shading correction for \(device?.localizedName ?? lensID): \(extracted.summary)")
             return extracted
         } else {
-            print("[CaptureController] No DNG GainMap in OpcodeList2 for \(device?.localizedName ?? lensID) — using LSC fallback")
+            print("[CaptureController] No usable DNG shading correction for \(lensID) — using LSC fallback")
             return existing
         }
     }
